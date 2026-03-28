@@ -1,0 +1,1669 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Powerwall</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+<style>
+:root {
+  --bg:         #161618;
+  --card-bg:    #222224;
+  --border:     #333336;
+  --text:       #eeece8;
+  --dim:        #9e9c96;
+  --very-dim:   #7a7875;
+  --grid-line:  #222226;
+  --badge-bg:   #303034;
+  --standby:    #3a3a3c;
+  --amber:      #EF9F27;
+  --green:      #1D9E75;
+  --blue:       #378ADD;
+  --gray:       #888780;
+  --rachio:     #29B5D4;
+}
+body.light {
+  --bg:         #f2f2f4;
+  --card-bg:    #ffffff;
+  --border:     #d8d8da;
+  --text:       #1c1c1e;
+  --dim:        #6c6c70;
+  --very-dim:   #a0a0a4;
+  --grid-line:  #eaeaec;
+  --badge-bg:   #e5e5ea;
+  --standby:    #c7c7cc;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', sans-serif;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* ── Nav ─────────────────────────────────────────────────────────────────────*/
+.nav {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  height: 48px;
+  background: var(--card-bg);
+  border-bottom: 0.5px solid var(--border);
+  flex-shrink: 0;
+}
+.nav-links { display: flex; gap: 4px; }
+.nav-link {
+  padding: 5px 14px;
+  border-radius: 7px;
+  font-size: 0.88rem;
+  font-weight: 500;
+  color: var(--dim);
+  cursor: pointer;
+  background: none;
+  border: none;
+  letter-spacing: 0.02em;
+}
+.nav-link:hover { color: var(--text); }
+.nav-link.active { background: var(--badge-bg); color: var(--text); }
+.theme-btn {
+  background: none;
+  border: 0.5px solid var(--border);
+  color: var(--dim);
+  border-radius: 7px;
+  padding: 4px 10px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+}
+.theme-btn:hover { color: var(--text); border-color: var(--dim); }
+
+/* ── Pages ───────────────────────────────────────────────────────────────────*/
+.page { display: none; flex: 1; overflow: hidden; }
+.page.active { display: flex; flex-direction: column; }
+
+/* ── Page 1: Dashboard ───────────────────────────────────────────────────────*/
+#page-dashboard {
+  display: none;
+  flex-direction: column;
+  padding: 10px 12px 12px;
+  gap: 10px;
+}
+#page-dashboard.active { display: flex; }
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 56px;
+  flex-shrink: 0;
+}
+.topbar-left { display: flex; align-items: baseline; gap: 14px; }
+.clock { font-size: 2.5rem; font-weight: 200; letter-spacing: -0.03em; line-height: 1; }
+.date-str { font-size: 1.05rem; color: var(--dim); font-weight: 300; }
+.topbar-right { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
+.wx-temp  { font-size: 2.1rem; font-weight: 200; line-height: 1; }
+.wx-desc  { font-size: 1rem; color: var(--dim); }
+.wx-fcst  { font-size: 0.85rem; color: var(--very-dim); }
+
+.card {
+  background: var(--card-bg);
+  border: 0.5px solid var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+.tile {
+  background: var(--card-bg);
+  border: 0.5px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+.tile-title { font-size: 0.82rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.09em; }
+.tile-value { font-size: 2rem; font-weight: 400; }
+.tile-sub   { font-size: 0.9rem; color: var(--dim); }
+.tile-na    { color: var(--standby); }
+
+/* ── Main row (flow + automations) ──────────────────────────────────────────*/
+.main-row { display: flex; gap: 10px; flex: 1; min-height: 0; }
+.flow-col  { flex: 3; min-width: 0; display: flex; flex-direction: column; }
+.flow-col .flow-card { flex: 1; min-height: 0; }
+.automations-col { flex: 2; min-width: 0; display: flex; flex-direction: column; }
+
+.flow-card { padding: 0; }
+#flow-svg { width: 100%; height: 100%; display: block; }
+
+.base-path {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 2;
+}
+.flow-path {
+  fill: none;
+  stroke-width: 3.5;
+  stroke-dasharray: 12 8;
+  opacity: 0;
+  transition: opacity 0.6s ease;
+}
+.flow-path.active {
+  opacity: 1;
+  animation: dashflow var(--dur, 1.2s) linear infinite;
+}
+@keyframes dashflow { to { stroke-dashoffset: -20; } }
+
+.node-ring     { fill: var(--card-bg); stroke-width: 1.5; }
+.node-interior { fill: var(--card-bg); }
+.node-lbl      { font-size: 15px; fill: var(--very-dim); }
+
+/* pill callouts */
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--card-bg);
+  border: 0.5px solid var(--border);
+  border-radius: 20px;
+  padding: 4px 10px;
+  white-space: nowrap;
+}
+.pill-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.pill-lbl { font-size: 11px; color: var(--very-dim); }
+.pill-val { font-size: 12px; font-weight: 600; }
+
+/* ── Upcoming Automations panel ──────────────────────────────────────────────*/
+.auto-card {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 12px 14px;
+}
+.auto-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 10px;
+  flex-shrink: 0;
+}
+.auto-title   { font-size: 0.82rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.09em; }
+.auto-updated { font-size: 0.72rem; color: var(--very-dim); }
+.auto-list    { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+.auto-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 9px 11px;
+  background: var(--bg);
+  border: 0.5px solid var(--border);
+  border-radius: 9px;
+}
+.auto-row.next-up           { border-color: var(--amber); background: rgba(239,159,39,0.05); }
+.auto-row.next-up.rachio   { border-color: var(--rachio); background: rgba(41,181,212,0.05); }
+.auto-row.rachio            { border-color: rgba(41,181,212,0.35); }
+.auto-time  { font-size: 0.88rem; font-weight: 600; color: var(--dim); }
+.auto-row.next-up .auto-time         { color: var(--amber); }
+.auto-row.next-up.rachio .auto-time  { color: var(--rachio); }
+.auto-row.rachio .auto-time          { color: var(--rachio); }
+.auto-source { font-size: 0.7rem; color: var(--very-dim); text-transform: uppercase;
+               letter-spacing: 0.06em; align-self: flex-start; }
+.auto-row.rachio .auto-source { color: var(--rachio); opacity: 0.75; }
+.auto-name  { font-size: 0.85rem; }
+.auto-badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.auto-empty { font-size: 0.88rem; color: var(--very-dim); padding: 20px 0; text-align: center; }
+.sched-badge.rachio { background: rgba(41,181,212,0.15); color: var(--rachio); }
+
+/* ── Shared badge style (used by automations + rules pages) ──────────────────*/
+.sched-badge {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 12px;
+  background: var(--badge-bg);
+  color: var(--dim);
+  white-space: nowrap;
+}
+.sched-badge.amber { background: rgba(239,159,39,0.15); color: var(--amber); }
+.sched-badge.green { background: rgba(29,158,117,0.15); color: var(--green); }
+.sched-badge.blue  { background: rgba(55,138,221,0.15); color: var(--blue); }
+
+/* ── Chart card ──────────────────────────────────────────────────────────────*/
+.chart-card {
+  padding: 10px 14px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  height: 210px;
+  flex-shrink: 0;
+}
+.chart-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+.chart-title  { font-size: 0.82rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.09em; }
+.chart-legend { display: flex; gap: 14px; }
+.legend-item  { display: flex; align-items: center; gap: 5px; font-size: 0.82rem; color: var(--dim); }
+.legend-dot   { width: 8px; height: 8px; border-radius: 50%; }
+.chart-wrap   { flex: 1; position: relative; min-height: 0; }
+#day-chart    { position: absolute; inset: 0; }
+
+.bottom-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+  height: 160px;
+  flex-shrink: 0;
+}
+
+/* ── Page 2: Rules ───────────────────────────────────────────────────────────*/
+#page-rules {
+  display: none;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+  overflow: hidden;
+}
+#page-rules.active { display: flex; }
+
+.rules-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-shrink: 0;
+}
+
+/* ── Rate card ───────────────────────────────────────────────────────────────*/
+.rate-card {
+  background: var(--card-bg);
+  border: 0.5px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  flex-shrink: 0;
+  font-size: 0.82rem;
+}
+.rate-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  gap: 12px;
+}
+.rate-card-title { color: var(--dim); text-transform: uppercase; letter-spacing: 0.07em; }
+.rate-card-updated { color: var(--very-dim); font-size: 0.75rem; }
+.rate-now-badge {
+  background: var(--badge-bg);
+  border-radius: 6px;
+  padding: 2px 8px;
+  font-size: 0.75rem;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.rate-table { width: 100%; border-collapse: collapse; }
+.rate-table th {
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-align: right;
+  padding: 2px 6px 4px;
+}
+.rate-table th:first-child { text-align: left; color: var(--very-dim); font-weight: 400; }
+.rate-table th:last-child { color: var(--very-dim); font-weight: 400; }
+#rate-th-summer { color: var(--amber); }
+#rate-th-winter  { color: var(--blue); }
+#rate-th-summer.rate-season-active { border-bottom: 2px solid var(--amber); }
+#rate-th-winter.rate-season-active  { border-bottom: 2px solid var(--blue); }
+.rate-table td {
+  padding: 3px 6px;
+  text-align: right;
+  color: var(--text);
+  border-left: 2px solid transparent;
+}
+.rate-table td:first-child { text-align: left; color: var(--dim); }
+.rate-table td:last-child { text-align: left; color: var(--very-dim); font-size: 0.75rem; padding-left: 12px; }
+/* Period-specific left border on active row */
+.rate-table tr[data-period="on_peak"].rate-active       td:first-child { border-left: 2px solid var(--amber); color: var(--text); }
+.rate-table tr[data-period="off_peak"].rate-active      td:first-child { border-left: 2px solid var(--green); color: var(--text); }
+.rate-table tr[data-period="super_off_peak"].rate-active td:first-child { border-left: 2px solid var(--blue);  color: var(--text); }
+/* Active season column cells */
+.rate-td-season-active.summer { color: var(--amber); }
+.rate-td-season-active.winter { color: var(--blue); }
+/* Intersection cell: active season × active period */
+.rate-cell-now { font-weight: 700; border-radius: 3px; padding: 3px 6px; }
+.rate-cell-now.on_peak       { background: rgba(239,159,39, 0.12); color: var(--amber) !important; }
+.rate-cell-now.off_peak      { background: rgba(29, 158,117, 0.12); color: var(--green) !important; }
+.rate-cell-now.super_off_peak { background: rgba(55, 138,221, 0.12); color: var(--blue)  !important; }
+.rate-card-footer { margin-top: 6px; text-align: right; }
+.rate-refresh-link {
+  background: none; border: none; color: var(--very-dim);
+  font-size: 0.72rem; cursor: pointer; padding: 0;
+}
+.rate-refresh-link:hover { color: var(--dim); }
+
+/* ── Current Rate tile ───────────────────────────────────────────────────────*/
+.rt-top { display: flex; align-items: flex-start; justify-content: space-between; }
+.rt-amount-wrap { display: flex; align-items: baseline; gap: 3px; }
+.rt-amount { font-size: 1.9rem; font-weight: 300; color: var(--amber); line-height: 1; }
+.rt-unit   { font-size: 0.75rem; color: var(--dim); }
+.rt-period { font-size: 0.72rem; color: var(--amber); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 3px; }
+.rt-season-badge { font-size: 0.68rem; padding: 1px 6px; border-radius: 4px; align-self: flex-start; }
+.rt-season-badge.summer { color: var(--amber); background: rgba(239,159,39,0.12); }
+.rt-season-badge.winter { color: var(--blue);  background: rgba(55,138,221,0.12); }
+.rt-mini { width: 100%; border-collapse: collapse; margin-top: 8px; }
+.rt-mini td { font-size: 0.78rem; padding: 2px 0; color: var(--very-dim); }
+.rt-mini td:last-child { text-align: right; }
+.rt-mini tr.rt-active td { color: var(--dim); }
+.rt-mini tr.rt-active td:first-child::before { content: '▶ '; font-size: 0.62rem; }
+.page-title { font-size: 0.82rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.09em; }
+.btn-add {
+  background: var(--amber);
+  color: #111;
+  border: none;
+  border-radius: 8px;
+  padding: 7px 16px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-add:hover { opacity: 0.88; }
+
+.rules-table-wrap { flex: 1; overflow-y: auto; }
+table.rules-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+}
+.rules-table th {
+  text-align: left;
+  font-size: 0.75rem;
+  color: var(--very-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  padding: 6px 10px;
+  border-bottom: 0.5px solid var(--border);
+}
+.rules-table td {
+  padding: 9px 10px;
+  border-bottom: 0.5px solid var(--border);
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.rules-table td:nth-child(2) { white-space: normal; }  /* Name column can wrap */
+.rules-table tr:last-child td { border-bottom: none; }
+
+.toggle-wrap { display: flex; align-items: center; }
+.toggle {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  flex-shrink: 0;
+}
+.toggle input { opacity: 0; width: 0; height: 0; }
+.toggle-slider {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+.toggle-slider::before {
+  content: '';
+  position: absolute;
+  width: 14px; height: 14px;
+  left: 3px; top: 3px;
+  background: #fff;
+  border-radius: 50%;
+  transition: transform 0.2s;
+}
+.toggle input:checked + .toggle-slider { background: var(--green); }
+.toggle input:checked + .toggle-slider::before { transform: translateX(14px); }
+
+.btn-icon {
+  background: none;
+  border: 0.5px solid var(--border);
+  color: var(--dim);
+  border-radius: 6px;
+  padding: 4px 9px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+.btn-icon:hover { color: var(--text); border-color: var(--dim); }
+.btn-delete { color: #e05252; border-color: rgba(224,82,82,0.3); }
+.btn-delete:hover { color: #e05252; border-color: #e05252; }
+.rule-actions { display: flex; gap: 6px; }
+.next-fire { font-size: 0.8rem; color: var(--very-dim); }
+
+/* ── Modal ───────────────────────────────────────────────────────────────────*/
+.modal-backdrop {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 100;
+  align-items: center;
+  justify-content: center;
+}
+.modal-backdrop.open { display: flex; }
+.modal {
+  background: var(--card-bg);
+  border: 0.5px solid var(--border);
+  border-radius: 14px;
+  padding: 20px 24px;
+  width: 560px;
+  max-width: 95vw;
+  max-height: 88vh;
+  overflow-y: auto;
+}
+.modal-title { font-size: 1.1rem; font-weight: 600; margin-bottom: 16px; }
+.form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 16px;
+}
+.form-group { display: flex; flex-direction: column; gap: 5px; }
+.form-group.full { grid-column: 1 / -1; }
+.form-label {
+  font-size: 0.78rem;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+}
+.form-input, .form-select {
+  background: var(--bg);
+  border: 0.5px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  padding: 7px 10px;
+  font-size: 0.9rem;
+  width: 100%;
+}
+.form-input:focus, .form-select:focus { outline: none; border-color: var(--amber); }
+
+.day-grid { display: flex; gap: 5px; }
+.day-btn {
+  flex: 1;
+  text-align: center;
+  padding: 5px 0;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  cursor: pointer;
+  background: var(--bg);
+  border: 0.5px solid var(--border);
+  color: var(--dim);
+}
+.day-btn.selected { background: var(--amber); color: #111; border-color: var(--amber); font-weight: 600; }
+
+.month-grid {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 4px;
+}
+.month-btn {
+  text-align: center;
+  padding: 4px 0;
+  border-radius: 5px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  background: var(--bg);
+  border: 0.5px solid var(--border);
+  color: var(--dim);
+}
+.month-btn.selected { background: var(--amber); color: #111; border-color: var(--amber); font-weight: 600; }
+
+.cond-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+.cond-row {
+  display: grid;
+  grid-template-columns: 70px 1fr 60px 70px 28px;
+  gap: 6px;
+  align-items: center;
+}
+.btn-remove-cond {
+  background: none;
+  border: none;
+  color: #e05252;
+  cursor: pointer;
+  font-size: 1rem;
+  padding: 0 2px;
+}
+.btn-add-cond {
+  background: none;
+  border: 0.5px dashed var(--border);
+  color: var(--dim);
+  border-radius: 6px;
+  padding: 5px 10px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  width: 100%;
+}
+.btn-add-cond:hover { color: var(--text); border-color: var(--dim); }
+
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 18px;
+}
+.btn-cancel {
+  background: none;
+  border: 0.5px solid var(--border);
+  color: var(--dim);
+  border-radius: 8px;
+  padding: 7px 16px;
+  font-size: 0.88rem;
+  cursor: pointer;
+}
+.btn-cancel:hover { color: var(--text); }
+.btn-save {
+  background: var(--green);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 7px 18px;
+  font-size: 0.88rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+.btn-save:hover { opacity: 0.88; }
+</style>
+</head>
+<body>
+
+<!-- ── Nav ───────────────────────────────────────────────────────────────────-->
+<nav class="nav">
+  <div class="nav-links">
+    <button class="nav-link active" data-page="dashboard" onclick="showPage('dashboard')">Dashboard</button>
+    <button class="nav-link"        data-page="rules"     onclick="showPage('rules')">Powerwall Rules</button>
+  </div>
+  <button id="theme-btn" class="theme-btn" onclick="toggleTheme()">Light</button>
+</nav>
+
+<!-- ── Page 1: Dashboard ─────────────────────────────────────────────────────-->
+<div id="page-dashboard" class="page active">
+
+  <div class="topbar">
+    <div class="topbar-left">
+      <div id="clock" class="clock">--:--</div>
+      <div id="date-str" class="date-str">---</div>
+    </div>
+    <div class="topbar-right">
+      <div id="wx-temp" class="wx-temp">--°F</div>
+      <div id="wx-desc" class="wx-desc">--</div>
+      <div id="wx-fcst" class="wx-fcst">Tomorrow: --</div>
+    </div>
+  </div>
+
+  <!-- Main Row: Power Flow + Upcoming Automations -->
+  <div class="main-row">
+
+    <div class="flow-col">
+      <div class="card flow-card">
+        <svg id="flow-svg" viewBox="0 0 800 340" preserveAspectRatio="xMidYMid meet">
+
+          <!-- Base paths -->
+          <path class="base-path" d="M 400,55 C 590,55 640,130 640,185"/>
+          <path class="base-path" d="M 400,55 C 210,55 160,130 160,185"/>
+          <path class="base-path" d="M 400,55 L 400,295"/>
+          <path class="base-path" d="M 400,295 C 590,295 640,250 640,185"/>
+          <path class="base-path" d="M 160,185 L 640,185"/>
+
+          <!-- Animated flow overlays -->
+          <path id="flow-solar-home"    class="flow-path" stroke="#EF9F27" d="M 400,55 C 590,55 640,130 640,185"/>
+          <path id="flow-solar-battery" class="flow-path" stroke="#EF9F27" d="M 400,55 C 210,55 160,130 160,185"/>
+          <path id="flow-solar-grid"    class="flow-path" stroke="#EF9F27" d="M 400,55 L 400,295"/>
+          <path id="flow-battery-home"  class="flow-path" stroke="#1D9E75" d="M 160,185 L 640,185"/>
+          <path id="flow-grid-home"     class="flow-path" stroke="#888780" d="M 400,295 C 590,295 640,250 640,185"/>
+
+          <!-- Solar node (top center) -->
+          <circle cx="400" cy="55" r="36" class="node-ring" stroke="#EF9F27"/>
+          <circle cx="400" cy="48" r="8"  fill="#EF9F27" opacity="0.85"/>
+          <line x1="400" y1="35" x2="400" y2="31" stroke="#EF9F27" stroke-width="2.3" stroke-linecap="round"/>
+          <line x1="411" y1="38" x2="414" y2="35" stroke="#EF9F27" stroke-width="2.3" stroke-linecap="round"/>
+          <line x1="415" y1="48" x2="419" y2="48" stroke="#EF9F27" stroke-width="2.3" stroke-linecap="round"/>
+          <line x1="411" y1="58" x2="414" y2="61" stroke="#EF9F27" stroke-width="2.3" stroke-linecap="round"/>
+          <line x1="389" y1="38" x2="386" y2="35" stroke="#EF9F27" stroke-width="2.3" stroke-linecap="round"/>
+          <line x1="385" y1="48" x2="381" y2="48" stroke="#EF9F27" stroke-width="2.3" stroke-linecap="round"/>
+          <line x1="389" y1="58" x2="386" y2="61" stroke="#EF9F27" stroke-width="2.3" stroke-linecap="round"/>
+
+          <!-- Solar pill: top-right leader -->
+          <line x1="428" y1="38" x2="470" y2="18" stroke="#333336" stroke-width="0.5" stroke-dasharray="3 3"/>
+          <circle cx="428" cy="38" r="3" fill="#EF9F27"/>
+          <foreignObject x="470" y="5" width="180" height="30">
+            <div xmlns="http://www.w3.org/1999/xhtml" class="pill">
+              <span class="pill-dot" style="background:#EF9F27"></span>
+              <span class="pill-lbl">Solar</span>
+              <span id="p-solar-w" class="pill-val" style="color:#EF9F27">0 W</span>
+            </div>
+          </foreignObject>
+
+          <!-- Solar today muted text -->
+          <text id="p-solar-today" x="400" y="108" text-anchor="middle" font-size="12" fill="#7a7875">-- kWh today</text>
+
+          <!-- Battery node (left) -->
+          <circle id="batt-flow-ring" cx="160" cy="185" r="36" class="node-ring" stroke="#1D9E75"/>
+          <rect x="147" y="172" width="26" height="14" rx="3" fill="none" stroke="#1D9E75" stroke-width="1.8"/>
+          <rect x="173" y="177" width="4" height="5" rx="1" fill="#1D9E75"/>
+          <rect id="batt-icon-fill" x="149" y="174" width="13" height="10" rx="2" fill="#1D9E75" opacity="0.75"/>
+
+          <!-- Battery pill: left leader -->
+          <line x1="124" y1="172" x2="80" y2="148" stroke="#333336" stroke-width="0.5" stroke-dasharray="3 3"/>
+          <circle cx="124" cy="172" r="3" fill="#1D9E75"/>
+          <foreignObject x="-10" y="125" width="220" height="30">
+            <div xmlns="http://www.w3.org/1999/xhtml" class="pill">
+              <span class="pill-dot" style="background:#1D9E75"></span>
+              <span class="pill-lbl">Battery</span>
+              <span id="p-batt-w"   class="pill-val" style="color:#1D9E75">0 W</span>
+              <span class="pill-lbl">·</span>
+              <span id="p-batt-pct" class="pill-val" style="color:#1D9E75">--%</span>
+              <span id="p-batt-status" class="pill-lbl"></span>
+            </div>
+          </foreignObject>
+
+          <!-- Home node (right) -->
+          <circle cx="640" cy="185" r="36" class="node-ring" stroke="#378ADD"/>
+          <polygon points="640,163 623,178 623,198 657,198 657,178" fill="none" stroke="#378ADD" stroke-width="1.8" stroke-linejoin="round"/>
+          <polygon points="640,158 619,176 661,176" fill="#378ADD" opacity="0.7"/>
+          <rect x="634" y="188" width="12" height="10" rx="1" class="node-interior"/>
+
+          <!-- Home pill: right leader -->
+          <line x1="676" y1="172" x2="712" y2="148" stroke="#333336" stroke-width="0.5" stroke-dasharray="3 3"/>
+          <circle cx="676" cy="172" r="3" fill="#378ADD"/>
+          <foreignObject x="712" y="125" width="180" height="30">
+            <div xmlns="http://www.w3.org/1999/xhtml" class="pill">
+              <span class="pill-dot" style="background:#378ADD"></span>
+              <span class="pill-lbl">Home</span>
+              <span id="p-home-w" class="pill-val" style="color:#378ADD">0 W</span>
+            </div>
+          </foreignObject>
+
+          <!-- Mode label — upper-left corner -->
+          <rect id="p-mode-bg"     x="8"  y="8" width="150" height="26" rx="6" fill="#18181a" stroke="#333336" stroke-width="1"/>
+          <rect id="p-mode-accent" x="8"  y="8" width="4"   height="26" rx="3" fill="#888780"/>
+          <circle id="p-mode-dot"  cx="22" cy="21" r="4" fill="#888780" opacity="0.9"/>
+          <text x="30" y="17" font-size="8" fill="#5a5a5e" letter-spacing="0.8">MODE</text>
+          <text id="p-mode" x="30" y="29" font-size="11" fill="#888780" font-weight="600" letter-spacing="0.2">—</text>
+
+          <!-- Grid today muted text -->
+          <text id="p-grid-today" x="400" y="262" text-anchor="middle" font-size="12" fill="#7a7875">-- kWh today</text>
+
+          <!-- Grid node (bottom center) -->
+          <circle id="grid-ring" cx="400" cy="295" r="36" class="node-ring" stroke="#888780"/>
+          <polygon points="404,275 396,295 402,295 397,315 408,295 401,295" fill="#888780" opacity="0.8"/>
+
+          <!-- Grid pill: bottom-right leader -->
+          <line x1="428" y1="308" x2="470" y2="325" stroke="#333336" stroke-width="0.5" stroke-dasharray="3 3"/>
+          <circle cx="428" cy="308" r="3" fill="#888780"/>
+          <foreignObject x="470" y="315" width="200" height="30">
+            <div xmlns="http://www.w3.org/1999/xhtml" class="pill">
+              <span class="pill-dot" id="p-grid-dot" style="background:#888780"></span>
+              <span class="pill-lbl">Grid</span>
+              <span id="p-grid-w"   class="pill-val" style="color:#888780">0 W</span>
+              <span id="p-grid-dir" class="pill-lbl"></span>
+            </div>
+          </foreignObject>
+
+        </svg>
+      </div>
+    </div><!-- .flow-col -->
+
+    <div class="automations-col">
+      <div class="auto-card card">
+        <div class="auto-header">
+          <div class="auto-title">Upcoming Automations</div>
+          <div id="auto-updated" class="auto-updated"></div>
+        </div>
+        <div id="auto-list" class="auto-list">
+          <div class="auto-empty">Loading…</div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- .main-row -->
+
+  <!-- Day Chart -->
+  <div class="card chart-card">
+    <div class="chart-header">
+      <div class="chart-title">Solar vs Home Load — Today</div>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:#EF9F27"></div>Solar</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#378ADD"></div>Home</div>
+      </div>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="day-chart"></canvas>
+    </div>
+  </div>
+
+  <!-- Bottom Tiles -->
+  <div class="bottom-row">
+    <!-- Tile 1: Energy YTD -->
+    <div class="tile" id="costs-tile">
+      <div class="tile-title">Energy YTD</div>
+      <div style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:6px;margin-top:6px">
+        <div style="display:flex;justify-content:space-between;font-size:0.88rem">
+          <span style="color:var(--dim)">Grid imported</span>
+          <span id="cost-import" class="tile-na">—</span>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-size:0.88rem">
+          <span style="color:var(--dim)">Export credits</span>
+          <span id="cost-credit" class="tile-na">—</span>
+        </div>
+        <div style="border-top:0.5px solid var(--border);margin:2px 0"></div>
+        <div style="display:flex;justify-content:space-between;font-size:0.88rem">
+          <span style="color:var(--dim)">Net cost</span>
+          <span id="cost-net" class="tile-na">—</span>
+        </div>
+      </div>
+    </div>
+    <!-- Tile 2: Current Rate -->
+    <div class="tile" id="rate-tile">
+      <div class="tile-title">Current Rate</div>
+      <div class="rt-top" style="margin-top:6px">
+        <div>
+          <div class="rt-amount-wrap">
+            <span id="tile-rate-amount" class="rt-amount tile-na">—</span>
+            <span class="rt-unit">/kWh</span>
+          </div>
+          <div id="tile-rate-period" class="rt-period">—</div>
+        </div>
+        <span id="tile-rate-season" class="rt-season-badge">—</span>
+      </div>
+      <table class="rt-mini">
+        <tr id="rt-row-on-peak">
+          <td>On-peak</td>
+          <td id="rt-on-rates" class="tile-na">—</td>
+        </tr>
+        <tr id="rt-row-off-peak">
+          <td>Off-peak</td>
+          <td id="rt-off-rates" class="tile-na">—</td>
+        </tr>
+        <tr id="rt-row-super">
+          <td>Super off-peak</td>
+          <td id="rt-sup-rates" class="tile-na">—</td>
+        </tr>
+      </table>
+    </div>
+    <!-- Tile 3: Pool -->
+    <div class="tile">
+      <div class="tile-title">Pool</div>
+      <div id="pool-temp" class="tile-value tile-na">--°F</div>
+      <div id="pool-pump" class="tile-sub tile-na">Pump: --</div>
+      <div id="pool-heat" class="tile-sub tile-na" style="font-size:11px;margin-top:2px"></div>
+      <div id="pool-spa" class="tile-sub tile-na" style="font-size:11px;margin-top:2px"></div>
+    </div>
+    <!-- Tile 4: Security (stubbed) -->
+    <div class="tile">
+      <div class="tile-title">Security</div>
+      <div class="tile-value tile-na">--</div>
+      <div class="tile-sub tile-na">Garage: --</div>
+    </div>
+  </div>
+
+</div><!-- #page-dashboard -->
+
+<!-- ── Page 2: Powerwall Rules ────────────────────────────────────────────────-->
+<div id="page-rules" class="page">
+
+  <div class="rules-toolbar">
+    <div class="page-title">Powerwall Rules</div>
+    <button class="btn-add" onclick="openModal(null)">+ Add Rule</button>
+  </div>
+
+  <!-- Rate card -->
+  <div class="rate-card">
+    <div class="rate-card-header">
+      <span class="rate-card-title">SDG&amp;E EV-TOU-2</span>
+      <span id="rate-updated" class="rate-card-updated"></span>
+      <span id="rate-now-badge" class="rate-now-badge">NOW: —</span>
+    </div>
+    <table class="rate-table">
+      <thead>
+        <tr>
+          <th>Period</th>
+          <th id="rate-th-summer">Summer</th>
+          <th id="rate-th-winter">Winter</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr id="rate-row-on-peak" data-period="on_peak">
+          <td>On-peak</td>
+          <td id="rate-sum-on"></td>
+          <td id="rate-win-on"></td>
+          <td>4pm – 9pm daily</td>
+        </tr>
+        <tr id="rate-row-off-peak" data-period="off_peak">
+          <td>Off-peak</td>
+          <td id="rate-sum-off"></td>
+          <td id="rate-win-off"></td>
+          <td>6am – 4pm, 9pm – midnight</td>
+        </tr>
+        <tr id="rate-row-super-off-peak" data-period="super_off_peak">
+          <td>Super off-peak</td>
+          <td id="rate-sum-sup"></td>
+          <td id="rate-win-sup"></td>
+          <td>midnight – 6am + weekends</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="rate-card-footer">
+      <button class="rate-refresh-link" onclick="refreshRates(true)">Refresh rates</button>
+    </div>
+  </div>
+
+  <div class="rules-table-wrap">
+    <table class="rules-table">
+      <thead>
+        <tr>
+          <th>On</th>
+          <th>Name</th>
+          <th>Next Fire</th>
+          <th>Actions</th>
+          <th>Mode</th>
+          <th>Reserve</th>
+        </tr>
+      </thead>
+      <tbody id="rules-tbody">
+        <tr><td colspan="6" style="color:var(--very-dim);padding:20px">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</div><!-- #page-rules -->
+
+<!-- ── Rule Edit Modal ────────────────────────────────────────────────────────-->
+<div id="modal-backdrop" class="modal-backdrop" onclick="if(event.target===this)closeModal()">
+  <div class="modal">
+    <div class="modal-title" id="modal-title">Add Rule</div>
+    <input type="hidden" id="edit-id">
+
+    <div class="form-grid">
+      <div class="form-group full">
+        <label class="form-label">Name</label>
+        <input id="f-name" class="form-input" type="text" placeholder="Rule name">
+      </div>
+
+      <div class="form-group full">
+        <label class="form-label">Days</label>
+        <div class="day-grid" id="day-grid">
+          <button type="button" class="day-btn" data-day="0">Mon</button>
+          <button type="button" class="day-btn" data-day="1">Tue</button>
+          <button type="button" class="day-btn" data-day="2">Wed</button>
+          <button type="button" class="day-btn" data-day="3">Thu</button>
+          <button type="button" class="day-btn" data-day="4">Fri</button>
+          <button type="button" class="day-btn" data-day="5">Sat</button>
+          <button type="button" class="day-btn" data-day="6">Sun</button>
+        </div>
+      </div>
+
+      <div class="form-group full">
+        <label class="form-label">Months</label>
+        <div class="month-grid" id="month-grid">
+          <button type="button" class="month-btn" data-month="1">Jan</button>
+          <button type="button" class="month-btn" data-month="2">Feb</button>
+          <button type="button" class="month-btn" data-month="3">Mar</button>
+          <button type="button" class="month-btn" data-month="4">Apr</button>
+          <button type="button" class="month-btn" data-month="5">May</button>
+          <button type="button" class="month-btn" data-month="6">Jun</button>
+          <button type="button" class="month-btn" data-month="7">Jul</button>
+          <button type="button" class="month-btn" data-month="8">Aug</button>
+          <button type="button" class="month-btn" data-month="9">Sep</button>
+          <button type="button" class="month-btn" data-month="10">Oct</button>
+          <button type="button" class="month-btn" data-month="11">Nov</button>
+          <button type="button" class="month-btn" data-month="12">Dec</button>
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Hour (0–23)</label>
+        <input id="f-hour" class="form-input" type="number" min="0" max="23">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Minute</label>
+        <select id="f-minute" class="form-select">
+          <option value="0">:00</option>
+          <option value="15">:15</option>
+          <option value="30">:30</option>
+          <option value="45">:45</option>
+        </select>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Mode</label>
+        <select id="f-mode" class="form-select">
+          <option value="">(no change)</option>
+          <option value="self_consumption">Self-Powered</option>
+          <option value="autonomous">Time-Based Control</option>
+          <option value="backup">Backup</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Reserve %</label>
+        <input id="f-reserve" class="form-input" type="number" min="0" max="100" placeholder="(no change)">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Grid Charging</label>
+        <select id="f-grid-charging" class="form-select">
+          <option value="">(no change)</option>
+          <option value="true">On</option>
+          <option value="false">Off</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Grid Export</label>
+        <select id="f-grid-export" class="form-select">
+          <option value="">(no change)</option>
+          <option value="battery_ok">Solar + Battery</option>
+          <option value="pv_only">Solar Only</option>
+        </select>
+      </div>
+
+      <div class="form-group full">
+        <label class="form-label">Conditions</label>
+        <div id="cond-list" class="cond-list"></div>
+        <button type="button" class="btn-add-cond" onclick="addCondRow()">+ Add Condition</button>
+      </div>
+    </div>
+
+    <div class="modal-footer">
+      <button class="btn-cancel" onclick="closeModal()">Cancel</button>
+      <button class="btn-save"   onclick="saveRule()">Save</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function fmtW(w) {
+  const a = Math.abs(w);
+  if (a >= 1000) return (w / 1000).toFixed(1) + ' kW';
+  return Math.round(w) + ' W';
+}
+function fmtWabs(w) { return fmtW(Math.abs(w)); }
+
+// ── Nav / page switching ──────────────────────────────────────────────────────
+let _activePage = 'dashboard';
+
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.nav-link').forEach(b => b.classList.remove('active'));
+  document.getElementById('page-' + name).classList.add('active');
+  document.querySelectorAll('.nav-link').forEach(b => {
+    if (b.dataset.page === name) b.classList.add('active');
+  });
+  _activePage = name;
+  if (name === 'rules') refreshRules();
+}
+
+// ── Clock ─────────────────────────────────────────────────────────────────────
+const DAYS_LBL   = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const MONTHS_LBL = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function tickClock() {
+  const n = new Date();
+  const h = n.getHours(), m = n.getMinutes();
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12  = h % 12 || 12;
+  const ts   = `${h12}:${String(m).padStart(2,'0')} ${ampm}`;
+  const ds   = `${DAYS_LBL[n.getDay()]}, ${MONTHS_LBL[n.getMonth()]} ${n.getDate()}`;
+  const clk  = document.getElementById('clock');
+  const dstr = document.getElementById('date-str');
+  if (clk)  clk.textContent  = ts;
+  if (dstr) dstr.textContent = ds;
+}
+setInterval(tickClock, 1000);
+tickClock();
+
+// ── Theme toggle ──────────────────────────────────────────────────────────────
+function toggleTheme() {
+  const isLight = document.body.classList.toggle('light');
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+  document.getElementById('theme-btn').textContent = isLight ? 'Dark' : 'Light';
+}
+(function applyTheme() {
+  if (localStorage.getItem('theme') === 'light') {
+    document.body.classList.add('light');
+    const btn = document.getElementById('theme-btn');
+    if (btn) btn.textContent = 'Dark';
+  }
+})();
+
+// ── Chart ─────────────────────────────────────────────────────────────────────
+const dayChart = new Chart(document.getElementById('day-chart').getContext('2d'), {
+  type: 'line',
+  data: {
+    datasets: [
+      { label: 'Solar', data: [], borderColor: '#EF9F27', backgroundColor: 'rgba(239,159,39,0.07)', fill: true, tension: 0.35, pointRadius: 0, borderWidth: 2 },
+      { label: 'Home',  data: [], borderColor: '#378ADD', backgroundColor: 'rgba(55,138,221,0.07)',  fill: true, tension: 0.35, pointRadius: 0, borderWidth: 2 },
+    ]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    scales: {
+      x: {
+        type: 'time', time: { unit: 'hour', displayFormats: { hour: 'h a' } },
+        grid: { color: '#222226' }, ticks: { color: '#9e9c96', maxTicksLimit: 12, font: { size: 13 } }, border: { color: '#333336' },
+      },
+      y: {
+        beginAtZero: true, grid: { color: '#222226' },
+        ticks: { color: '#9e9c96', font: { size: 13 }, callback: v => v >= 1000 ? (v/1000).toFixed(1)+'k' : v },
+        border: { color: '#333336' },
+      }
+    },
+    plugins: {
+      legend: { display: false },
+      tooltip: {
+        mode: 'index', intersect: false,
+        backgroundColor: '#222224', borderColor: '#333336', borderWidth: 1,
+        titleColor: '#9e9c96', bodyColor: '#eeece8',
+        callbacks: { label: ctx => ` ${ctx.dataset.label}: ${fmtW(ctx.parsed.y)}` }
+      }
+    }
+  }
+});
+
+async function refreshChart() {
+  try {
+    const rows = await fetch('/api/today').then(r => r.json());
+    dayChart.data.datasets[0].data = rows.map(r => ({ x: r.ts * 1000, y: Math.max(0, r.solar_w) }));
+    dayChart.data.datasets[1].data = rows.map(r => ({ x: r.ts * 1000, y: Math.max(0, r.home_w)  }));
+    dayChart.update('none');
+  } catch(e) { console.warn('Chart:', e); }
+}
+
+// ── Power Flow ────────────────────────────────────────────────────────────────
+const THRESHOLD = 50;
+
+function setFlow(id, active, watts) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (active && watts > THRESHOLD) {
+    el.classList.add('active');
+    const dur = Math.max(0.4, Math.min(2.5, 400 / Math.sqrt(watts + 100)));
+    el.style.setProperty('--dur', dur + 's');
+  } else {
+    el.classList.remove('active');
+  }
+}
+
+function updateDashboard(d) {
+  const solarOn = d.solar_w   >  THRESHOLD;
+  const battChg = d.battery_w >  THRESHOLD;
+  const battDis = d.battery_w < -THRESHOLD;
+  const gridIn  = d.grid_w    >  THRESHOLD;
+  const gridOut = d.grid_w    < -THRESHOLD;
+
+  setFlow('flow-solar-home',    solarOn, d.solar_w);
+  setFlow('flow-solar-battery', battChg, d.battery_w);
+  setFlow('flow-solar-grid',    gridOut, Math.abs(d.grid_w));
+  setFlow('flow-battery-home',  battDis, Math.abs(d.battery_w));
+  setFlow('flow-grid-home',     gridIn,  d.grid_w);
+
+  const pSolarW = document.getElementById('p-solar-w');
+  if (pSolarW) pSolarW.textContent = fmtW(d.solar_w);
+
+  const pSolarToday = document.getElementById('p-solar-today');
+  if (pSolarToday) pSolarToday.textContent = (d.solar_kwh_today || 0).toFixed(1) + ' kWh today';
+
+  const pBattW      = document.getElementById('p-batt-w');
+  const pBattPct    = document.getElementById('p-batt-pct');
+  const pBattStatus = document.getElementById('p-batt-status');
+  if (pBattW)      pBattW.textContent      = fmtWabs(d.battery_w);
+  if (pBattPct)    pBattPct.textContent    = Math.round(d.battery_pct || 0) + '%';
+  if (pBattStatus) pBattStatus.textContent = d.battery_status ? '· ' + d.battery_status : '';
+
+  const pHomeW = document.getElementById('p-home-w');
+  if (pHomeW) pHomeW.textContent = fmtW(d.home_w);
+
+  const pGridW   = document.getElementById('p-grid-w');
+  const pGridDir = document.getElementById('p-grid-dir');
+  const pGridDot = document.getElementById('p-grid-dot');
+  if (pGridW)   pGridW.textContent   = fmtWabs(d.grid_w);
+  if (pGridDir) pGridDir.textContent = gridIn ? 'importing' : gridOut ? 'exporting' : '';
+  if (pGridDot) {
+    pGridDot.style.background = gridOut ? '#1D9E75' : '#888780';
+    if (pGridW) pGridW.style.color = gridOut ? '#1D9E75' : '#888780';
+  }
+
+  const fillEl = document.getElementById('batt-icon-fill');
+  if (fillEl) fillEl.setAttribute('width', Math.max(2, Math.round(22 * (d.battery_pct || 0) / 100)));
+
+  const ringColor = (d.battery_pct || 0) > 30 ? '#1D9E75' : (d.battery_pct || 0) > 15 ? '#EF9F27' : '#e05252';
+  const battRing = document.getElementById('batt-flow-ring');
+  if (battRing) battRing.setAttribute('stroke', ringColor);
+
+  // Grid today label (SVG text near grid node)
+  const gkEl = document.getElementById('p-grid-today');
+  if (gkEl && d.grid_kwh_today != null) {
+    gkEl.textContent = d.grid_kwh_today.toFixed(1) + ' kWh today';
+  }
+
+  // Mode label — upper-left, color-coded by mode
+  const pMode       = document.getElementById('p-mode');
+  const pModeBg     = document.getElementById('p-mode-bg');
+  const pModeAccent = document.getElementById('p-mode-accent');
+  const pModeDot    = document.getElementById('p-mode-dot');
+  if (pMode && d.mode) {
+    const label = modeLabel(d.mode) || d.mode;
+    const modeColors = {
+      'self_consumption': '#1D9E75',
+      'autonomous':       '#EF9F27',
+      'backup':           '#e05252',
+    };
+    const col = modeColors[d.mode] || '#888780';
+    pMode.textContent = label.toUpperCase();
+    pMode.setAttribute('fill', col);
+    if (pModeAccent) pModeAccent.setAttribute('fill', col);
+    if (pModeDot)    pModeDot.setAttribute('fill', col);
+    if (pModeBg) {
+      pModeBg.setAttribute('stroke', col);
+      pModeBg.style.opacity = '0.85';
+      const w = Math.max(100, label.length * 6.8 + 42);
+      pModeBg.setAttribute('width', w);
+    }
+  }
+}
+
+// ── Weather ───────────────────────────────────────────────────────────────────
+async function refreshWeather() {
+  try {
+    const w = await fetch('/api/weather').then(r => r.json());
+    const wt = document.getElementById('wx-temp');
+    const wd = document.getElementById('wx-desc');
+    const wf = document.getElementById('wx-fcst');
+    if (wt && w.temp_f != null)  wt.textContent = w.temp_f + '°F';
+    if (wd && w.desc)            wd.textContent = w.desc;
+    if (wf && w.tomorrow_cloud != null) {
+      const cl   = Math.round(w.tomorrow_cloud);
+      const rain = w.tomorrow_rain != null ? `, ${w.tomorrow_rain.toFixed(1)}mm rain` : '';
+      const warn = w.bad_forecast ? '  !' : '';
+      wf.textContent = `Tomorrow: ${cl}% clouds${rain}${warn}`;
+    }
+  } catch(e) { console.warn('Weather:', e); }
+}
+
+// ── Pool ──────────────────────────────────────────────────────────────────────
+async function refreshPool() {
+  try {
+    const d = await fetch('/api/pool').then(r => r.json());
+    const tempEl = document.getElementById('pool-temp');
+    const pumpEl = document.getElementById('pool-pump');
+    if (!tempEl || !pumpEl) return;
+
+    if (d.temp_f != null) {
+      tempEl.textContent = d.temp_f + '°F';
+      tempEl.classList.remove('tile-na');
+    } else {
+      tempEl.textContent = '--°F';
+      tempEl.classList.add('tile-na');
+    }
+
+    const heatEl = document.getElementById('pool-heat');
+    const spaEl  = document.getElementById('pool-spa');
+
+    if (d.pump_on != null) {
+      const watts = d.pump_watts != null ? ` · ${d.pump_watts}W` : '';
+      pumpEl.textContent = 'Pump: ' + (d.pump_on ? 'On' : 'Off') + watts;
+      pumpEl.style.color = d.pump_on ? 'var(--green)' : 'var(--dim)';
+      pumpEl.classList.remove('tile-na');
+    } else {
+      pumpEl.textContent = 'Pump: --';
+      pumpEl.style.color = '';
+      pumpEl.classList.add('tile-na');
+    }
+
+    if (heatEl) {
+      if (d.heat_mode) {
+        heatEl.textContent = 'Heat: ' + d.heat_mode;
+        heatEl.style.color = 'var(--dim)';
+        heatEl.classList.remove('tile-na');
+      } else {
+        heatEl.textContent = '';
+      }
+    }
+
+    if (spaEl) {
+      if (d.spa_temp_f != null) {
+        const spaOn = d.spa_circuit_on ? ' · On' : '';
+        spaEl.textContent = 'Spa: ' + d.spa_temp_f + '°F' + spaOn;
+        spaEl.style.color = d.spa_circuit_on ? 'var(--green)' : 'var(--dim)';
+        spaEl.classList.remove('tile-na');
+      } else {
+        spaEl.textContent = '';
+      }
+    }
+  } catch(e) { console.warn('Pool:', e); }
+}
+
+// ── Poll ──────────────────────────────────────────────────────────────────────
+async function poll() {
+  try {
+    const d = await fetch('/api/live').then(r => r.json());
+    updateDashboard(d);
+  } catch(e) { console.warn('Poll:', e); }
+}
+
+// ── Upcoming Automations ──────────────────────────────────────────────────────
+function fmtFireTime(iso) {
+  const d = new Date(iso);
+  const day  = DAYS_LBL[d.getDay()].slice(0,3);
+  const h    = d.getHours(), m = d.getMinutes();
+  const ampm = h >= 12 ? 'PM' : 'AM';
+  const h12  = h % 12 || 12;
+  return `${day} ${h12}:${String(m).padStart(2,'0')} ${ampm}`;
+}
+
+const _MODE_LABELS = {
+  'self_consumption': 'Self-Powered',
+  'autonomous':       'Time-Based Control',
+  'backup':           'Backup',
+};
+function modeLabel(m) { return m ? (_MODE_LABELS[m] || m.replace(/_/g,' ')) : null; }
+
+function settingsBadges(e) {
+  const badges = [];
+  if (e.mode)              badges.push({ text: modeLabel(e.mode), cls: 'amber' });
+  if (e.reserve != null)   badges.push({ text: `reserve ${e.reserve}%`, cls: '' });
+  if (e.grid_charging != null) badges.push({ text: `grid charge ${e.grid_charging ? 'ON' : 'OFF'}`, cls: e.grid_charging ? 'green' : '' });
+  if (e.grid_export)       badges.push({ text: e.grid_export === 'battery_ok' ? 'export solar+batt' : 'export solar only', cls: 'blue' });
+  return badges;
+}
+
+// ── Energy YTD tile ───────────────────────────────────────────────────────────
+async function refreshCosts() {
+  try {
+    const d = await fetch('/api/costs/ytd').then(r => r.json());
+    const fmt = v => '$' + v.toFixed(2);
+    const importEl  = document.getElementById('cost-import');
+    const creditEl  = document.getElementById('cost-credit');
+    const netEl     = document.getElementById('cost-net');
+    if (!importEl) return;
+    importEl.textContent  = fmt(d.import_cost);
+    importEl.classList.remove('tile-na');
+    creditEl.textContent  = '−' + fmt(d.export_credit);
+    creditEl.style.color  = 'var(--green)';
+    creditEl.classList.remove('tile-na');
+    netEl.textContent     = fmt(d.net_cost);
+    netEl.classList.remove('tile-na');
+  } catch (e) { /* leave dashes */ }
+}
+
+
+// ── Rate card + Current Rate tile ─────────────────────────────────────────────
+async function refreshRates(force = false) {
+  try {
+    if (force) await fetch('/api/rates/refresh', {method: 'POST'});
+    const r = await fetch('/api/rates').then(x => x.json());
+    const fmt3 = v => v != null ? '$' + Number(v).toFixed(3) : '—';
+    const fmt2 = v => v != null ? '$' + Number(v).toFixed(3) : '—';
+
+    // ── Populate rate card cells ──
+    document.getElementById('rate-sum-on').textContent  = fmt3(r.summer_on_peak);
+    document.getElementById('rate-win-on').textContent  = fmt3(r.winter_on_peak);
+    document.getElementById('rate-sum-off').textContent = fmt3(r.summer_off_peak);
+    document.getElementById('rate-win-off').textContent = fmt3(r.winter_off_peak);
+    document.getElementById('rate-sum-sup').textContent = fmt3(r.summer_super_off_peak);
+    document.getElementById('rate-win-sup').textContent = fmt3(r.winter_super_off_peak);
+
+    if (r.updated) {
+      const upd = new Date(r.updated);
+      document.getElementById('rate-updated').textContent =
+        'updated ' + upd.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'});
+    }
+
+    // ── Compute current season + period ──
+    const now       = new Date();
+    const h         = now.getHours();
+    const mon       = now.getMonth() + 1;
+    const dow       = now.getDay();
+    const isSummer  = [6,7,8,9,10].includes(mon);
+    const isWeekend = dow === 0 || dow === 6;
+    const season    = isSummer ? 'summer' : 'winter';
+    let period;
+    if (h >= 16 && h < 21)      period = 'on_peak';
+    else if (h < 6 || isWeekend) period = 'super_off_peak';
+    else                          period = 'off_peak';
+
+    const periodLabels  = {on_peak: 'ON-PEAK', off_peak: 'OFF-PEAK', super_off_peak: 'SUPER OFF-PEAK'};
+    const periodAccents = {on_peak: 'var(--amber)', off_peak: 'var(--green)', super_off_peak: 'var(--blue)'};
+    const rateRowIds    = {on_peak: 'rate-row-on-peak', off_peak: 'rate-row-off-peak', super_off_peak: 'rate-row-super-off-peak'};
+    const accentColor   = periodAccents[period];
+
+    // ── Rate card: active period row ──
+    document.querySelectorAll('.rate-table tr.rate-active').forEach(tr => tr.classList.remove('rate-active'));
+    const activeRow = document.getElementById(rateRowIds[period]);
+    if (activeRow) activeRow.classList.add('rate-active');
+
+    // ── Rate card: Now badge (color matches period) ──
+    const badge = document.getElementById('rate-now-badge');
+    if (badge) { badge.textContent = 'NOW: ' + periodLabels[period]; badge.style.color = accentColor; }
+
+    // ── Rate card: season column headers ──
+    const thSum = document.getElementById('rate-th-summer');
+    const thWin = document.getElementById('rate-th-winter');
+    if (thSum) { thSum.classList.toggle('rate-season-active', isSummer); }
+    if (thWin) { thWin.classList.toggle('rate-season-active', !isSummer); }
+
+    // ── Rate card: active season column cells — color + class ──
+    const sumCellIds = ['rate-sum-on', 'rate-sum-off', 'rate-sum-sup'];
+    const winCellIds = ['rate-win-on', 'rate-win-off', 'rate-win-sup'];
+    [...sumCellIds, ...winCellIds].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.classList.remove('rate-td-season-active', 'summer', 'winter',
+                          'rate-cell-now', 'on_peak', 'off_peak', 'super_off_peak');
+    });
+    const activeCols = isSummer ? sumCellIds : winCellIds;
+    activeCols.forEach(id => {
+      const el = document.getElementById(id);
+      if (el) { el.classList.add('rate-td-season-active', season); }
+    });
+
+    // ── Rate card: highlight intersection cell ──
+    const colPrefix  = isSummer ? 'rate-sum-' : 'rate-win-';
+    const cellSuffix = {on_peak: 'on', off_peak: 'off', super_off_peak: 'sup'}[period];
+    const nowCell    = document.getElementById(colPrefix + cellSuffix);
+    if (nowCell) nowCell.classList.add('rate-cell-now', period);
+
+    // ── Current Rate tile ──
+    const currentRate = r[`${season}_${period}`];
+    const tileAmount  = document.getElementById('tile-rate-amount');
+    const tilePeriod  = document.getElementById('tile-rate-period');
+    const tileSeason  = document.getElementById('tile-rate-season');
+    if (tileAmount) {
+      tileAmount.textContent = currentRate != null ? '$' + Number(currentRate).toFixed(3) : '—';
+      tileAmount.classList.remove('tile-na');
+      tileAmount.style.color = accentColor;
+    }
+    if (tilePeriod) { tilePeriod.textContent = periodLabels[period]; tilePeriod.style.color = accentColor; }
+    if (tileSeason) {
+      tileSeason.textContent = isSummer ? 'SUMMER' : 'WINTER';
+      tileSeason.className   = 'rt-season-badge ' + season;
+    }
+
+    // Mini rate table in tile
+    const rtRows = {on_peak: 'rt-row-on-peak', off_peak: 'rt-row-off-peak', super_off_peak: 'rt-row-super'};
+    document.querySelectorAll('.rt-mini tr.rt-active').forEach(tr => tr.classList.remove('rt-active'));
+    const rtActive = document.getElementById(rtRows[period]);
+    if (rtActive) rtActive.classList.add('rt-active');
+
+    const onEl  = document.getElementById('rt-on-rates');
+    const offEl = document.getElementById('rt-off-rates');
+    const supEl = document.getElementById('rt-sup-rates');
+    if (onEl)  { onEl.textContent  = fmt2(r.summer_on_peak)  + ' / ' + fmt2(r.winter_on_peak);  onEl.classList.remove('tile-na'); }
+    if (offEl) { offEl.textContent = fmt2(r.summer_off_peak) + ' / ' + fmt2(r.winter_off_peak); offEl.classList.remove('tile-na'); }
+    if (supEl) { supEl.textContent = fmt2(r.summer_super_off_peak) + ' / ' + fmt2(r.winter_super_off_peak); supEl.classList.remove('tile-na'); }
+
+  } catch (e) { /* leave dashes */ }
+}
+
+
+async function refreshAutomations() {
+  try {
+    const data = await fetch('/api/schedule').then(r => r.json());
+    const list = document.getElementById('auto-list');
+    if (!list) return;
+
+    const items = (data.schedule || []).slice(0, 5);
+    if (!items.length) {
+      list.innerHTML = '<div class="auto-empty">No upcoming automations.</div>';
+    } else {
+      list.innerHTML = items.map((e, i) => {
+        const isRachio = e.source === 'rachio';
+        const nextUp   = i === 0 ? 'next-up' : '';
+        const racchioCls = isRachio ? 'rachio' : '';
+        const sourceLabel = isRachio ? 'Rachio' : 'Powerwall';
+
+        let badges = '';
+        if (isRachio) {
+          if (e.duration_min) {
+            badges = `<span class="sched-badge rachio">${e.duration_min} min</span>`;
+          }
+        } else {
+          badges = settingsBadges(e)
+            .map(b => `<span class="sched-badge ${b.cls}">${b.text}</span>`).join('');
+        }
+
+        return `
+          <div class="auto-row ${nextUp} ${racchioCls}">
+            <div style="display:flex;align-items:baseline;gap:8px">
+              <div class="auto-time">${fmtFireTime(e.fire_time)}</div>
+              <div class="auto-source">${sourceLabel}</div>
+            </div>
+            <div class="auto-name">${e.name}</div>
+            ${badges ? `<div class="auto-badges">${badges}</div>` : ''}
+          </div>`;
+      }).join('');
+    }
+
+    const upd = document.getElementById('auto-updated');
+    if (upd) upd.textContent = new Date().toLocaleTimeString([], {hour:'numeric',minute:'2-digit'});
+  } catch(e) { console.warn('Automations:', e); }
+}
+
+// ── Rules page ────────────────────────────────────────────────────────────────
+let _rules = [];
+
+function nextFireForRule(rule) {
+  const now  = new Date();
+  const days   = new Set(rule.days);
+  const months = new Set(rule.months);
+  for (let delta = 0; delta <= 7; delta++) {
+    const d = new Date(now);
+    d.setDate(d.getDate() + delta);
+    d.setHours(rule.hour, rule.minute, 0, 0);
+    const weekday = (d.getDay() + 6) % 7; // JS Sun=0 → Mon=0
+    if (d > now && days.has(weekday) && months.has(d.getMonth() + 1)) {
+      return fmtFireTime(d.toISOString());
+    }
+  }
+  return '—';
+}
+
+async function refreshRules() {
+  try {
+    _rules = await fetch('/api/rules').then(r => r.json());
+    renderRulesTable();
+  } catch(e) { console.warn('Rules:', e); }
+}
+
+function renderRulesTable() {
+  const tbody = document.getElementById('rules-tbody');
+  if (!tbody) return;
+  if (!_rules.length) {
+    tbody.innerHTML = '<tr><td colspan="6" style="color:var(--very-dim);padding:20px">No rules defined.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = _rules.map(r => `
+    <tr>
+      <td>
+        <label class="toggle">
+          <input type="checkbox" ${r.enabled ? 'checked' : ''} onchange="toggleRule(${r.id}, this)">
+          <span class="toggle-slider"></span>
+        </label>
+      </td>
+      <td>${r.name}</td>
+      <td class="next-fire">${nextFireForRule(r)}</td>
+      <td>
+        <div class="rule-actions">
+          <button class="btn-icon" onclick="openModal(${r.id})">Edit</button>
+          <button class="btn-icon btn-delete" onclick="deleteRule(${r.id})">Delete</button>
+        </div>
+      </td>
+      <td style="color:var(--dim);font-size:0.82rem">${modeLabel(r.mode) || '—'}</td>
+      <td style="color:var(--dim);font-size:0.82rem">${r.reserve != null ? r.reserve + '%' : '—'}</td>
+    </tr>
+  `).join('');
+}
+
+async function toggleRule(id, checkbox) {
+  try {
+    const res = await fetch(`/api/rules/${id}/toggle`, { method: 'PUT' });
+    if (!res.ok) { checkbox.checked = !checkbox.checked; return; }
+    const data = await res.json();
+    checkbox.checked = data.enabled;
+    const rule = _rules.find(r => r.id === id);
+    if (rule) rule.enabled = data.enabled;
+  } catch(e) { checkbox.checked = !checkbox.checked; }
+}
+
+async function deleteRule(id) {
+  if (!confirm('Delete this rule?')) return;
+  try {
+    await fetch(`/api/rules/${id}`, { method: 'DELETE' });
+    await refreshRules();
+  } catch(e) { console.warn('Delete:', e); }
+}
+
+// ── Modal ─────────────────────────────────────────────────────────────────────
+let _condCount = 0;
+
+function openModal(id) {
+  _condCount = 0;
+  document.getElementById('cond-list').innerHTML = '';
+  document.getElementById('modal-title').textContent = id ? 'Edit Rule' : 'Add Rule';
+  document.getElementById('edit-id').value = id || '';
+
+  document.getElementById('f-name').value    = '';
+  document.getElementById('f-hour').value    = '0';
+  document.getElementById('f-minute').value  = '0';
+  document.getElementById('f-mode').value    = '';
+  document.getElementById('f-reserve').value = '';
+  document.getElementById('f-grid-charging').value = '';
+  document.getElementById('f-grid-export').value   = '';
+  document.querySelectorAll('.day-btn').forEach(b => b.classList.remove('selected'));
+  document.querySelectorAll('.month-btn').forEach(b => b.classList.remove('selected'));
+
+  if (id) {
+    const rule = _rules.find(r => r.id === id);
+    if (!rule) return;
+    document.getElementById('f-name').value   = rule.name;
+    document.getElementById('f-hour').value   = rule.hour;
+    document.getElementById('f-minute').value = rule.minute;
+    document.getElementById('f-mode').value   = rule.mode || '';
+    document.getElementById('f-reserve').value = rule.reserve != null ? rule.reserve : '';
+    document.getElementById('f-grid-charging').value = rule.grid_charging == null ? '' : (rule.grid_charging ? 'true' : 'false');
+    document.getElementById('f-grid-export').value   = rule.grid_export || '';
+    rule.days.forEach(d => {
+      const b = document.querySelector(`.day-btn[data-day="${d}"]`);
+      if (b) b.classList.add('selected');
+    });
+    rule.months.forEach(m => {
+      const b = document.querySelector(`.month-btn[data-month="${m}"]`);
+      if (b) b.classList.add('selected');
+    });
+    (rule.conditions || []).forEach(c => addCondRow(c));
+  }
+
+  document.getElementById('modal-backdrop').classList.add('open');
+}
+
+function closeModal() {
+  document.getElementById('modal-backdrop').classList.remove('open');
+}
+
+document.querySelectorAll('.day-btn').forEach(b => b.addEventListener('click', () => b.classList.toggle('selected')));
+document.querySelectorAll('.month-btn').forEach(b => b.addEventListener('click', () => b.classList.toggle('selected')));
+
+function addCondRow(data) {
+  const idx = _condCount++;
+  const logic    = data?.logic    || 'AND';
+  const type     = data?.type     || 'battery_pct';
+  const operator = data?.operator || '>';
+  const value    = data?.value    ?? '';
+
+  const row = document.createElement('div');
+  row.className = 'cond-row';
+  row.id = `cond-${idx}`;
+  row.innerHTML = `
+    <select class="form-select cond-logic">
+      <option value="AND" ${logic==='AND'?'selected':''}>AND</option>
+      <option value="OR"  ${logic==='OR' ?'selected':''}>OR</option>
+    </select>
+    <select class="form-select cond-type">
+      <option value="battery_pct" ${type==='battery_pct'?'selected':''}>Battery %</option>
+    </select>
+    <select class="form-select cond-op">
+      <option value=">"  ${ operator==='>'  ?'selected':''}>></option>
+      <option value="<"  ${ operator==='<'  ?'selected':''}>&#60;</option>
+      <option value=">=" ${ operator==='>=' ?'selected':''}>>=</option>
+      <option value="<=" ${ operator==='<=' ?'selected':''}>&#60;=</option>
+    </select>
+    <input class="form-input cond-val" type="number" min="0" max="100" value="${value}" placeholder="0">
+    <button type="button" class="btn-remove-cond" onclick="this.parentElement.remove()">×</button>
+  `;
+  document.getElementById('cond-list').appendChild(row);
+}
+
+function getConditions() {
+  return Array.from(document.querySelectorAll('#cond-list .cond-row')).map(row => ({
+    logic:    row.querySelector('.cond-logic').value,
+    type:     row.querySelector('.cond-type').value,
+    operator: row.querySelector('.cond-op').value,
+    value:    parseFloat(row.querySelector('.cond-val').value) || 0,
+  }));
+}
+
+async function saveRule() {
+  const id   = document.getElementById('edit-id').value;
+  const name = document.getElementById('f-name').value.trim();
+  if (!name) { alert('Name is required.'); return; }
+
+  const days   = Array.from(document.querySelectorAll('.day-btn.selected')).map(b => parseInt(b.dataset.day));
+  const months = Array.from(document.querySelectorAll('.month-btn.selected')).map(b => parseInt(b.dataset.month));
+  if (!days.length)   { alert('Select at least one day.');   return; }
+  if (!months.length) { alert('Select at least one month.'); return; }
+
+  const gc = document.getElementById('f-grid-charging').value;
+  const reserveVal = document.getElementById('f-reserve').value;
+
+  const body = {
+    name,
+    enabled: true,
+    days,
+    months,
+    hour:          parseInt(document.getElementById('f-hour').value) || 0,
+    minute:        parseInt(document.getElementById('f-minute').value) || 0,
+    mode:          document.getElementById('f-mode').value || null,
+    reserve:       reserveVal !== '' ? parseInt(reserveVal) : null,
+    grid_charging: gc === '' ? null : gc === 'true',
+    grid_export:   document.getElementById('f-grid-export').value || null,
+    conditions:    getConditions(),
+  };
+
+  try {
+    const url    = id ? `/api/rules/${id}` : '/api/rules';
+    const method = id ? 'PUT' : 'POST';
+    const res = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    if (!res.ok) { alert('Save failed.'); return; }
+    closeModal();
+    await refreshRules();
+  } catch(e) { alert('Save error: ' + e); }
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+poll();
+refreshChart();
+refreshWeather();
+refreshAutomations();
+refreshPool();
+refreshCosts();
+refreshRates();
+
+setInterval(poll,               10_000);
+setInterval(refreshChart,       60_000);
+setInterval(refreshWeather,    600_000);
+setInterval(refreshAutomations, 60_000);
+setInterval(refreshPool,        60_000);
+setInterval(refreshCosts,      300_000);
+setInterval(refreshRates,      600_000);
+</script>
+</body>
+</html>

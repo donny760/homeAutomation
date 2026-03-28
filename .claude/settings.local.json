@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py -m pip install flask --quiet)",
+      "Bash(py -c \"import flask; print\\(''flask'', flask.__version__\\)\")",
+      "Bash(py -c \"import pypowerwall; print\\(''pypowerwall ok''\\)\")",
+      "WebSearch"
+    ]
+  }
+}

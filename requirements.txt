@@ -1,0 +1,5 @@
+flask
+pypowerwall
+screenlogicpy
+pdfplumber
+requests
