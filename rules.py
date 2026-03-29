@@ -154,7 +154,33 @@ def init_db(conn):
             operator  TEXT NOT NULL,
             value     REAL NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS event_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          INTEGER NOT NULL,
+            system      TEXT NOT NULL,
+            event_type  TEXT NOT NULL,
+            title       TEXT NOT NULL,
+            detail      TEXT,
+            result      TEXT,
+            source      TEXT DEFAULT 'live',
+            battery_pct REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_event_log_ts     ON event_log(ts);
+        CREATE INDEX IF NOT EXISTS idx_event_log_system ON event_log(system);
     ''')
+    conn.commit()
+
+
+def log_event(conn, system, event_type, title, detail=None,
+              result=None, source='live', battery_pct=None):
+    conn.execute(
+        'INSERT INTO event_log '
+        '(ts, system, event_type, title, detail, result, source, battery_pct) '
+        'VALUES (?,?,?,?,?,?,?,?)',
+        (int(time.time()), system, event_type, title,
+         detail, result, source, battery_pct)
+    )
     conn.commit()
 
 
@@ -300,47 +326,76 @@ def get_live_state(pw) -> dict:
         return {'battery_pct': 0}
 
 
+# ── Mode label for display ────────────────────────────────────────────────────
+_MODE_LABEL = {
+    'self_consumption': 'Self-Powered',
+    'autonomous':       'Time-Based Control',
+    'backup':           'Backup',
+}
+
+
 # ── Apply Settings ────────────────────────────────────────────────────────────
-def apply_settings(pw, target: dict, last: dict) -> bool:
-    changed = False
+def apply_settings(pw, target: dict, last: dict,
+                   conn=None, battery_pct=None, first_run=False) -> bool:
+    """Apply target state to Powerwall. Logs one combined event row per call
+    (skipped on first_run to avoid startup-sync noise)."""
+    changes = []   # list of (label, event_type) for successful changes
+    errors  = []   # list of label strings for failures
 
     if target['reserve'] is not None and target['reserve'] != last.get('reserve'):
         result = pw.set_reserve(target['reserve'])
         if result is not None:
             log.info('set_reserve(%d%%) → OK', target['reserve'])
             last['reserve'] = target['reserve']
-            changed = True
+            changes.append((f"Reserve → {target['reserve']}%", 'reserve_changed'))
         else:
             log.error('set_reserve(%d%%) failed', target['reserve'])
+            errors.append(f"set_reserve({target['reserve']}%) failed")
 
     if target['mode'] is not None and target['mode'] != last.get('mode'):
         result = pw.set_mode(target['mode'])
         if result is not None:
             log.info('set_mode(%s) → OK', target['mode'])
             last['mode'] = target['mode']
-            changed = True
+            label = _MODE_LABEL.get(target['mode'], target['mode'])
+            changes.append((f"Mode → {label}", 'mode_changed'))
         else:
             log.error('set_mode(%s) failed', target['mode'])
+            errors.append(f"set_mode({target['mode']}) failed")
 
     if target['grid_charging'] is not None and target['grid_charging'] != last.get('grid_charging'):
         result = pw.set_grid_charging(target['grid_charging'])
         if result is not None:
             log.info('set_grid_charging(%s) → OK', target['grid_charging'])
             last['grid_charging'] = target['grid_charging']
-            changed = True
+            changes.append((f"Grid charging → {'ON' if target['grid_charging'] else 'OFF'}",
+                            'grid_charging_changed'))
         else:
             log.error('set_grid_charging(%s) failed', target['grid_charging'])
+            errors.append(f"set_grid_charging({target['grid_charging']}) failed")
 
     if target['grid_export'] is not None and target['grid_export'] != last.get('grid_export'):
         result = pw.set_grid_export(target['grid_export'])
         if result is not None:
             log.info('set_grid_export(%s) → OK', target['grid_export'])
             last['grid_export'] = target['grid_export']
-            changed = True
+            changes.append((f"Grid export → {target['grid_export']}", 'grid_export_changed'))
         else:
             log.error('set_grid_export(%s) failed', target['grid_export'])
+            errors.append(f"set_grid_export({target['grid_export']}) failed")
 
-    return changed
+    if conn and not first_run:
+        if changes:
+            title  = '  ·  '.join(label for label, _ in changes)
+            etype  = changes[0][1] if len(changes) == 1 else 'automation_fired'
+            log_event(conn, 'powerwall', etype, title,
+                      result='ok', battery_pct=battery_pct)
+        if errors:
+            log_event(conn, 'powerwall', 'error',
+                      '  ·  '.join(errors),
+                      result='failed', battery_pct=battery_pct)
+
+    return bool(changes or errors)
 
 
 # ── Main Loop ─────────────────────────────────────────────────────────────────
@@ -356,6 +411,7 @@ def main_loop(stop_fn=None):
     pw         = None
     last_eval  = 0.0
     last_state = {}
+    first_run  = True
 
     while True:
         if stop_fn and stop_fn():
@@ -394,7 +450,10 @@ def main_loop(stop_fn=None):
                 if nxt:
                     log.info('Next rule fires at %s', nxt.strftime('%Y-%m-%d %H:%M'))
 
-                changed = apply_settings(pw, target, last_state)
+                changed = apply_settings(pw, target, last_state,
+                                         conn=conn, battery_pct=live.get('battery_pct'),
+                                         first_run=first_run)
+                first_run = False
                 if not changed:
                     log.info('No changes needed.')
 

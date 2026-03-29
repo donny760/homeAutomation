@@ -5,7 +5,7 @@ Run: py backfill.py
 """
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import pypowerwall
 
@@ -20,7 +20,7 @@ def backfill():
     pw = pypowerwall.Powerwall('', cloudmode=True,
                                email=PW_EMAIL,
                                timeout=60, authpath=BASE_DIR)
-    print('Connected. Fetching history month by month...')
+    print('Connected. Fetching history day by day...')
 
     sites = pw.client.getsites()
     if not sites:
@@ -34,29 +34,27 @@ def backfill():
 
     conn = sqlite3.connect(DB_PATH)
     try:
-        now     = datetime.now(timezone.utc)
+        today   = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         current = START
 
-        while current <= now:
-            # Use first day of next month as end_date so period='month' covers the full month
-            year_next  = current.year + (current.month // 12)
-            month_next = (current.month % 12) + 1
-            end_dt     = datetime(year_next, month_next, 1, tzinfo=timezone.utc)
-            end_str    = end_dt.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-            month_lbl  = current.strftime('%Y-%m')
+        while current <= today:
+            next_day = current + timedelta(days=1)
+            end_str  = next_day.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+            day_lbl  = current.strftime('%Y-%m-%d')
+
             try:
                 data   = battery.get_calendar_history_data(
                     kind='power',
-                    period='month',
+                    period='day',
                     end_date=end_str,
                     timezone='America/Los_Angeles',
                 )
                 series = (data or {}).get('time_series', [])
             except Exception as e:
-                print(f'  {month_lbl}: error fetching — {e}')
+                print(f'  {day_lbl}: error fetching — {e}')
                 series = []
 
-            month_inserted = 0
+            day_inserted = 0
             for row in series:
                 raw_ts = row.get('timestamp', '')
                 try:
@@ -84,13 +82,12 @@ def backfill():
                 )
                 if cur.rowcount:
                     inserted += 1
-                    month_inserted += 1
+                    day_inserted += 1
                 else:
                     skipped += 1
 
-            print(f'  {month_lbl}: {len(series)} rows returned, {month_inserted} inserted')
-
-            current = end_dt  # already computed as first day of next month
+            print(f'  {day_lbl}: {len(series)} rows returned, {day_inserted} inserted')
+            current = next_day
 
         conn.commit()
     finally:
