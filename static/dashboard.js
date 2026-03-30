@@ -59,10 +59,24 @@ setInterval(tickClock, 1000);
 tickClock();
 
 // ── Theme toggle ──────────────────────────────────────────────────────────────
+function syncChartTheme(light) {
+  if (typeof dayChart === 'undefined' || !dayChart) return;
+  const gl = light ? 'transparent' : '#222226';
+  const tc = light ? '#6c6c70' : '#9e9c96';
+  const bc = light ? '#d8d8da' : '#333336';
+  dayChart.options.scales.x.grid.color = gl;
+  dayChart.options.scales.y.grid.color = gl;
+  dayChart.options.scales.x.ticks.color = tc;
+  dayChart.options.scales.y.ticks.color = tc;
+  dayChart.options.scales.x.border.color = bc;
+  dayChart.options.scales.y.border.color = bc;
+  dayChart.update('none');
+}
 function toggleTheme() {
   const isLight = document.body.classList.toggle('light');
   localStorage.setItem('theme', isLight ? 'light' : 'dark');
   document.getElementById('theme-btn').textContent = isLight ? 'Dark' : 'Light';
+  syncChartTheme(isLight);
 }
 (function applyTheme() {
   if (localStorage.getItem('theme') === 'light') {
@@ -105,6 +119,7 @@ const dayChart = new Chart(document.getElementById('day-chart').getContext('2d')
     }
   }
 });
+syncChartTheme(document.body.classList.contains('light'));
 
 async function refreshChart() {
   try {
@@ -627,6 +642,201 @@ async function deleteRule(id) {
   } catch(e) { console.warn('Delete:', e); }
 }
 
+// ── Insights Drawer (Gemini-powered) ─────────────────────────────────────────
+let _insightsOpen = false;
+let _insightsLoaded = false;
+
+const _severityIcon  = { warning: '\u26a0\ufe0f', suggestion: '\ud83d\udca1', info: '\u2139\ufe0f' };
+const _severityClass = { warning: 'severity-warning', suggestion: 'severity-suggestion', info: 'severity-info' };
+
+function _mdToHtml(md) {
+  // Process line by line for reliable rendering
+  const lines = md.split('\n');
+  let html = '';
+  let inUl = false, inOl = false, inTable = false;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    // Close open lists if non-list line
+    if (inUl && !/^[\*\-]\s/.test(trimmed) && !/^\s+[\*\-]\s/.test(line)) {
+      html += '</ul>'; inUl = false;
+    }
+    if (inOl && !/^\d+\.\s/.test(trimmed)) {
+      html += '</ol>'; inOl = false;
+    }
+
+    // Table rows
+    if (/^\|(.+)\|$/.test(trimmed)) {
+      const cells = trimmed.split('|').slice(1, -1).map(c => c.trim());
+      // Separator row (|---|---|)
+      if (cells.every(c => /^[-:]+$/.test(c))) continue;
+      if (!inTable) {
+        html += '<table><thead><tr>' + cells.map(c => '<th>' + c + '</th>').join('') + '</tr></thead><tbody>';
+        inTable = true;
+        continue;
+      }
+      html += '<tr>' + cells.map(c => '<td>' + c + '</td>').join('') + '</tr>';
+      continue;
+    }
+    if (inTable) { html += '</tbody></table>'; inTable = false; }
+
+    // Headings
+    if (/^###\s(.+)/.test(trimmed)) {
+      html += '<h4>' + trimmed.replace(/^###\s/, '') + '</h4>'; continue;
+    }
+    if (/^##\s(.+)/.test(trimmed)) {
+      html += '<h3>' + trimmed.replace(/^##\s/, '') + '</h3>'; continue;
+    }
+    if (/^#\s(.+)/.test(trimmed)) {
+      html += '<h2>' + trimmed.replace(/^#\s/, '') + '</h2>'; continue;
+    }
+
+    // Horizontal rule
+    if (/^---+$/.test(trimmed)) { html += '<hr>'; continue; }
+
+    // Bullet list
+    if (/^[\*\-]\s+(.*)/.test(trimmed)) {
+      if (!inUl) { html += '<ul>'; inUl = true; }
+      html += '<li>' + trimmed.replace(/^[\*\-]\s+/, '') + '</li>';
+      continue;
+    }
+    // Indented sub-bullet
+    if (/^\s+[\*\-]\s+(.*)/.test(line)) {
+      if (!inUl) { html += '<ul>'; inUl = true; }
+      html += '<li class="ai-sub">' + line.replace(/^\s+[\*\-]\s+/, '') + '</li>';
+      continue;
+    }
+
+    // Numbered list
+    if (/^\d+\.\s+(.*)/.test(trimmed)) {
+      if (!inOl) { html += '<ol>'; inOl = true; }
+      html += '<li>' + trimmed.replace(/^\d+\.\s+/, '') + '</li>';
+      continue;
+    }
+
+    // Empty line = paragraph break
+    if (trimmed === '') { html += '<br>'; continue; }
+
+    // Regular text
+    html += '<p>' + trimmed + '</p>';
+  }
+
+  if (inUl) html += '</ul>';
+  if (inOl) html += '</ol>';
+  if (inTable) html += '</tbody></table>';
+
+  // Inline formatting
+  html = html
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+?)\*/g, '<em>$1</em>')
+    .replace(/`([^`]+?)`/g, '<code>$1</code>');
+
+  return html;
+}
+
+function _renderRuleInsightsFallback(insights) {
+  if (!insights.length) return '<div class="insights-empty">No insights \u2014 your rules look good!</div>';
+  return '<div class="ai-fallback-note">Gemini unavailable \u2014 showing rule-based analysis</div>'
+    + insights.map(i => `
+      <div class="insight-card ${_severityClass[i.severity] || ''}">
+        <div class="insight-title">${_severityIcon[i.severity] || ''} ${i.title}</div>
+        <div class="insight-detail">${i.detail}</div>
+        <div class="insight-action">${i.action}</div>
+      </div>
+    `).join('');
+}
+
+const _thinkingTerms = [
+  'Rules', 'Rate Schedule', 'Usage Patterns', 'Solar Production',
+  'Battery Cycles', 'Export Credits', 'Seasonal Trends', 'Holidays',
+  'Cost Projections', 'TOU Periods', 'Grid Imports', 'True-Up Target',
+  'Overnight Charging', 'On-Peak Windows', 'Self-Powered Mode', 'Sunset Timing',
+  'Prior Year Data', 'Monthly Costs', 'Export Timing', 'Super Off-Peak Usage',
+  'Battery Reserve', 'Net Energy Balance', 'Daily Cycle', 'Weather Patterns',
+];
+let _thinkingInterval = null;
+
+function _startThinking(el) {
+  let idx = 0;
+  el.textContent = 'Analyzing with ' + _thinkingTerms[0] + '\u2026';
+  _thinkingInterval = setInterval(() => {
+    idx = (idx + 1) % _thinkingTerms.length;
+    el.textContent = 'Analyzing with ' + _thinkingTerms[idx] + '\u2026';
+  }, 1800);
+}
+
+function _stopThinking() {
+  if (_thinkingInterval) { clearInterval(_thinkingInterval); _thinkingInterval = null; }
+}
+
+async function toggleInsights() {
+  const drawer   = document.getElementById('insights-drawer');
+  const backdrop = document.getElementById('insights-backdrop');
+  _insightsOpen = !_insightsOpen;
+
+  if (_insightsOpen) {
+    drawer.classList.add('open');
+    backdrop.classList.add('open');
+    if (!_insightsLoaded) {
+      const body = document.getElementById('insights-body');
+      body.innerHTML = '<div class="ai-loading-pulse" id="ai-thinking"></div>';
+      document.getElementById('insights-elapsed').textContent = '';
+      _startThinking(document.getElementById('ai-thinking'));
+      const _t0 = Date.now();
+      try {
+        const res  = await fetch('/api/rules/ai-insights', { method: 'POST' });
+        _stopThinking();
+        const elapsed = ((Date.now() - _t0) / 1000).toFixed(1);
+        const data = await res.json();
+        if (data.ok) {
+          const now = new Date();
+          const timeStr = now.toLocaleTimeString('en-US', {hour: 'numeric', minute: '2-digit'});
+          const cached = data.cached ? ' (cached)' : '';
+          document.getElementById('insights-elapsed').textContent = elapsed + 's · ' + timeStr + cached;
+          const tableHtml = data.projection_table
+            ? '<h3>True-up Projection</h3><div class="ai-content">' + _mdToHtml(data.projection_table) + '</div><hr>'
+            : '';
+          const optHtml = data.optimized_table
+            ? '<h3>Projected True-Up After Changes</h3><div class="ai-content">' + _mdToHtml(data.optimized_table) + '</div>'
+            : '';
+          body.innerHTML = tableHtml + '<div class="ai-content">' + _mdToHtml(data.insights) + '</div>' + optHtml;
+          _insightsLoaded = true;
+        } else {
+          // Gemini failed — fall back to rule-based insights
+          const fallback = await fetch('/api/rules/insights').then(r => r.json());
+          body.innerHTML = '<div class="ai-error">' + (data.error || 'Gemini error') + '</div>'
+            + _renderRuleInsightsFallback(fallback);
+          _insightsLoaded = true;
+        }
+      } catch (e) {
+        _stopThinking();
+        // Network error — fall back to rule-based insights
+        try {
+          const fallback = await fetch('/api/rules/insights').then(r => r.json());
+          body.innerHTML = '<div class="ai-error">Could not reach Gemini API.</div>'
+            + _renderRuleInsightsFallback(fallback);
+        } catch (e2) {
+          body.innerHTML = '<div class="ai-error">Failed to load insights.</div>';
+        }
+        _insightsLoaded = true;
+      }
+    }
+  } else {
+    drawer.classList.remove('open');
+    backdrop.classList.remove('open');
+  }
+}
+
+function refreshInsightsData() {
+  _insightsLoaded = false;
+  if (_insightsOpen) {
+    toggleInsights();  // close
+    toggleInsights();  // reopen + reload
+  }
+}
+
 // ── Modal ─────────────────────────────────────────────────────────────────────
 let _condCount = 0;
 
@@ -749,6 +959,7 @@ async function saveRule() {
     const res = await fetch(url, { method, headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
     if (!res.ok) { alert('Save failed.'); return; }
     closeModal();
+    _insightsLoaded = false;
     await refreshRules();
   } catch(e) { alert('Save error: ' + e); }
 }

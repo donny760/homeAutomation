@@ -15,7 +15,7 @@
   <div class="nav-links">
     <button class="nav-link active" data-page="dashboard" onclick="showPage('dashboard')">Dashboard</button>
     <button class="nav-link"        data-page="events"    onclick="showPage('events')">Event Log</button>
-    <button class="nav-link"        data-page="rules"     onclick="showPage('rules')">Powerwall Rules</button>
+    <button class="nav-link"        data-page="rules"     onclick="showPage('rules')"><span class="nav-sparkle">&#10022;</span> Powerwall Rules</button>
     <button class="nav-link"        data-page="costs"     onclick="showPage('costs')">Energy Breakdown</button>
     <button class="nav-link"        data-page="settings"  onclick="showPage('settings')">Settings</button>
   </div>
@@ -234,17 +234,23 @@
     <!-- Tile 3: Pool -->
     <div class="tile">
       <div class="tile-title">Pool</div>
-      <div id="pool-temp"      class="tile-value tile-na">--°F</div>
-      <div id="pool-pump"      class="tile-sub tile-na"></div>
-      <div id="pool-edge-pump" class="tile-sub tile-na"></div>
-      <div id="pool-cleaner"   class="tile-sub tile-na"></div>
-      <div id="pool-salt"      class="tile-sub tile-na"></div>
+      <div class="tile-split">
+        <div id="pool-temp" class="tile-value tile-na">--°F</div>
+        <div class="tile-detail">
+          <div id="pool-pump"      class="tile-sub tile-na"></div>
+          <div id="pool-edge-pump" class="tile-sub tile-na"></div>
+          <div id="pool-cleaner"   class="tile-sub tile-na"></div>
+          <div id="pool-salt"      class="tile-sub tile-na"></div>
+        </div>
+      </div>
     </div>
     <!-- Tile 4: Security -->
     <div class="tile" id="security-tile">
       <div class="tile-title">Security</div>
-      <div id="sec-mode" class="tile-value tile-na">--</div>
-      <div id="sec-issues" class="tile-sub tile-na"></div>
+      <div class="tile-split">
+        <div id="sec-mode" class="tile-value tile-na">--</div>
+        <div id="sec-issues" class="tile-detail tile-sub tile-na"></div>
+      </div>
     </div>
   </div>
 
@@ -255,7 +261,10 @@
 
   <div class="rules-toolbar">
     <div class="page-title">Powerwall Rules</div>
-    <button class="btn-add" onclick="openModal(null)">+ Add Rule</button>
+    <div class="rules-toolbar-btns">
+      <button class="btn-insights" onclick="toggleInsights()">&#10022; Insights</button>
+      <button class="btn-add" onclick="openModal(null)">+ Add Rule</button>
+    </div>
   </div>
 
   <!-- Rate card -->
@@ -319,6 +328,20 @@
   </div>
 
 </div><!-- #page-rules -->
+
+<!-- ── Insights Drawer ───────────────────────────────────────────────────────-->
+<div id="insights-backdrop" class="insights-backdrop" onclick="toggleInsights()"></div>
+<div id="insights-drawer" class="insights-drawer">
+  <div class="insights-header">
+    <span class="insights-title">&#10022; Insights <span id="insights-elapsed" class="insights-elapsed"></span></span>
+    <button class="insights-close" onclick="toggleInsights()">&times;</button>
+  </div>
+  <div class="insights-scroll">
+    <div id="insights-body" class="insights-body">
+      <div class="ai-loading-pulse">Analyzing with Gemini…</div>
+    </div>
+  </div>
+</div>
 
 <!-- ── Page 3: Event Log ──────────────────────────────────────────────────────-->
 <div id="page-events" class="page">

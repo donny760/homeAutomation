@@ -11,9 +11,11 @@ import time
 import sqlite3
 import threading
 import urllib.request
+import requests as _requests
 from datetime import datetime, date, timedelta, timezone
 
 import asyncio
+import socket
 
 from flask import Flask, jsonify, send_file, request
 import pypowerwall
@@ -25,7 +27,7 @@ from fetch_rates import (
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PW_EMAIL          = 'don@nsdsolutions.com'
-PW_CAPACITY_KWH   = 13.5          # Powerwall 2 usable capacity
+PW_CAPACITY_KWH   = 40.5          # 3× Powerwall 2 usable capacity (3 × 13.5 kWh)
 BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
 DB_PATH           = os.path.join(BASE_DIR, 'powerwall.db')
 POLL_INTERVAL     = 10            # seconds between pypowerwall polls
@@ -39,6 +41,7 @@ ABODE_EMAIL         = 'don@nsdsolutions.com'
 ABODE_PASSWORD      = 'RKf3^KH^'
 
 app = Flask(__name__)
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # no browser caching of static files
 
 # Shared live-data cache
 _live: dict = {}
@@ -47,7 +50,8 @@ _lock = threading.Lock()
 # Pool cache
 _pool: dict    = {}
 _pool_ts: float = 0.0
-_pool_prev: dict = {}  # previous state for change detection
+_pool_prev: dict = {}       # previous state for change detection
+_pool_pending: dict = {}    # pending state changes (debounce — must persist 2 consecutive polls)
 
 # Security cache
 _security: dict    = {}
@@ -211,6 +215,9 @@ _SETTINGS_DEFAULTS = {
     'fe_events_interval':          '60000',   # event log
     'fe_security_interval':        '60000',   # security tile
     'security_poll_interval':      '30',      # backend cache TTL
+    # Gemini AI
+    'gemini_api_key':              '',
+    'gemini_model':                'gemini-2.0-flash',
 }
 
 def _seed_settings(conn):
@@ -578,6 +585,69 @@ def backfill_history() -> None:
         print(f'Backfill error: {exc}')
 
 
+# ── Public port check ────────────────────────────────────────────────────────
+_port_open: bool = False    # assume closed on startup (no log needed)
+_port_open_since: float = 0
+
+def _get_public_ip() -> str | None:
+    try:
+        req = urllib.request.Request('https://ifconfig.me', headers={'User-Agent': 'curl/7'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.read().decode().strip()
+    except Exception:
+        return None
+
+def check_public_port(port: int = 5000) -> None:
+    """Check if our public IP has the given port open; only log when OPEN."""
+    global _port_open, _port_open_since
+    pub_ip = _get_public_ip()
+    if not pub_ip:
+        return
+    try:
+        s = socket.create_connection((pub_ip, port), timeout=5)
+        s.close()
+        is_open = True
+    except (OSError, socket.timeout):
+        is_open = False
+
+    if is_open == _port_open:
+        if is_open and _port_open_since:
+            # Still open — update event with duration
+            mins = int((time.time() - _port_open_since) / 60)
+            if mins >= 5:
+                dur = f'{mins} min' if mins < 60 else f'{mins // 60}h {mins % 60}m'
+                title = f'Port {port} is OPEN publicly ({dur})'
+                detail = f'Public IP: {pub_ip}'
+                print(f'Port check: {title}')
+                with sqlite3.connect(DB_PATH) as c:
+                    # Update the existing open event instead of creating new ones
+                    c.execute(
+                        'UPDATE event_log SET title=?, ts=? '
+                        'WHERE system="system" AND event_type="port_check" AND result="warning" '
+                        'ORDER BY ts DESC LIMIT 1',
+                        (title, int(time.time()))
+                    )
+        return
+
+    _port_open = is_open
+
+    if is_open:
+        _port_open_since = time.time()
+        title = f'Port {port} is OPEN publicly'
+        detail = f'Public IP: {pub_ip}'
+        print(f'Port check: {title} ({detail})')
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute(
+                'INSERT INTO event_log '
+                '(ts, system, event_type, title, detail, result, source) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (int(time.time()), 'system', 'port_check', title, detail, 'warning', 'live')
+            )
+    else:
+        # Port closed — silently update state, no log entry
+        _port_open_since = 0
+
+
 # ── Poller thread ─────────────────────────────────────────────────────────────
 def poller() -> None:
     pw = None
@@ -588,6 +658,7 @@ def poller() -> None:
     last_rates_check = 0
     last_rachio_event_poll = 0
     last_rain_skip_check = 0
+    last_port_check = 0
 
     while True:
         poll_interval = get_setting_int('powerwall_poll_interval', POLL_INTERVAL)
@@ -696,6 +767,14 @@ def poller() -> None:
                     print(f'Rain skip check error: {exc}')
                     _log_system_error('rachio', 'Rain skip check error', str(exc))
                 last_rain_skip_check = now
+
+            # Public port exposure check (every 5 min)
+            if now - last_port_check >= 300:
+                try:
+                    check_public_port()
+                except Exception as exc:
+                    print(f'Port check error: {exc}')
+                last_port_check = now
 
         except Exception as exc:
             print(f'Poller error: {exc}')
@@ -812,6 +891,7 @@ async def _pool_fetch_async() -> dict:
         pump0  = _key(pump,    0, '0') or {}
         c505   = _key(circuit, 505, '505') or {}
         c500   = _key(circuit, 500, '500') or {}
+        c506   = _key(circuit, 506, '506') or {}
         c508   = _key(circuit, 508, '508') or {}
 
         temp_f  = _nested(pool_b, 'last_temperature', 'value')
@@ -822,10 +902,10 @@ async def _pool_fetch_async() -> dict:
         hm_opts = _nested(pool_b, 'heat_mode', 'enum_options') or []
         heat_mode = hm_opts[hm_idx] if (hm_idx is not None and isinstance(hm_opts, list) and hm_idx < len(hm_opts)) else None
 
-        # Pump 1 = pool pump, pump 0 = edge/booster pump
+        # Pump 1 = pool pump; edge pump via circuit 506 (pump 0 is unreliable)
         pool_pump_on    = bool(_nested(pump1, 'state', 'value'))
         pool_pump_watts = _nested(pump1, 'watts_now', 'value')
-        edge_pump_on    = bool(_nested(pump0, 'state', 'value'))
+        edge_pump_on    = bool(_nested(c506, 'value'))
 
         # Circuits
         pool_circuit_on = bool(_nested(c505, 'value'))
@@ -868,34 +948,49 @@ _POOL_EVENT_FIELDS = {
 
 
 def _log_pool_changes(new: dict) -> None:
-    """Compare new pool state against previous and log any changes."""
-    global _pool_prev
+    """Compare new pool state against previous and log confirmed changes.
+
+    Debounce: a state change must persist for 2 consecutive polls before
+    logging.  This filters out single-sample flickers from ScreenLogic
+    (e.g. edge pump briefly reporting None/0 then back to 1).
+    """
+    global _pool_prev, _pool_pending
     if not _pool_prev:
         # First fetch — seed state, don't log
         _pool_prev = {k: new.get(k) for k in _POOL_EVENT_FIELDS}
+        _pool_pending = {}
         return
     now = int(time.time())
     try:
         with sqlite3.connect(DB_PATH) as c:
             for field, (event_type, label) in _POOL_EVENT_FIELDS.items():
-                old_val = _pool_prev.get(field)
+                confirmed_val = _pool_prev.get(field)
                 new_val = new.get(field)
-                if old_val == new_val:
+                if confirmed_val == new_val:
+                    # Stable — clear any pending change for this field
+                    _pool_pending.pop(field, None)
                     continue
-                state = 'on' if new_val else 'off'
-                title = f'{label} turned {state}'
-                detail = None
-                if field == 'pump_on' and new_val and new.get('pump_watts'):
-                    detail = f'{new["pump_watts"]} W'
-                c.execute(
-                    'INSERT INTO event_log '
-                    '(ts, system, event_type, title, detail, result, source) '
-                    'VALUES (?,?,?,?,?,?,?)',
-                    (now, 'pool', event_type, title, detail, 'ok', 'live')
-                )
+                # Value differs from confirmed state
+                if _pool_pending.get(field) == new_val:
+                    # Same new value two polls in a row — confirmed real change
+                    state = 'on' if new_val else 'off'
+                    title = f'{label} turned {state}'
+                    detail = None
+                    if field == 'pump_on' and new_val and new.get('pump_watts'):
+                        detail = f'{new["pump_watts"]} W'
+                    c.execute(
+                        'INSERT INTO event_log '
+                        '(ts, system, event_type, title, detail, result, source) '
+                        'VALUES (?,?,?,?,?,?,?)',
+                        (now, 'pool', event_type, title, detail, 'ok', 'live')
+                    )
+                    _pool_prev[field] = new_val
+                    _pool_pending.pop(field, None)
+                else:
+                    # First time seeing this new value — mark pending, wait for confirmation
+                    _pool_pending[field] = new_val
     except Exception as exc:
         print(f'Pool event log error: {exc}')
-    _pool_prev = {k: new.get(k) for k in _POOL_EVENT_FIELDS}
 
 
 def fetch_pool() -> dict:
@@ -1788,6 +1883,7 @@ def api_rules_post():
         ).fetchone()
         conds = c.execute('SELECT rule_id,logic,type,operator,value FROM rule_conditions WHERE rule_id=?', (rid,)).fetchall()
     cond_list = [{'logic': r[1], 'type': r[2], 'operator': r[3], 'value': r[4]} for r in conds]
+    _ai_cache['ts'] = 0  # invalidate AI insights cache
     return jsonify(_rule_row_to_dict(row, cond_list)), 201
 
 
@@ -1819,6 +1915,7 @@ def api_rules_put(rid):
     if not row:
         return jsonify({'error': 'not found'}), 404
     cond_list = [{'logic': r[1], 'type': r[2], 'operator': r[3], 'value': r[4]} for r in conds]
+    _ai_cache['ts'] = 0  # invalidate AI insights cache
     return jsonify(_rule_row_to_dict(row, cond_list))
 
 
@@ -1827,6 +1924,7 @@ def api_rules_delete(rid):
     with sqlite3.connect(DB_PATH) as c:
         c.execute('PRAGMA foreign_keys = ON')
         c.execute('DELETE FROM rules WHERE id=?', (rid,))
+    _ai_cache['ts'] = 0
     return '', 204
 
 
@@ -1840,6 +1938,917 @@ def api_rules_toggle(rid):
     if not row:
         return jsonify({'error': 'not found'}), 404
     return jsonify({'id': rid, 'enabled': bool(row[2])})
+
+
+# ── Rules Insights engine ────────────────────────────────────────────────────
+_HOLIDAY_NAMES = {
+    (1, 1): "New Year's Day", (7, 4): 'Independence Day',
+    (11, 11): "Veterans Day", (12, 25): 'Christmas Day',
+}
+
+
+def _holiday_name(d):
+    """Return display name for an SDG&E holiday date."""
+    key = (d.month, d.day)
+    if key in _HOLIDAY_NAMES:
+        return _HOLIDAY_NAMES[key]
+    if d.month == 2 and d.weekday() == 0 and 15 <= d.day <= 21:
+        return "Presidents' Day"
+    if d.month == 5 and d.weekday() == 0 and d.day >= 25:
+        return 'Memorial Day'
+    if d.month == 9 and d.weekday() == 0 and d.day <= 7:
+        return 'Labor Day'
+    if d.month == 11 and d.weekday() == 3 and 22 <= d.day <= 28:
+        return 'Thanksgiving'
+    return 'SDG&E Holiday'
+
+
+def _analyze_rules(rules, rates, holidays):
+    """Deterministic analysis of Powerwall rules against EV-TOU-2 rate schedule."""
+    insights = []
+    now = datetime.now()
+    today = now.date()
+
+    enabled = [r for r in rules if r.get('enabled')]
+    sop_winter = rates.get('winter_super_off_peak', 0.25)
+    sop_summer = rates.get('summer_super_off_peak', 0.26)
+    on_summer  = rates.get('summer_on_peak', 0.78)
+    on_winter  = rates.get('winter_on_peak', 0.51)
+
+    # ── 1. Grid charging window duration ─────────────────────────────────────
+    charge_on  = [r for r in enabled if r.get('grid_charging') is True]
+    charge_off = [r for r in enabled if r.get('grid_charging') is False]
+
+    if charge_on:
+        for on_r in charge_on:
+            on_min  = on_r['hour'] * 60 + on_r['minute']
+            on_days = set(on_r['days'])
+            best_off = None
+            for off_r in charge_off:
+                off_min = off_r['hour'] * 60 + off_r['minute']
+                if off_min > on_min and on_days & set(off_r['days']):
+                    if best_off is None or off_min < best_off['hour'] * 60 + best_off['minute']:
+                        best_off = off_r
+            if best_off:
+                window = (best_off['hour'] * 60 + best_off['minute']) - on_min
+                if window < 180:
+                    kwh = round(window * 5 / 60, 1)
+                    insights.append({
+                        'severity': 'warning',
+                        'title':  f'Grid charging window is only {window} minutes',
+                        'detail': (
+                            f'"{on_r["name"]}" charges from {on_r["hour"]}:{on_r["minute"]:02d} '
+                            f'until "{best_off["name"]}" stops it at {best_off["hour"]}:{best_off["minute"]:02d}. '
+                            f'At ~5 kW that adds only ~{kwh} kWh to a 40.5 kWh battery bank (3× Powerwall 2). '
+                            f'Super off-peak runs midnight\u20136 AM at ${sop_winter:.3f}/kWh.'
+                        ),
+                        'action': 'Start grid charging earlier (midnight or 1 AM) to fully charge at super off-peak rates.',
+                        'rule_id': on_r['id'],
+                    })
+    else:
+        insights.append({
+            'severity': 'suggestion',
+            'title':  'No grid charging rules configured',
+            'detail': (
+                f'Charging from grid during super off-peak (${sop_winter:.3f}/kWh) offsets '
+                f'on-peak usage (${on_summer:.3f}/kWh) \u2014 a {on_summer / sop_winter:.1f}x saving.'
+            ),
+            'action': 'Add a rule to enable grid charging during midnight\u20136 AM (super off-peak).',
+        })
+
+    # ── 2. Sunday grid charging gap ──────────────────────────────────────────
+    if charge_on:
+        charge_days = set()
+        for r in charge_on:
+            charge_days.update(r['days'])
+        if 6 not in charge_days:  # 6 = Sunday
+            insights.append({
+                'severity': 'suggestion',
+                'title':  'Sunday excluded from grid charging',
+                'detail': (
+                    'Grid charging rules cover Mon\u2013Sat but skip Sunday. '
+                    'The Powerwall may not be topped off for Sunday\u2019s on-peak hours.'
+                ),
+                'action': 'Add Sunday to an existing grid charging rule or create a Sunday-specific rule.',
+            })
+
+    # ── 3. Mar/Apr weekday super off-peak window ────────────────────────────
+    mar_apr_tbc = [r for r in enabled
+                   if r.get('mode') == 'autonomous'
+                   and {3, 4} & set(r['months'])
+                   and {0, 1, 2, 3, 4} & set(r['days'])
+                   and 10 <= r['hour'] < 14]
+    if not mar_apr_tbc:
+        insights.append({
+            'severity': 'suggestion',
+            'title':  'Mar/Apr weekday super off-peak window not utilized',
+            'detail': (
+                'EV-TOU-2 has a bonus super off-peak window 10 AM\u20132 PM on weekdays in March & April '
+                f'(${sop_winter:.3f}/kWh). Switching to Time-Based Control enables grid charging.'
+            ),
+            'action': 'Create rules: Time-Based Control at 10 AM and Self-Powered at 2 PM, weekdays, Mar\u2013Apr.',
+        })
+
+    # ── 4. No rule at 4 PM on-peak boundary ─────────────────────────────────
+    at_4pm = [r for r in enabled if r['hour'] == 16 and r['minute'] <= 5]
+    if not at_4pm:
+        insights.append({
+            'severity': 'suggestion',
+            'title':  'No rule at 4 PM on-peak boundary',
+            'detail': (
+                f'On-peak starts at 4 PM (${on_summer:.3f}/kWh summer, ${on_winter:.3f}/kWh winter). '
+                f'No rule adjusts Powerwall settings at this critical transition.'
+            ),
+            'action': 'Consider a 4 PM rule to set Self-Powered mode and verify reserve covers the 4\u20139 PM peak.',
+        })
+
+    # ── 5. Summer battery export starts late ─────────────────────────────────
+    summer = {6, 7, 8, 9, 10}
+    weekday_export = [r for r in enabled
+                      if r.get('grid_export') == 'battery_ok'
+                      and summer & set(r['months'])
+                      and {0, 1, 2, 3, 4} & set(r['days'])]
+    for r in weekday_export:
+        if r['hour'] >= 18:
+            missed = r['hour'] - 16
+            insights.append({
+                'severity': 'suggestion',
+                'title':  f'Battery export starts at {r["hour"]}:{r["minute"]:02d} \u2014 on-peak begins 4 PM',
+                'detail': (
+                    f'"{r["name"]}" enables battery export {missed}+ hours after on-peak starts. '
+                    f'On-peak runs 4\u20139 PM at ${on_summer:.3f}/kWh.'
+                ),
+                'action': 'Consider starting export at 5 PM or 6 PM to capture more on-peak value.',
+                'rule_id': r['id'],
+            })
+
+    # ── 6. November in summer export rules ───────────────────────────────────
+    nov_export = [r for r in enabled
+                  if r.get('grid_export') == 'battery_ok'
+                  and 11 in set(r['months'])
+                  and summer & set(r['months'])]
+    if nov_export:
+        insights.append({
+            'severity': 'info',
+            'title':  'November grouped with summer in export rules',
+            'detail': (
+                f'SDG&E classifies November as winter (on-peak ${on_winter:.3f} vs summer ${on_summer:.3f}/kWh). '
+                f'Export is still profitable but sunset is earlier \u2014 less solar by 7 PM.'
+            ),
+            'action': 'Consider separate November export rules with earlier timing for shorter daylight.',
+        })
+
+    # ── 7. Upcoming weekday holidays ─────────────────────────────────────────
+    upcoming = sorted(d for d in holidays if today <= d <= today + timedelta(days=90))
+    weekday_holidays = [d for d in upcoming if d.weekday() < 5]
+
+    for hd in weekday_holidays:
+        name = _holiday_name(hd)
+        day_name = hd.strftime('%A')
+        insights.append({
+            'severity':     'warning',
+            'title':        f'{name} ({hd.strftime("%b %d")}) falls on a {day_name}',
+            'detail': (
+                f'{name} uses the weekend/holiday TOU schedule: super off-peak midnight\u20132 PM, '
+                f'on-peak 4\u20139 PM. Your weekday rules will fire but assume the regular schedule '
+                f'(super off-peak only midnight\u20136 AM).'
+            ),
+            'action': (
+                f'Disable weekday rules for {hd.strftime("%b %d")} or create holiday rules '
+                f'that leverage the extended super off-peak window (midnight\u20132 PM).'
+            ),
+            'holiday_date': hd.isoformat(),
+        })
+
+    # ── 8. Holiday calendar health ───────────────────────────────────────────
+    if not holidays:
+        insights.append({
+            'severity': 'warning',
+            'title':  'No holiday dates configured',
+            'detail': (
+                'SDG&E holidays use a different TOU schedule (super off-peak midnight\u20132 PM). '
+                'Without holiday dates, rules can\u2019t account for these changes.'
+            ),
+            'action': 'Refresh holiday dates via Settings.',
+        })
+    elif all(d < today for d in holidays):
+        insights.append({
+            'severity': 'warning',
+            'title':  'All holiday dates have passed',
+            'detail': (
+                f'The last holiday was {max(holidays).isoformat()}. '
+                f'Holiday dates need refreshing for upcoming holidays.'
+            ),
+            'action': 'Refresh holiday dates via Settings or wait for automatic refresh.',
+        })
+
+    return insights
+
+
+@app.route('/api/rules/insights')
+def api_rules_insights():
+    with sqlite3.connect(DB_PATH) as c:
+        rules = _load_all_rules(c)
+    rates    = load_rates() or {}
+    holidays = SDGE_HOLIDAYS
+    insights = _analyze_rules(rules, rates, holidays)
+    return jsonify(insights)
+
+
+# ── Gemini AI Insights ───────────────────────────────────────────────────────
+_GEMINI_SYSTEM = """\
+You are an energy optimization advisor for a specific home in San Diego, CA.
+
+## System
+- 3× Tesla Powerwall 2 (40.5 kWh total usable capacity, ~90% round-trip efficiency)
+- Rooftop solar — production varies seasonally (San Diego: ~10–14 kWh/day winter,
+  ~22–30 kWh/day summer due to longer daylight hours June–October)
+- SDG&E EV-TOU-2 rate plan — use the EXACT rate values from the rates object in
+  the provided data, never guess or use generic values
+- Annual true-up in January
+- IMPORTANT: SDG&E does NOT pay out excess true-up credits — they pay close to nothing.
+  The homeowner's goal is to land near net-zero with a small credit buffer ($100–$500).
+  Overproducing credits is wasted energy. The current rules were intentionally tuned to
+  be conservative on exports, but the additional grid import from overnight charging
+  wasn't fully accounted for, resulting in the current projected deficit.
+  Recommendations should close that gap without overshooting into excessive credits.
+- Location: San Diego — mild winters, long sunny summers. June–October daylight runs
+  ~13–14 hours vs ~10 hours in winter, meaning significantly more solar production
+  and longer afternoon export windows
+
+## Data conventions — read carefully
+- battery_w: positive = charging, negative = discharging
+- grid_w: positive = importing from grid, negative = exporting to grid
+- on_peak_cost / off_peak_cost / super_off_peak_cost: signed net values —
+  negative = net credit earned
+- rule_based_insights: deterministic gaps already identified by a separate analysis
+  engine — do NOT repeat these findings, go deeper or synthesize across them
+
+## Rate structure
+Use the exact summer_on_peak, summer_off_peak, summer_super_off_peak, winter_on_peak,
+winter_off_peak, winter_super_off_peak values from the rates object provided.
+
+Key EV-TOU-2 nuances:
+- On-peak (4–9 PM) applies EVERY day including weekends and holidays — no exemptions
+- Super off-peak bonus window: 10 AM–2 PM weekdays in March and April only
+- Holidays follow weekend schedule: super off-peak all day except 4–9 PM on-peak
+- November is WINTER season despite being adjacent to summer export months
+
+## How to read the rules
+The rules array defines the automation schedule. Each rule fires at hour:minute on
+the specified days (0=Mon..6=Sun) and months (1=Jan..12=Dec). Rules change only the
+fields they specify — null fields carry forward from the previous rule.
+
+Key fields: mode (self_consumption | autonomous | backup), reserve (battery floor %),
+grid_charging (true/false), grid_export (battery_ok | pv_only).
+
+IMPORTANT: grid_export = battery_ok means ACTIVE continuous battery discharge to grid
+at up to ~15 kW combined (3× Powerwall). At 1% reserve, nearly the full 40.5 kWh
+is available to export. This is NOT passive solar overflow.
+
+The design principles behind the rules (read the actual rules data for specific times):
+
+- The system is tuned so the home NEVER buys expensive grid power. Every kWh comes
+  from either super off-peak grid (cheapest), solar (free), or battery (charged from
+  cheap sources).
+- Overnight: home runs on grid at super off-peak. There is NO solar before ~6:30 AM
+  in San Diego. Do NOT describe any pre-dawn hours as "solar time."
+- Daytime (Self-Powered mode): solar does the heavy lifting — powers home, charges
+  battery to 100%, exports excess. Grid is barely touched.
+- Battery export starts around sunset when solar drops off. Before sunset, solar is
+  still producing and covering everything for free.
+- Export stops before the battery is fully drained — enough reserve is kept to power
+  the home through to midnight, avoiding expensive grid imports. At midnight, grid
+  takes over again at super off-peak.
+- If the true-up shows a deficit, it means super off-peak imports exceed total exports.
+  The fix is to INCREASE EXPORTS, not decrease imports — imports are already at the
+  cheapest rates possible.
+- When evaluating export timing: once the battery reaches 100% and solar is still
+  producing, the battery is idle. Starting active battery export at that point would
+  not reduce solar benefit because solar is already covering the home. Analyze the
+  hourly readings to find when this window occurs and whether earlier export could
+  close the deficit gap. Show the tradeoff with actual numbers.
+
+## Prior year data — critical for projections
+The `prior_year_monthly` array contains ACTUAL monthly performance from the previous
+year. This is real measured data from the same house, same solar panels, same location.
+It reflects real San Diego solar production, weather patterns, and consumption by month.
+
+IMPORTANT: The prior year used a DIFFERENT automation strategy (Time-Based Control —
+Tesla's automatic algorithm). The current year uses custom rules that deliberately
+import more during super off-peak (grid charging) to build up battery for on-peak
+export. This means:
+- Winter months will show HIGHER imports in the current year (by design)
+- Summer months should show HIGHER export credits (the payoff)
+- Do NOT extrapolate from the most recent month to project summer — summer and
+  winter behave fundamentally differently in San Diego
+
+## Your analysis — cover all four areas:
+
+**1. True-up trajectory**
+
+The `trueup_projection_table` field contains a PRE-RENDERED markdown table.
+These numbers were computed server-side with exact arithmetic.
+
+The table is displayed separately in the UI — DO NOT reproduce it in your response.
+DO NOT output a markdown table of the projection numbers.
+Instead, reference the numbers directly in your analysis (e.g., "June shows -$234 credit").
+
+Analyze:
+- Is the full-year net positive (owe SDG&E) or negative (credit)?
+- Which months drive the most credit? Which are the biggest costs?
+- Is the current trajectory on track for net-zero or net-credit at true-up?
+- What is the biggest risk to the projection?
+
+The table MUST appear before any rule change recommendations.
+
+**2. Seasonal transition impact**
+Based on the current season and when the next season starts:
+- Walk through what happens on a typical day in the upcoming season based on the
+  current rules — what mode is the system in at each key time of day?
+- How will the season shift affect solar production, electricity rates, and the
+  opportunity to sell power back to the grid?
+- What rule changes should be made BEFORE the transition?
+- Address the battery export window timing given longer summer daylight hours
+
+**3. Rule optimization**
+Review the current rules against actual usage patterns. Focus on:
+- Is the battery sitting fully charged during the expensive on-peak hours (4-9 PM)
+  without actively exporting? How much money is being left on the table, and what
+  would it cost in overnight charging to make up for earlier export?
+- Is the overnight grid charging window long enough to fully recharge the battery?
+  If not, how much longer does it need to be?
+- Are there months where battery export rules are active but shouldn't be (like
+  November, which is actually a winter month)?
+- Are any days of the week missing from the export schedule?
+For each suggestion, estimate the dollar impact per month using actual rates.
+
+**4. Credit maximization**
+Looking at the daily cost data:
+- On days where little or no on-peak credit was earned, what likely went wrong?
+  (cloudy day? battery not full? no export rule active?)
+- Are there consistent patterns between high-credit days and low-credit days?
+- Given the 40.5 kWh battery capacity that can actively discharge to the grid,
+  where are the biggest untapped opportunities to earn more credits?
+
+## Format
+Use markdown. Use the actual rate values and cost figures from the data — no generic estimates.
+Do not repeat findings already listed in rule_based_insights.
+
+CRITICAL — Write for a homeowner, not an engineer:
+- Use natural language for days: "Monday through Friday" or "Weekdays" or "Every day" — never arrays like [0,1,2,3,4].
+- Use natural language for months: "June through October" — never arrays like [6,7,8,9,10].
+- Use 12-hour time: "5:00 PM" — never "hour: 17" or "19:15".
+- Never reference internal field names in your output. Instead of "grid_export = battery_ok",
+  say "battery export to grid". Instead of "on_peak_kwh" or "on_peak_cost", say "on-peak usage"
+  or "on-peak credits". Instead of "daily_costs" or "hourly_readings", say "your daily cost data"
+  or "your recent power readings". Instead of "self_consumption mode", say "Self-Powered mode".
+  Instead of "autonomous mode", say "Time-Based Control mode".
+- For rule recommendations: explain WHY the change helps and the expected dollar impact.
+  Do NOT walk the user through how to create or edit a rule — they know how.
+  Example: "Starting battery export at 5 PM instead of 7:15 PM would capture 2 extra hours
+  of on-peak rates, adding approximately $X per month in credits toward net-zero."
+- Never output JSON, arrays, code blocks, or raw data field names in recommendations.
+- Use dollar amounts to justify every recommendation.
+
+Keep the total response focused — depth over breadth.
+
+After all rule recommendations, end with:
+
+**5. Projected impact**
+A pre-calculated "After Changes" projection table is displayed in the UI alongside
+the baseline. It models adding winter on-peak battery export for months that currently
+have no export rules. These numbers are computed server-side — DO NOT reproduce them.
+
+Analyze:
+- Does the optimized projection bring the full-year net into the $100–$500 credit range?
+- If it overshoots, suggest scaling back (fewer months, higher reserve)
+- If it falls short, suggest what additional changes could help
+- Compare the baseline total vs optimized total and state the improvement\
+"""
+
+
+def _aggregate_monthly_power(c, year):
+    """Aggregate solar_w and home_w from readings into monthly kWh."""
+    result = {}
+    for month in range(1, 13):
+        start = int(datetime(year, month, 1).timestamp())
+        end = int(datetime(year + (1 if month == 12 else 0),
+                           (month % 12) + 1, 1).timestamp())
+        row = c.execute(
+            'SELECT COUNT(*), SUM(solar_w), SUM(home_w), '
+            '       (MAX(timestamp) - MIN(timestamp)) / NULLIF(COUNT(*) - 1.0, 0) '
+            'FROM readings WHERE timestamp >= ? AND timestamp < ? AND solar_w IS NOT NULL',
+            (start, end)
+        ).fetchone()
+        count = row[0] or 0
+        if count < 100:
+            result[month] = {'solar_kwh': 0, 'home_kwh': 0}
+            continue
+        avg_interval_h = (row[3] or 300) / 3600.0
+        result[month] = {
+            'solar_kwh': round((row[1] or 0) * avg_interval_h / 1000, 1),
+            'home_kwh': round((row[2] or 0) * avg_interval_h / 1000, 1),
+        }
+    return result
+
+
+def _render_projection_table(projection):
+    """Render a projection list as a markdown table."""
+    lines = ['| Month | Label | Import kWh | Export kWh | Import Cost | Export Credit | Base Charge | Net |',
+             '|---|---|---|---|---|---|---|---|']
+    t_ikwh = t_ekwh = t_icost = t_ecred = t_base = t_net = 0
+    for p in projection:
+        lines.append(f'| {p["month"]} | {p["label"]} | {p["import_kwh"]:.1f} | {p["export_kwh"]:.1f} '
+                     f'| ${p["import_cost"]:.2f} | ${p["export_credit"]:.2f} '
+                     f'| ${p["base_charge"]:.2f} | ${p["net"]:.2f} |')
+        t_ikwh += p['import_kwh']; t_ekwh += p['export_kwh']
+        t_icost += p['import_cost']; t_ecred += p['export_credit']
+        t_base += p['base_charge']; t_net += p['net']
+    lines.append(f'| **Total** | | **{t_ikwh:.1f}** | **{t_ekwh:.1f}** '
+                 f'| **${t_icost:.2f}** | **${t_ecred:.2f}** '
+                 f'| **${t_base:.2f}** | **${t_net:.2f}** |')
+    return '\n'.join(lines)
+
+
+def _build_trueup_projection(c, rates, base_charge_per_day):
+    """Pre-calculate baseline + optimized projection tables using solar-based approach."""
+    import calendar
+    now = datetime.now()
+    this_year = now.year
+    prior_year = this_year - 1
+    CAPACITY = 40.5
+    EFFICIENCY = 0.90
+    CHARGE_RATE_KW = 15.0  # 3× Powerwall combined
+
+    # ── Gather data ──────────────────────────────────────────────────────────
+    # Current year actuals from daily_costs
+    cy_rows = c.execute(
+        'SELECT substr(date,1,7) as m, SUM(import_kwh), SUM(export_kwh), '
+        '       SUM(import_cost), SUM(export_credit), COUNT(date) '
+        'FROM daily_costs WHERE date >= ? AND date < ? '
+        'GROUP BY substr(date,1,7) ORDER BY 1',
+        (f'{this_year}-01-01', f'{this_year + 1}-01-01')
+    ).fetchall()
+    cy_data = {}
+    for row in cy_rows:
+        cy_data[row[0]] = {
+            'import_kwh': row[1] or 0, 'export_kwh': row[2] or 0,
+            'import_cost': row[3] or 0, 'export_credit': row[4] or 0,
+            'days': row[5],
+        }
+
+    # Prior year solar + home from readings (for context)
+    py_power = _aggregate_monthly_power(c, prior_year)
+    cy_power = _aggregate_monthly_power(c, this_year)
+
+    # Prior year monthly import/export from daily_costs (for projection baseline)
+    py_dc_rows = c.execute(
+        'SELECT substr(date,1,7) as m, SUM(import_kwh), SUM(export_kwh) '
+        'FROM daily_costs WHERE date >= ? AND date < ? '
+        'GROUP BY substr(date,1,7) ORDER BY 1',
+        (f'{prior_year}-01-01', f'{prior_year + 1}-01-01')
+    ).fetchall()
+    py_dc_data = {}
+    for row in py_dc_rows:
+        py_dc_data[f'{prior_year}-{row[0][5:7]}'] = {
+            'import_kwh': row[1] or 0, 'export_kwh': row[2] or 0,
+        }
+
+    # Home consumption ratio — Q1 is winter, so ratio applies best to winter months.
+    # Summer home usage is more sun-driven (AC, etc.) so cap the summer ratio at 1.1×
+    cy_q1_home = sum(cy_power.get(m, {}).get('home_kwh', 0) for m in [1, 2, 3])
+    py_q1_home = sum(py_power.get(m, {}).get('home_kwh', 0) for m in [1, 2, 3])
+    winter_home_ratio = cy_q1_home / py_q1_home if py_q1_home > 0 else 1.0
+    summer_home_ratio = min(winter_home_ratio, 1.10)  # cap summer at 10% increase
+
+    # Rate periods
+    rate_periods = c.execute(
+        'SELECT effective_date, end_date, '
+        '       summer_on_peak, summer_off_peak, summer_super_off_peak, '
+        '       winter_on_peak, winter_off_peak, winter_super_off_peak '
+        'FROM rate_history ORDER BY effective_date'
+    ).fetchall()
+
+    # ── Estimate grid charging + export from current rules ───────────────────
+    # Read rules to determine: which months have grid charging? which have export?
+    rules = c.execute(
+        'SELECT months, hour, minute, grid_charging, grid_export, days '
+        'FROM rules WHERE enabled = 1'
+    ).fetchall()
+
+    def _rule_charging_hours(month):
+        """Estimate daily grid charging hours for a given month."""
+        charge_start = charge_end = None
+        for months_j, hour, minute, gc, ge, days_j in rules:
+            months = json.loads(months_j) if isinstance(months_j, str) else months_j
+            if month not in months:
+                continue
+            if gc == 1:  # grid_charging ON
+                charge_start = hour + minute / 60.0
+            elif gc == 0 and charge_start is not None:  # grid_charging OFF
+                charge_end = hour + minute / 60.0
+        if charge_start is not None and charge_end is not None and charge_end > charge_start:
+            return charge_end - charge_start
+        return 0
+
+    def _rule_export_hours(month):
+        """Estimate daily battery export hours for a given month."""
+        # Find earliest battery_ok start and latest pv_only end for this month
+        earliest_start = None
+        latest_end = None
+        for months_j, hour, minute, gc, ge, days_j in rules:
+            months = json.loads(months_j) if isinstance(months_j, str) else months_j
+            if month not in months:
+                continue
+            t = hour + minute / 60.0
+            if ge == 'battery_ok':
+                if earliest_start is None or t < earliest_start:
+                    earliest_start = t
+            elif ge == 'pv_only' and earliest_start is not None:
+                if latest_end is None or t > latest_end:
+                    latest_end = t
+        if earliest_start is not None and latest_end is None:
+            latest_end = 21.0  # on-peak ends at 9 PM
+        if earliest_start is not None and latest_end is not None and latest_end > earliest_start:
+            return latest_end - earliest_start
+        return 0
+
+    # ── Build baseline projection ────────────────────────────────────────────
+    baseline = []
+    for month_num in range(1, 13):
+        m_key = f'{this_year}-{month_num:02d}'
+        days_in_month = calendar.monthrange(this_year, month_num)[1]
+        is_summer = month_num in (6, 7, 8, 9, 10)
+        base_charge = round(base_charge_per_day * days_in_month, 2)
+
+        if m_key in cy_data:
+            d = cy_data[m_key]
+            baseline.append({
+                'month': m_key, 'label': 'actual',
+                'import_kwh': round(d['import_kwh'], 1),
+                'export_kwh': round(d['export_kwh'], 1),
+                'import_cost': round(d['import_cost'], 2),
+                'export_credit': round(d['export_credit'], 2),
+                'base_charge': round(base_charge_per_day * d['days'], 2),
+                'net': round(d['import_cost'] - d['export_credit']
+                             + base_charge_per_day * d['days'], 2),
+            })
+        else:
+            # Use prior year's actual import/export from daily_costs as the baseline
+            # (captures real solar overflow behavior that monthly solar/home can't)
+            py_key = f'{prior_year}-{month_num:02d}'
+            py_dc = py_dc_data.get(py_key, {'import_kwh': 0, 'export_kwh': 0})
+
+            # Scale imports: winter uses home_ratio (higher consumption + grid charging),
+            # summer uses a modest ratio (solar covers most, grid charging similar)
+            if is_summer:
+                proj_imp_kwh = py_dc['import_kwh'] * summer_home_ratio
+                proj_exp_kwh = py_dc['export_kwh']  # solar exports stay ~same
+            else:
+                proj_imp_kwh = py_dc['import_kwh'] * winter_home_ratio
+                proj_exp_kwh = py_dc['export_kwh'] * (winter_home_ratio * 0.5 + 0.5)
+                # Winter exports partially scale with higher charging
+
+            # Apply current rates
+            mid_date = f'{this_year}-{month_num:02d}-15'
+            r = _rate_for_date(rate_periods, mid_date) or rates
+            season = 'summer' if is_summer else 'winter'
+
+            # Import rate: mostly super off-peak (grid charging), some off-peak
+            avg_imp_rate = (r[f'{season}_super_off_peak'] * 0.70
+                         + r[f'{season}_off_peak'] * 0.25
+                         + r[f'{season}_on_peak'] * 0.05)
+            # Export rate: summer weighted toward on-peak, winter toward off-peak
+            if is_summer:
+                avg_exp_rate = (r[f'{season}_on_peak'] * 0.55
+                              + r[f'{season}_off_peak'] * 0.40
+                              + r[f'{season}_super_off_peak'] * 0.05)
+            else:
+                avg_exp_rate = (r[f'{season}_on_peak'] * 0.30
+                              + r[f'{season}_off_peak'] * 0.50
+                              + r[f'{season}_super_off_peak'] * 0.20)
+
+            proj_imp_cost = round(proj_imp_kwh * avg_imp_rate, 2)
+            proj_exp_credit = round(proj_exp_kwh * avg_exp_rate, 2)
+            net = round(proj_imp_cost - proj_exp_credit + base_charge, 2)
+
+            baseline.append({
+                'month': m_key, 'label': 'projected',
+                'import_kwh': round(proj_imp_kwh, 1),
+                'export_kwh': round(proj_exp_kwh, 1),
+                'import_cost': proj_imp_cost,
+                'export_credit': proj_exp_credit,
+                'base_charge': base_charge,
+                'net': net,
+            })
+
+    # ── Build optimized projection (add winter on-peak export) ───────────────
+    optimized = []
+    for bp in baseline:
+        month_num = int(bp['month'][5:7])
+        is_summer = month_num in (6, 7, 8, 9, 10)
+        days_in_month = calendar.monthrange(this_year, month_num)[1]
+
+        has_export = _rule_export_hours(month_num) > 0
+        if bp['label'] == 'actual' or has_export:
+            # Actual months or months that already have export rules — no change
+            optimized.append(dict(bp))
+        else:
+            # Winter month with no export rules — add on-peak battery export
+            mid_date = f'{this_year}-{month_num:02d}-15'
+            r = _rate_for_date(rate_periods, mid_date) or rates
+            season = 'winter'
+
+            add_export_kwh = CAPACITY * 0.80 * days_in_month
+            add_charge_kwh = add_export_kwh / EFFICIENCY
+            credit_gain = add_export_kwh * r[f'{season}_on_peak']
+            charge_cost = add_charge_kwh * r[f'{season}_super_off_peak']
+
+            new_imp_kwh = bp['import_kwh'] + add_charge_kwh
+            new_exp_kwh = bp['export_kwh'] + add_export_kwh
+            new_imp_cost = round(bp['import_cost'] + charge_cost, 2)
+            new_exp_credit = round(bp['export_credit'] + credit_gain, 2)
+            new_net = round(new_imp_cost - new_exp_credit + bp['base_charge'], 2)
+
+            optimized.append({
+                'month': bp['month'], 'label': 'optimized',
+                'import_kwh': round(new_imp_kwh, 1),
+                'export_kwh': round(new_exp_kwh, 1),
+                'import_cost': new_imp_cost,
+                'export_credit': new_exp_credit,
+                'base_charge': bp['base_charge'],
+                'net': new_net,
+            })
+
+    baseline_md = _render_projection_table(baseline)
+    optimized_md = _render_projection_table(optimized)
+
+    return baseline, baseline_md, optimized, optimized_md
+
+
+def _build_ai_context():
+    """Gather all relevant data for the Gemini prompt."""
+    now = datetime.now()
+    today = now.date()
+    rates = load_rates() or {}
+    holidays = sorted(d.isoformat() for d in SDGE_HOLIDAYS if d >= today)
+
+    with sqlite3.connect(DB_PATH) as c:
+        rules = _load_all_rules(c)
+
+        # Current year monthly summaries
+        cy_monthly_rows = c.execute(
+            'SELECT substr(date,1,7), SUM(import_kwh), SUM(export_kwh), '
+            '       SUM(import_cost), SUM(export_credit), '
+            '       SUM(on_peak_kwh), SUM(off_peak_kwh), SUM(super_off_peak_kwh) '
+            'FROM daily_costs WHERE date >= ? AND date < ? '
+            'GROUP BY substr(date,1,7) ORDER BY 1',
+            (f'{now.year}-01-01', f'{now.year + 1}-01-01')
+        ).fetchall()
+
+        # Last 7 days of daily costs (for recent pattern analysis)
+        d7 = (today - timedelta(days=7)).isoformat()
+        cost_rows = c.execute(
+            'SELECT date, import_kwh, export_kwh, import_cost, export_credit, '
+            '       on_peak_kwh, off_peak_kwh, super_off_peak_kwh '
+            'FROM daily_costs WHERE date >= ? ORDER BY date', (d7,)
+        ).fetchall()
+
+        # Prior year monthly summaries (2025) for seasonal baseline
+        prior_year = now.year - 1
+        py_rows = c.execute(
+            'SELECT substr(date,1,7), SUM(import_kwh), SUM(export_kwh), '
+            '       SUM(import_cost), SUM(export_credit), '
+            '       SUM(on_peak_kwh), SUM(off_peak_kwh), SUM(super_off_peak_kwh) '
+            'FROM daily_costs WHERE date >= ? AND date < ? '
+            'GROUP BY substr(date,1,7) ORDER BY 1',
+            (f'{prior_year}-01-01', f'{prior_year + 1}-01-01')
+        ).fetchall()
+
+        # Pre-calculated true-up projections (baseline + optimized)
+        base_charge = float(rates.get('base_services_charge_per_day', 0.79343))
+        baseline, baseline_md, optimized, optimized_md = _build_trueup_projection(c, rates, base_charge)
+
+        # Last 7 days of readings (sample every ~60 min)
+        t7 = int((now - timedelta(days=7)).timestamp())
+        reading_rows = c.execute(
+            'SELECT timestamp, solar_w, home_w, battery_w, grid_w, battery_pct '
+            'FROM readings WHERE timestamp >= ? ORDER BY timestamp', (t7,)
+        ).fetchall()
+
+    # Sample readings to ~3-hourly
+    sampled = []
+    last_ts = 0
+    for row in reading_rows:
+        if row[0] - last_ts >= 10800:
+            sampled.append({
+                'time': datetime.fromtimestamp(row[0]).strftime('%Y-%m-%d %H:%M'),
+                'solar_w': round(row[1] or 0), 'home_w': round(row[2] or 0),
+                'battery_w': round(row[3] or 0), 'grid_w': round(row[4] or 0),
+                'battery_pct': round(row[5] or 0, 1),
+            })
+            last_ts = row[0]
+
+    # Current year monthly summaries
+    current_year_monthly = []
+    for row in cy_monthly_rows:
+        current_year_monthly.append({
+            'month': row[0],
+            'import_kwh': round(row[1] or 0, 1), 'export_kwh': round(row[2] or 0, 1),
+            'import_cost': round(row[3] or 0, 2), 'export_credit': round(row[4] or 0, 2),
+            'on_peak_kwh': round(row[5] or 0, 1), 'off_peak_kwh': round(row[6] or 0, 1),
+            'super_off_peak_kwh': round(row[7] or 0, 1),
+        })
+
+    # Last 7 days of daily costs
+    daily_costs_7d = []
+    for row in cost_rows:
+        daily_costs_7d.append({
+            'date': row[0],
+            'import_kwh': round(row[1] or 0, 2), 'export_kwh': round(row[2] or 0, 2),
+            'import_cost': round(row[3] or 0, 2), 'export_credit': round(row[4] or 0, 2),
+            'on_peak_kwh': round(row[5] or 0, 2), 'off_peak_kwh': round(row[6] or 0, 2),
+            'super_off_peak_kwh': round(row[7] or 0, 2),
+        })
+
+    # Rule summaries
+    rule_summaries = []
+    for r in rules:
+        rule_summaries.append({
+            'name': r['name'], 'enabled': r['enabled'],
+            'days': r['days'], 'months': r['months'],
+            'hour': r['hour'], 'minute': r['minute'],
+            'mode': r['mode'], 'reserve': r['reserve'],
+            'grid_charging': r['grid_charging'], 'grid_export': r['grid_export'],
+        })
+
+    # Prior year monthly summaries
+    prior_year_monthly = []
+    for row in py_rows:
+        prior_year_monthly.append({
+            'month': row[0],
+            'import_kwh': round(row[1] or 0, 1), 'export_kwh': round(row[2] or 0, 1),
+            'import_cost': round(row[3] or 0, 2), 'export_credit': round(row[4] or 0, 2),
+            'on_peak_kwh': round(row[5] or 0, 1), 'off_peak_kwh': round(row[6] or 0, 1),
+            'super_off_peak_kwh': round(row[7] or 0, 1),
+        })
+
+    # Rule-based insights for additional context
+    rule_insights = _analyze_rules(rules, rates, SDGE_HOLIDAYS)
+
+    is_summer = now.month in (6, 7, 8, 9, 10)
+    jan1_next = date(now.year + 1, 1, 1) if now.month > 1 else date(now.year, 1, 1)
+    days_until_trueup = (jan1_next - today).days
+
+    with _lock:
+        live_snapshot = dict(_live)
+
+    return json.dumps({
+        'current_date': today.isoformat(),
+        'current_season': 'summer' if is_summer else 'winter',
+        'next_season_change': 'June 1' if not is_summer else 'November 1',
+        'days_until_trueup': days_until_trueup,
+        'battery_capacity_kwh': 40.5,
+        'powerwall_count': 3,
+        'rates': {k: v for k, v in rates.items()},
+        'upcoming_holidays': holidays,
+        'rules': rule_summaries,
+        'rule_based_insights': [{'title': i['title'], 'action': i['action']} for i in rule_insights],
+        'trueup_projection_table': baseline_md,
+        'optimized_projection_table': optimized_md,
+        'prior_year_monthly': prior_year_monthly,
+        'prior_year_note': (
+            f'{prior_year} used Time-Based Control (Tesla automatic algorithm). '
+            f'Current {now.year} rules are custom \u2014 they deliberately import more during '
+            f'super off-peak (grid charging 4\u20135 AM) to store energy for summer on-peak export. '
+            f'Q1 imports doubled vs {prior_year} but summer export credits should more than offset this.'
+        ),
+        'current_year_monthly': current_year_monthly,
+        'daily_costs_last_7d': daily_costs_7d,
+        'readings_last_7d': sampled,
+        'live_now': {
+            'battery_pct': round(live_snapshot.get('battery_pct', 0), 1),
+            'solar_w': round(live_snapshot.get('solar_w', 0)),
+            'home_w': round(live_snapshot.get('home_w', 0)),
+            'grid_w': round(live_snapshot.get('grid_w', 0)),
+            'mode': live_snapshot.get('mode', 'unknown'),
+        },
+    }, indent=None, default=str), baseline_md, optimized_md
+
+
+_ai_cache = {'text': None, 'model': None, 'ts': 0, 'table': None}
+
+_AI_CACHE_TTL = 300  # 5 minutes
+
+
+@app.route('/api/rules/ai-insights', methods=['POST'])
+def api_rules_ai_insights():
+    # Return cached response if fresh
+    if _ai_cache['text'] and (time.time() - _ai_cache['ts']) < _AI_CACHE_TTL:
+        return jsonify({'ok': True, 'insights': _ai_cache['text'], 'model': _ai_cache['model'],
+                        'projection_table': _ai_cache['table'],
+                        'optimized_table': _ai_cache.get('optimized'), 'cached': True})
+
+    api_key = get_setting('gemini_api_key', '')
+    model   = get_setting('gemini_model', 'gemini-2.0-flash')
+    if not api_key:
+        return jsonify({'ok': False, 'error': 'Gemini API key not configured. Add it in Settings.'}), 400
+
+    try:
+        context, table_md, opt_md = _build_ai_context()
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
+        payload = {
+            'system_instruction': {'parts': [{'text': _GEMINI_SYSTEM}]},
+            'contents': [{'parts': [{'text': f'Here is the current home energy data:\n\n{context}'}]}],
+            'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 65536},
+        }
+        resp = _requests.post(url, json=payload, timeout=300)
+        resp.raise_for_status()
+        data = resp.json()
+
+        # Extract text from Gemini response
+        text = ''
+        candidates = data.get('candidates', [])
+        if candidates:
+            parts = candidates[0].get('content', {}).get('parts', [])
+            text = '\n'.join(p.get('text', '') for p in parts)
+
+        if not text:
+            return jsonify({'ok': False, 'error': 'Gemini returned an empty response.'}), 502
+
+        _ai_cache['text'] = text
+        _ai_cache['model'] = model
+        _ai_cache['table'] = table_md
+        _ai_cache['optimized'] = opt_md
+        _ai_cache['ts'] = time.time()
+        return jsonify({'ok': True, 'insights': text, 'model': model,
+                        'projection_table': table_md, 'optimized_table': opt_md})
+
+    except _requests.exceptions.Timeout:
+        return jsonify({'ok': False, 'error': 'Gemini API timed out. Try again.'}), 504
+    except _requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response else 500
+        body = ''
+        try:
+            body = exc.response.json().get('error', {}).get('message', str(exc))
+        except Exception:
+            body = str(exc)
+        return jsonify({'ok': False, 'error': f'Gemini API error ({status}): {body}'}), 502
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+
+@app.route('/api/rules/ai-insights/debug')
+def api_rules_ai_insights_debug():
+    """Debug endpoint — returns full prompt, context, raw Gemini response, and token usage."""
+    api_key = get_setting('gemini_api_key', '')
+    model   = get_setting('gemini_model', 'gemini-2.0-flash')
+    if not api_key:
+        return jsonify({'ok': False, 'error': 'No API key'}), 400
+
+    context, _, _ = _build_ai_context()
+    user_msg = f'Here is the current home energy data:\n\n{context}'
+    url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
+    payload = {
+        'system_instruction': {'parts': [{'text': _GEMINI_SYSTEM}]},
+        'contents': [{'parts': [{'text': user_msg}]}],
+        'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 65536},
+    }
+
+    try:
+        resp = _requests.post(url, json=payload, timeout=300)
+        raw = resp.json()
+    except Exception as exc:
+        return jsonify({'ok': False, 'error': str(exc)}), 500
+
+    # Extract parts
+    text = ''
+    candidates = raw.get('candidates', [])
+    finish_reason = None
+    if candidates:
+        parts = candidates[0].get('content', {}).get('parts', [])
+        text = '\n'.join(p.get('text', '') for p in parts)
+        finish_reason = candidates[0].get('finishReason')
+
+    usage = raw.get('usageMetadata', {})
+
+    return jsonify({
+        'ok': resp.status_code == 200,
+        'model': model,
+        'system_prompt_chars': len(_GEMINI_SYSTEM),
+        'context_chars': len(context),
+        'finish_reason': finish_reason,
+        'usage': {
+            'prompt_tokens': usage.get('promptTokenCount'),
+            'output_tokens': usage.get('candidatesTokenCount'),
+            'thinking_tokens': usage.get('thoughtsTokenCount'),
+            'total_tokens': usage.get('totalTokenCount'),
+        },
+        'response_chars': len(text),
+        'response_text': text,
+        'system_prompt': _GEMINI_SYSTEM,
+    })
 
 
 # ── Costs + Rates endpoints ──────────────────────────────────────────────────
@@ -2179,6 +3188,15 @@ def api_settings():
             'intervals': [
                 {'key': 'rates_page_url', 'label': 'Rates page URL', 'unit': 'url'},
                 {'key': 'rate_schedule_name', 'label': 'Schedule name', 'unit': 'text'},
+            ],
+        },
+        {
+            'key': 'gemini',
+            'label': 'Gemini AI',
+            'type': 'configurable',
+            'intervals': [
+                {'key': 'gemini_api_key', 'label': 'API Key', 'unit': 'text'},
+                {'key': 'gemini_model', 'label': 'Model', 'unit': 'text'},
             ],
         },
         {

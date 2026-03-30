@@ -1,5 +1,5 @@
 # Powerwall Dashboard — Project Context
-# Session 10 handoff — March 29 2026
+# Session 11 handoff — March 29 2026
 
 ## Status
 - Dashboard running — 5 pages: Dashboard, Event Log, Powerwall Rules, Energy Breakdown, Settings
@@ -11,13 +11,15 @@
 - Energy YTD tile live (pos 1) — daily_costs table in powerwall.db
 - Current Rate tile live (pos 2) — big rate, period accent colors, season badge, mini table
 - Pool tile (pos 3) — temp, pump/edge/cleaner status, salt PPM + chlorinator %. Security stubbed (pos 4)
-- Tile row height: 160px
+- Tile row height: 150px (fixed, tiles overflow:hidden; session 9 two-column layout)
 - Rate card on Rules page enhanced — season columns color-coded, active rate cell highlighted,
   period-specific left border (amber/green/blue), NOW badge tracks period accent
 - Dark/light theme toggle live — persists via localStorage
 - Nav clock removed (Dashboard topbar clock is the only clock)
 - Active integrations: pypowerwall (cloud), screenlogicpy (Pentair), Rachio, Abode (websocket)
 - Run: `py server.py` (port 5000)
+- Flask static file caching disabled (`SEND_FILE_MAX_AGE_DEFAULT = 0`) — prevents
+  stale CSS/JS on deployed browser after code changes
 - Rachio event logging live — polls `/device/{id}/event?startTime=&endTime=` every 30min
   (configurable `rachio_event_poll_interval`), deduplicates on (ts, title), logs to event_log
 - Smart Rain Skip feature — evaluates accumulated rainfall over configurable lookback window,
@@ -35,8 +37,15 @@
   configurable start date + interval (months)
 - All polling/parsing errors logged to event_log table
 - Pool state-change events logged (pump, edge pump, cleaner, pool/spa circuits)
-  via _log_pool_changes() comparing previous vs current poll state
+  via _log_pool_changes() comparing previous vs current poll state.
+  Debounced: state change must persist for 2 consecutive polls before logging —
+  filters out single-sample ScreenLogic flickers (e.g. edge pump briefly reporting
+  off then back on). Uses _pool_pending dict to track unconfirmed transitions.
 - Pool polling is clock-aligned (e.g. 15m → :00/:15/:30/:45, not relative to server start)
+- Public port exposure check — every 5 min, checks if port 5000 is reachable from public IP
+  (via ifconfig.me + TCP connect). Logs event on state transitions only (open→closed, closed→open).
+  System: 'system', event_type: 'port_check', result: 'warning' when open, 'ok' when closed.
+- Server binds 0.0.0.0:5000 — accessible externally when router port forward is active
 - Salt chlorine generator (SCG) data extracted from screenlogicpy:
   salt_ppm, scg_active, scg_pool_pct, super_chlor — displayed on Pool tile
 - Power flow SVG overhauled (session 9):
@@ -51,6 +60,27 @@
   - Drops all-zero readings (Tesla cloud API glitch — all 4 values exactly 0)
   - Drops single-sample outliers (home_w differs >50% from both neighbors)
   - Real transitions (EV stopping, load changes) pass through — they persist across readings
+- Chart theme support (session 9):
+  - `syncChartTheme(isLight)` updates grid lines, tick colors, border colors
+  - Light theme: grid lines transparent; dark theme: #222226
+  - Called on theme toggle and after chart creation on initial load
+  - CSS var `--grid-line` set to `transparent` for light, `#222226` for dark
+- Dashboard layout refinements (session 9):
+  - Tile row height reduced from 185px to 150px — more space for flow diagram + chart
+  - Pool tile: two-column layout (`.tile-split`) — temp on left, pump/edge/cleaner/salt on right
+  - Security tile: two-column layout — mode on left, open doors/windows on right
+  - `.tile-detail` class for right-aligned detail text (0.82rem, line-height 1.4)
+  - Nav sparkle icon (AI) enlarged from 0.7em to 0.85em
+- AI Insights on Powerwall Rules page (session 8+):
+  - Rule-based engine: `_analyze_rules()` — deterministic checks against EV-TOU-2 schedule
+    (charging window duration, Sunday gaps, Mar/Apr super off-peak, 4 PM boundary,
+    summer export timing, November grouping, upcoming holidays, holiday calendar health)
+  - Gemini AI engine: `_build_ai_context()` gathers 90d costs, 7d hourly readings, rules,
+    rates, holidays, live snapshot → sends to Gemini with detailed system prompt for
+    true-up trajectory, seasonal transition, rule optimization, credit maximization analysis
+  - Settings: `gemini_api_key` (text), `gemini_model` (default: gemini-2.0-flash)
+  - UI: purple drawer on Rules page, rule-based cards shown immediately,
+    AI insights loaded on demand via POST, rendered as markdown
 
 ### Pending
 - rules.py: write event_log rows on automation fire / skip / fail
@@ -105,8 +135,8 @@ Confirmed data paths from debug endpoint /api/debug/pool:
   Spa setpoint:     data["body"]["1"]["heat_setpoint"]["value"]         (104)
   Pool pump state:  data["pump"]["1"]["state"]["value"]                 (0/1)
   Pool pump watts:  data["pump"]["1"]["watts_now"]["value"]
-  Edge pump state:  data["pump"]["0"]["state"]["value"]                 (1=on)
-  Edge pump watts:  data["pump"]["0"]["watts_now"]["value"]             (140)
+  Edge pump:        data["circuit"]["506"]["value"]                      (0/1)
+  NOTE: pump[0] is unreliable for edge pump — use circuit 506 instead
   Pool circuit:     data["circuit"]["505"]["value"]                     (0/1)
   Spa circuit:      data["circuit"]["500"]["value"]                     (0/1)
   Air temp:         data["controller"]["sensor"]["air_temperature"]["value"]
@@ -169,7 +199,7 @@ Debug endpoints:
 ---
 
 ## Hardware / location
-- Tesla Powerwall 2
+- 3× Tesla Powerwall 2 (40.5 kWh total usable capacity)
 - SDG&E EV-TOU-2 plan, San Diego CA (lat 32.7157, lon -117.1611)
 - Wall-mounted display — always-on dark mode
 
@@ -201,7 +231,7 @@ Dashboard:         live power flow, chart, pool tile, upcoming automations widge
 Event Log:         filterable event timeline (Powerwall, Rachio/Sprinklers, Abode, Pool) + system errors
 Powerwall Rules:   rules manager (CRUD table + add/edit form) + rate card
 Energy Breakdown:  daily cost breakdown by TOU period (On-Peak, Off-Peak, Super Off-Peak)
-Settings:          connector toggles, polling intervals, SDG&E rate config, maintenance schedules
+Settings:          connector toggles, polling intervals, SDG&E rate config, Gemini AI config
 
 ---
 
@@ -332,7 +362,7 @@ CREATE TABLE IF NOT EXISTS settings (
 CREATE TABLE IF NOT EXISTS event_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     ts          INTEGER NOT NULL,
-    system      TEXT NOT NULL,      -- 'powerwall' | 'rachio' | 'abode' | 'holidays' | 'rates' | ...
+    system      TEXT NOT NULL,      -- 'powerwall' | 'rachio' | 'abode' | 'system' | 'holidays' | 'rates' | ...
     event_type  TEXT NOT NULL,
     title       TEXT NOT NULL,
     detail      TEXT,
@@ -371,6 +401,9 @@ CREATE TABLE IF NOT EXISTS event_log (
   DELETE /api/rules/<id>        -> delete rule
   PUT    /api/rules/<id>/toggle -> flip enabled flag
   GET    /api/schedule          -> upcoming firings next 48h (for widget)
+  GET    /api/rules/insights    -> deterministic rule analysis (rule-based engine)
+  POST   /api/rules/ai-insights -> Gemini AI analysis (requires gemini_api_key)
+  GET    /api/rules/ai-insights/debug -> full prompt + raw Gemini response + token usage
 
 ### Costs & Rates
   GET    /api/costs/ytd         -> YTD totals for dashboard tile
@@ -378,6 +411,15 @@ CREATE TABLE IF NOT EXISTS event_log (
   POST   /api/costs/rebuild     -> trigger cost rebuild from readings
   GET    /api/rates             -> rates.json contents
   POST   /api/rates/refresh     -> re-fetch from SDG&E
+
+### Security / Abode
+  GET    /api/security                  -> alarm status
+  GET    /api/debug/abode/devices       -> raw Abode device list
+  GET    /api/debug/abode/timeline      -> raw Abode timeline
+  GET    /api/debug/abode/status        -> Abode connection status
+  POST   /api/debug/abode/backfill      -> backfill Abode events to event_log
+  POST   /api/debug/abode/dedup         -> deduplicate Abode events in event_log
+  POST   /api/debug/abode/test-event    -> inject synthetic test event
 
 ### Events
   GET    /api/events            -> event_log entries (limit, system, days, type params)
@@ -1174,9 +1216,10 @@ Full-height page, same padding/gap pattern as #page-rules (16px, gap 12px, overf
     (no new fetch — filter the already-loaded _events array)
 - Right: "updated HH:MM" timestamp + auto-refresh indicator
 
-### System accent colors (add --abode to :root CSS variables)
+### System accent colors
 ```css
 --abode: #9B6DFF;   /* purple */
+--pool:  #00BCD4;   /* cyan/teal */
 /* existing: --amber, --green (used for powerwall), --rachio, --blue */
 ```
 
@@ -1185,6 +1228,7 @@ Filter pill active states:
 - Powerwall: rgba(239,159,39,0.15) background, var(--amber) color
 - Rachio:    rgba(41,181,212,0.15) background, var(--rachio) color
 - Abode:     rgba(155,109,255,0.15) background, var(--abode) color
+- Pool:      rgba(0,188,212,0.15) background, var(--pool) color
 
 ### Event rows
 
