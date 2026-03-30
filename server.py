@@ -137,6 +137,11 @@ def init_db() -> None:
                 c.execute(f'ALTER TABLE daily_costs ADD COLUMN {col} REAL DEFAULT 0')
             except Exception:
                 pass
+        # Migration: add base_services_charge_per_day to rate_history
+        try:
+            c.execute('ALTER TABLE rate_history ADD COLUMN base_services_charge_per_day REAL DEFAULT 0')
+        except Exception:
+            pass
         # Settings table
         c.execute('''
             CREATE TABLE IF NOT EXISTS settings (
@@ -204,6 +209,8 @@ _SETTINGS_DEFAULTS = {
             'super_off_peak': [[0, 14]],
         },
     }),
+    # TOU schedule verification
+    'tou_periods_last_verified':   '',        # YYYY-MM-DD — when TOU time windows were last confirmed
     # Frontend refresh intervals (milliseconds)
     'fe_poll_interval':            '10000',   # live power poll
     'fe_chart_interval':           '60000',   # chart refresh
@@ -283,13 +290,15 @@ def _seed_rate_history(conn):
     conn.execute(
         'INSERT OR IGNORE INTO rate_history '
         '(effective_date, summer_on_peak, summer_off_peak, summer_super_off_peak, '
-        ' winter_on_peak, winter_off_peak, winter_super_off_peak, source_url, fetched_at) '
-        'VALUES (?,?,?,?,?,?,?,?,?)',
+        ' winter_on_peak, winter_off_peak, winter_super_off_peak, '
+        ' base_services_charge_per_day, source_url, fetched_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?,?)',
         (eff_date,
          rates.get('summer_on_peak', 0), rates.get('summer_off_peak', 0),
          rates.get('summer_super_off_peak', 0),
          rates.get('winter_on_peak', 0), rates.get('winter_off_peak', 0),
          rates.get('winter_super_off_peak', 0),
+         rates.get('base_services_charge_per_day', 0),
          url, rates.get('updated'))
     )
     conn.commit()
@@ -303,20 +312,23 @@ def _load_rate_history() -> list:
         return c.execute(
             'SELECT effective_date, end_date, '
             '       summer_on_peak, summer_off_peak, summer_super_off_peak, '
-            '       winter_on_peak, winter_off_peak, winter_super_off_peak '
+            '       winter_on_peak, winter_off_peak, winter_super_off_peak, '
+            '       COALESCE(base_services_charge_per_day, 0) '
             'FROM rate_history ORDER BY effective_date'
         ).fetchall()
 
 
 def _rate_for_date(rate_periods, d_iso: str) -> dict | None:
     """Find the rate dict applicable to a given date string 'YYYY-MM-DD'."""
-    for eff, end, s_on, s_off, s_sup, w_on, w_off, w_sup in reversed(rate_periods):
+    for row in reversed(rate_periods):
+        eff = row[0]
         if d_iso >= eff:
             return {
-                'summer_on_peak': s_on, 'summer_off_peak': s_off,
-                'summer_super_off_peak': s_sup,
-                'winter_on_peak': w_on, 'winter_off_peak': w_off,
-                'winter_super_off_peak': w_sup,
+                'summer_on_peak': row[2], 'summer_off_peak': row[3],
+                'summer_super_off_peak': row[4],
+                'winter_on_peak': row[5], 'winter_off_peak': row[6],
+                'winter_super_off_peak': row[7],
+                'base_services_charge_per_day': row[8] if len(row) > 8 else 0,
             }
     return None
 
@@ -521,8 +533,8 @@ def backfill_history() -> None:
 
     Sign convention from Tesla history API:
       solar_power   – positive = producing
-      battery_power – positive = charging, negative = discharging
-      grid_power    – positive = exporting, negative = importing
+      battery_power – positive = discharging, negative = charging
+      grid_power    – positive = importing, negative = exporting
     home_w is derived: home = solar - battery - grid  (energy conservation)
     """
     print('Backfill: fetching last 24 h of history from Tesla cloud…')
@@ -2062,25 +2074,31 @@ def _analyze_rules(rules, rates, holidays):
             'action': 'Consider a 4 PM rule to set Self-Powered mode and verify reserve covers the 4\u20139 PM peak.',
         })
 
-    # ── 5. Summer battery export starts late ─────────────────────────────────
+    # ── 5. Battery export starts late (season-aware) ────────────────────────
+    # Summer sunset ~7:30-8 PM — starting at 7 PM+ means missing 3+ on-peak hours
+    # Winter sunset ~5-5:30 PM — starting at 6 PM+ means missing 2+ on-peak hours
     summer = {6, 7, 8, 9, 10}
-    weekday_export = [r for r in enabled
-                      if r.get('grid_export') == 'battery_ok'
-                      and summer & set(r['months'])
-                      and {0, 1, 2, 3, 4} & set(r['days'])]
-    for r in weekday_export:
-        if r['hour'] >= 18:
-            missed = r['hour'] - 16
-            insights.append({
-                'severity': 'suggestion',
-                'title':  f'Battery export starts at {r["hour"]}:{r["minute"]:02d} \u2014 on-peak begins 4 PM',
-                'detail': (
-                    f'"{r["name"]}" enables battery export {missed}+ hours after on-peak starts. '
-                    f'On-peak runs 4\u20139 PM at ${on_summer:.3f}/kWh.'
-                ),
-                'action': 'Consider starting export at 5 PM or 6 PM to capture more on-peak value.',
-                'rule_id': r['id'],
-            })
+    for season_label, season_months, late_hour, rate_val in [
+        ('summer', summer, 19, on_summer),
+        ('winter', {1, 2, 3, 4, 5, 11, 12}, 18, on_winter),
+    ]:
+        season_export = [r for r in enabled
+                         if r.get('grid_export') == 'battery_ok'
+                         and season_months & set(r['months'])
+                         and {0, 1, 2, 3, 4} & set(r['days'])]
+        for r in season_export:
+            if r['hour'] >= late_hour:
+                missed = r['hour'] - 16
+                insights.append({
+                    'severity': 'suggestion',
+                    'title':  f'Battery export starts at {r["hour"]}:{r["minute"]:02d} \u2014 on-peak begins 4 PM',
+                    'detail': (
+                        f'"{r["name"]}" enables battery export {missed}+ hours after on-peak starts. '
+                        f'On-peak runs 4\u20139 PM at ${rate_val:.3f}/kWh ({season_label}).'
+                    ),
+                    'action': f'Consider starting export earlier to capture more {season_label} on-peak value.',
+                    'rule_id': r['id'],
+                })
 
     # ── 6. November in summer export rules ───────────────────────────────────
     nov_export = [r for r in enabled
@@ -2140,6 +2158,24 @@ def _analyze_rules(rules, rates, holidays):
                 f'Holiday dates need refreshing for upcoming holidays.'
             ),
             'action': 'Refresh holiday dates via Settings or wait for automatic refresh.',
+        })
+
+    # TOU schedule staleness check
+    last_verified = get_setting('tou_periods_last_verified', '')
+    try:
+        stale = not last_verified or (date.today() - date.fromisoformat(last_verified)).days > 180
+    except ValueError:
+        stale = True
+    if stale:
+        insights.append({
+            'severity': 'info',
+            'title':  'TOU schedule not verified in 6+ months',
+            'detail': (
+                'The on-peak, off-peak, and super off-peak time windows are configured '
+                'based on SDG&E EV-TOU-2 tariff Sheet 3. SDG&E occasionally adjusts these '
+                'hours. Last verified: ' + (last_verified or 'never') + '.'
+            ),
+            'action': 'Check SDG&E EV-TOU-2 tariff schedule and update tou_periods_last_verified in Settings.',
         })
 
     return insights
@@ -2291,19 +2327,49 @@ Looking at the daily cost data:
 - Given the 40.5 kWh battery capacity that can actively discharge to the grid,
   where are the biggest untapped opportunities to earn more credits?
 
+## Data quality awareness
+The `data_quality` object tells you how reliable each projection input is:
+- `actual_months`: months with real measured data — treat these as ground truth
+- `projected_months`: months estimated from prior year patterns — flag as projections
+- `period_weights_source`: per-season, tells you if TOU period distributions are from
+  'current_year' (measured), 'prior_year' (historical), or 'default' (hardcoded estimate).
+  If 'default', explicitly note that the import/export rate mix is estimated, not measured.
+- `optimized_export_source`: 'actual_months' means the optimized scenario uses real export
+  data from months with active rules. 'cross_season_estimate' or 'capacity_estimate' means
+  it's hypothetical — frame it as "potential" or "estimated" savings, not guaranteed.
+- `prior_year_daily_costs`: false means no historical baseline exists — projections for
+  future months are less reliable. Note this limitation clearly.
+
+When data sources are estimated rather than measured, hedge your language accordingly.
+
 ## Format
 Use markdown. Use the actual rate values and cost figures from the data — no generic estimates.
 Do not repeat findings already listed in rule_based_insights.
+
+NEVER use JSON field names from the data in your output. The data contains technical
+keys like on_peak_kwh, solar_w, grid_w, battery_pct, super_off_peak_kwh, import_kwh,
+export_kwh, battery_w, home_w, etc. These are for your analysis only — always translate
+to natural language in your response:
+  on_peak_kwh → "on-peak export" or "on-peak usage"
+  solar_w → "solar production"
+  grid_w → "grid import" or "grid export"
+  battery_w → "battery charging" or "battery discharging"
+  battery_pct → "battery level"
+  super_off_peak_kwh → "super off-peak usage"
+  import_kwh → "grid imports"
+  export_kwh → "grid exports"
+  grid_export → "battery export to grid"
+  self_consumption → "Self-Powered mode"
+  autonomous → "Time-Based Control mode"
+If the user sees a field name like `on_peak_kwh` or `solar_w` in your response, that
+is a failure. Every technical term must be translated to plain English.
 
 CRITICAL — Write for a homeowner, not an engineer:
 - Use natural language for days: "Monday through Friday" or "Weekdays" or "Every day" — never arrays like [0,1,2,3,4].
 - Use natural language for months: "June through October" — never arrays like [6,7,8,9,10].
 - Use 12-hour time: "5:00 PM" — never "hour: 17" or "19:15".
-- Never reference internal field names in your output. Instead of "grid_export = battery_ok",
-  say "battery export to grid". Instead of "on_peak_kwh" or "on_peak_cost", say "on-peak usage"
-  or "on-peak credits". Instead of "daily_costs" or "hourly_readings", say "your daily cost data"
-  or "your recent power readings". Instead of "self_consumption mode", say "Self-Powered mode".
-  Instead of "autonomous mode", say "Time-Based Control mode".
+- Instead of "daily_costs" or "hourly_readings", say "your daily cost data"
+  or "your recent power readings".
 - For rule recommendations: explain WHY the change helps and the expected dollar impact.
   Do NOT walk the user through how to create or edit a rule — they know how.
   Example: "Starting battery export at 5 PM instead of 7:15 PM would capture 2 extra hours
@@ -2353,6 +2419,63 @@ def _aggregate_monthly_power(c, year):
     return result
 
 
+_PERIODS = ('on_peak', 'off_peak', 'super_off_peak')
+_DEFAULT_WEIGHTS = {
+    'winter': {
+        'import': {'on_peak': 0.05, 'off_peak': 0.25, 'super_off_peak': 0.70},
+        'export': {'on_peak': 0.30, 'off_peak': 0.50, 'super_off_peak': 0.20},
+    },
+    'summer': {
+        'import': {'on_peak': 0.05, 'off_peak': 0.25, 'super_off_peak': 0.70},
+        'export': {'on_peak': 0.55, 'off_peak': 0.40, 'super_off_peak': 0.05},
+    },
+}
+
+
+def _compute_period_weights(c, year) -> dict:
+    """Derive actual TOU period weights from daily_costs per-period data.
+
+    Returns dict keyed by season ('winter'/'summer'), each containing
+    'import' and 'export' sub-dicts with fractional weights per period.
+    Falls back to _DEFAULT_WEIGHTS for seasons with insufficient data.
+    """
+    rows = c.execute(
+        'SELECT date, on_peak_kwh, off_peak_kwh, super_off_peak_kwh '
+        'FROM daily_costs WHERE date >= ? AND date < ?',
+        (f'{year}-01-01', f'{year + 1}-01-01')
+    ).fetchall()
+
+    # Accumulate import/export kWh by season and period.
+    # We split on kWh sign, not cost sign. This is intentional — weights are
+    # multiplied by rates to get avg rate, so kWh gives the correct distribution.
+    # Using cost would double-count rate differences between periods.
+    buckets = {
+        'winter': {'import': {p: 0.0 for p in _PERIODS}, 'export': {p: 0.0 for p in _PERIODS}},
+        'summer': {'import': {p: 0.0 for p in _PERIODS}, 'export': {p: 0.0 for p in _PERIODS}},
+    }
+    for d, on_kwh, off_kwh, sop_kwh in rows:
+        month = int(d[5:7])
+        season = 'summer' if month in (6, 7, 8, 9, 10) else 'winter'
+        for period, val in zip(_PERIODS, (on_kwh or 0, off_kwh or 0, sop_kwh or 0)):
+            if val > 0:
+                buckets[season]['import'][period] += val
+            elif val < 0:
+                buckets[season]['export'][period] += abs(val)
+
+    # Normalize to fractions; fall back to defaults if no data
+    result = {}
+    for season in ('winter', 'summer'):
+        result[season] = {}
+        for direction in ('import', 'export'):
+            totals = buckets[season][direction]
+            total = sum(totals.values())
+            if total > 0:
+                result[season][direction] = {p: totals[p] / total for p in _PERIODS}
+            else:
+                result[season][direction] = dict(_DEFAULT_WEIGHTS[season][direction])
+    return result
+
+
 def _render_projection_table(projection):
     """Render a projection list as a markdown table."""
     lines = ['| Month | Label | Import kWh | Export kWh | Import Cost | Export Credit | Base Charge | Net |',
@@ -2379,7 +2502,6 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
     prior_year = this_year - 1
     CAPACITY = 40.5
     EFFICIENCY = 0.90
-    CHARGE_RATE_KW = 15.0  # 3× Powerwall combined
 
     # ── Gather data ──────────────────────────────────────────────────────────
     # Current year actuals from daily_costs
@@ -2426,15 +2548,36 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
     rate_periods = c.execute(
         'SELECT effective_date, end_date, '
         '       summer_on_peak, summer_off_peak, summer_super_off_peak, '
-        '       winter_on_peak, winter_off_peak, winter_super_off_peak '
+        '       winter_on_peak, winter_off_peak, winter_super_off_peak, '
+        '       COALESCE(base_services_charge_per_day, 0) '
         'FROM rate_history ORDER BY effective_date'
     ).fetchall()
+
+    # Data-derived TOU period weights (current year, with prior year fallback)
+    cy_weights = _compute_period_weights(c, this_year)
+    py_weights = _compute_period_weights(c, prior_year)
+    # For each season: prefer current year if it has real data, else prior year
+    period_weights = {}
+    weights_source = {}  # track source per season for data_quality
+    for season in ('winter', 'summer'):
+        period_weights[season] = {}
+        if cy_weights[season]['import'] != _DEFAULT_WEIGHTS[season]['import']:
+            weights_source[season] = 'current_year'
+        elif py_weights[season]['import'] != _DEFAULT_WEIGHTS[season]['import']:
+            weights_source[season] = 'prior_year'
+        else:
+            weights_source[season] = 'default'
+        for direction in ('import', 'export'):
+            if cy_weights[season][direction] == _DEFAULT_WEIGHTS[season][direction]:
+                period_weights[season][direction] = py_weights[season][direction]
+            else:
+                period_weights[season][direction] = cy_weights[season][direction]
 
     # ── Estimate grid charging + export from current rules ───────────────────
     # Read rules to determine: which months have grid charging? which have export?
     rules = c.execute(
         'SELECT months, hour, minute, grid_charging, grid_export, days '
-        'FROM rules WHERE enabled = 1'
+        'FROM rules WHERE enabled = 1 ORDER BY hour, minute'
     ).fetchall()
 
     def _rule_charging_hours(month):
@@ -2453,7 +2596,12 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
         return 0
 
     def _rule_export_hours(month):
-        """Estimate daily battery export hours for a given month."""
+        """Check if any export rules exist for a given month and estimate the window.
+
+        Returns >0 if any rule enables battery_ok for this month (used as boolean
+        by callers). Does not weight by days-of-week — actual export kWh comes from
+        daily_costs data which reflects real-world day coverage.
+        """
         # Find earliest battery_ok start and latest pv_only end for this month
         earliest_start = None
         latest_end = None
@@ -2475,25 +2623,37 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
         return 0
 
     # ── Build baseline projection ────────────────────────────────────────────
+    has_prior_year_data = bool(py_dc_data)
+    actual_months = []
+    projected_months = []
+    projection_basis = []
     baseline = []
     for month_num in range(1, 13):
         m_key = f'{this_year}-{month_num:02d}'
         days_in_month = calendar.monthrange(this_year, month_num)[1]
         is_summer = month_num in (6, 7, 8, 9, 10)
-        base_charge = round(base_charge_per_day * days_in_month, 2)
+        # Look up base charge from rate_history for this month; fall back to passed-in value
+        mid_date = f'{this_year}-{month_num:02d}-15'
+        month_rates = _rate_for_date(rate_periods, mid_date)
+        month_base_per_day = (month_rates or {}).get('base_services_charge_per_day', 0) or base_charge_per_day
+        base_charge = round(month_base_per_day * days_in_month, 2)
 
         if m_key in cy_data:
             d = cy_data[m_key]
+            # Use calendar days for complete past months; recorded days for current month
+            is_current_month = (month_num == now.month and this_year == now.year)
+            base_days = d['days'] if is_current_month else days_in_month
             baseline.append({
                 'month': m_key, 'label': 'actual',
                 'import_kwh': round(d['import_kwh'], 1),
                 'export_kwh': round(d['export_kwh'], 1),
                 'import_cost': round(d['import_cost'], 2),
                 'export_credit': round(d['export_credit'], 2),
-                'base_charge': round(base_charge_per_day * d['days'], 2),
+                'base_charge': round(month_base_per_day * base_days, 2),
                 'net': round(d['import_cost'] - d['export_credit']
-                             + base_charge_per_day * d['days'], 2),
+                             + month_base_per_day * base_days, 2),
             })
+            actual_months.append(m_key)
         else:
             # Use prior year's actual import/export from daily_costs as the baseline
             # (captures real solar overflow behavior that monthly solar/home can't)
@@ -2507,27 +2667,15 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
                 proj_exp_kwh = py_dc['export_kwh']  # solar exports stay ~same
             else:
                 proj_imp_kwh = py_dc['import_kwh'] * winter_home_ratio
-                proj_exp_kwh = py_dc['export_kwh'] * (winter_home_ratio * 0.5 + 0.5)
-                # Winter exports partially scale with higher charging
+                proj_exp_kwh = py_dc['export_kwh']  # unscaled — exports driven by solar + rules, not consumption
 
-            # Apply current rates
-            mid_date = f'{this_year}-{month_num:02d}-15'
-            r = _rate_for_date(rate_periods, mid_date) or rates
+            # Apply current rates with data-derived TOU period weights
+            r = month_rates or rates
             season = 'summer' if is_summer else 'winter'
+            w = period_weights[season]
 
-            # Import rate: mostly super off-peak (grid charging), some off-peak
-            avg_imp_rate = (r[f'{season}_super_off_peak'] * 0.70
-                         + r[f'{season}_off_peak'] * 0.25
-                         + r[f'{season}_on_peak'] * 0.05)
-            # Export rate: summer weighted toward on-peak, winter toward off-peak
-            if is_summer:
-                avg_exp_rate = (r[f'{season}_on_peak'] * 0.55
-                              + r[f'{season}_off_peak'] * 0.40
-                              + r[f'{season}_super_off_peak'] * 0.05)
-            else:
-                avg_exp_rate = (r[f'{season}_on_peak'] * 0.30
-                              + r[f'{season}_off_peak'] * 0.50
-                              + r[f'{season}_super_off_peak'] * 0.20)
+            avg_imp_rate = sum(r[f'{season}_{p}'] * w['import'][p] for p in _PERIODS)
+            avg_exp_rate = sum(r[f'{season}_{p}'] * w['export'][p] for p in _PERIODS)
 
             proj_imp_cost = round(proj_imp_kwh * avg_imp_rate, 2)
             proj_exp_credit = round(proj_exp_kwh * avg_exp_rate, 2)
@@ -2542,12 +2690,50 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
                 'base_charge': base_charge,
                 'net': net,
             })
+            projected_months.append(m_key)
+            projection_basis.append({
+                'month': m_key,
+                'basis': 'prior_year' if py_dc['import_kwh'] > 0 else 'no_data',
+                'py_import_kwh': round(py_dc['import_kwh'], 1),
+                'py_export_kwh': round(py_dc['export_kwh'], 1),
+                'home_ratio': round(summer_home_ratio if is_summer else winter_home_ratio, 3),
+                'weights_source': weights_source.get(season, 'default'),
+            })
 
-    # ── Build optimized projection (add winter on-peak export) ───────────────
+    # ── Compute actual daily export from months with export rules ──────────────
+    # Query per-day on-peak net export for months that have export rules active
+    export_months = [m for m in range(1, 13) if _rule_export_hours(m) > 0]
+    avg_daily_export = {'winter': 0.0, 'summer': 0.0}
+    if export_months:
+        # Build date range filters for months with export rules
+        winter_export_months = [m for m in export_months if m not in (6, 7, 8, 9, 10)]
+        summer_export_months = [m for m in export_months if m in (6, 7, 8, 9, 10)]
+        for season, months in [('winter', winter_export_months), ('summer', summer_export_months)]:
+            if not months:
+                continue
+            like_clauses = ' OR '.join(f"date LIKE '{this_year}-{m:02d}-%'" for m in months)
+            row = c.execute(
+                f'SELECT SUM(CASE WHEN on_peak_kwh < 0 THEN ABS(on_peak_kwh) ELSE 0 END), '
+                f'       COUNT(DISTINCT date) '
+                f'FROM daily_costs WHERE ({like_clauses})'
+            ).fetchone()
+            total_export = row[0] or 0
+            day_count = row[1] or 0
+            if day_count > 0:
+                avg_daily_export[season] = total_export / day_count
+
+    # Determine optimized export data source
+    if avg_daily_export['winter'] > 0 or avg_daily_export['summer'] > 0:
+        optimized_export_source = 'actual_months'
+    else:
+        optimized_export_source = 'capacity_estimate'
+
+    # ── Build optimized projection (add battery export to months without rules) ─
     optimized = []
     for bp in baseline:
         month_num = int(bp['month'][5:7])
         is_summer = month_num in (6, 7, 8, 9, 10)
+        season = 'summer' if is_summer else 'winter'
         days_in_month = calendar.monthrange(this_year, month_num)[1]
 
         has_export = _rule_export_hours(month_num) > 0
@@ -2555,15 +2741,34 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
             # Actual months or months that already have export rules — no change
             optimized.append(dict(bp))
         else:
-            # Winter month with no export rules — add on-peak battery export
+            # Month with no export rules — estimate what adding export rules could yield
             mid_date = f'{this_year}-{month_num:02d}-15'
             r = _rate_for_date(rate_periods, mid_date) or rates
-            season = 'winter'
+            w = period_weights[season]
 
-            add_export_kwh = CAPACITY * 0.80 * days_in_month
+            # Use actual average daily export if available; prior-year seasonal fallback otherwise
+            daily_exp = avg_daily_export[season]
+            if daily_exp <= 0:
+                # No current-year data — use prior year's same-season avg daily export
+                py_season_months = [m for m in range(1, 13)
+                                    if (m in (6, 7, 8, 9, 10)) == (season == 'summer')]
+                py_total = sum(py_dc_data.get(f'{prior_year}-{m:02d}', {}).get('export_kwh', 0)
+                               for m in py_season_months)
+                py_days = sum(calendar.monthrange(prior_year, m)[1] for m in py_season_months)
+                if py_total > 0 and py_days > 0:
+                    daily_exp = py_total / py_days
+                    optimized_export_source = 'prior_year_seasonal'
+                else:
+                    daily_exp = CAPACITY * 0.50
+                    optimized_export_source = 'capacity_estimate'
+
+            add_export_kwh = daily_exp * days_in_month
             add_charge_kwh = add_export_kwh / EFFICIENCY
-            credit_gain = add_export_kwh * r[f'{season}_on_peak']
-            charge_cost = add_charge_kwh * r[f'{season}_super_off_peak']
+            # Use data-derived export weights for credit, import weights for charge cost
+            avg_exp_rate = sum(r[f'{season}_{p}'] * w['export'][p] for p in _PERIODS)
+            avg_imp_rate = sum(r[f'{season}_{p}'] * w['import'][p] for p in _PERIODS)
+            credit_gain = add_export_kwh * avg_exp_rate
+            charge_cost = add_charge_kwh * avg_imp_rate
 
             new_imp_kwh = bp['import_kwh'] + add_charge_kwh
             new_exp_kwh = bp['export_kwh'] + add_export_kwh
@@ -2584,7 +2789,51 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
     baseline_md = _render_projection_table(baseline)
     optimized_md = _render_projection_table(optimized)
 
-    return baseline, baseline_md, optimized, optimized_md
+    meta = {
+        'prior_year_daily_costs': has_prior_year_data,
+        'period_weights_source': weights_source,
+        'optimized_export_source': optimized_export_source,
+        'actual_months': actual_months,
+        'projected_months': projected_months,
+        'projection_basis': projection_basis,
+    }
+    return baseline, baseline_md, optimized, optimized_md, meta
+
+
+def _build_prior_year_note(rules, prior_year, current_year):
+    """Build a prior_year_note with the actual charging window from rules."""
+    def _fmt_time(h, m):
+        if h == 0 and m == 0:
+            return 'midnight'
+        period = 'AM' if h < 12 else 'PM'
+        display_h = h if h <= 12 else h - 12
+        if display_h == 0:
+            display_h = 12
+        return f'{display_h}:{m:02d} {period}' if m else f'{display_h} {period}'
+
+    # Find earliest grid_charging ON and OFF from enabled rules
+    gc_on = gc_off = None
+    for r in rules:
+        if not r.get('enabled'):
+            continue
+        gc = r.get('grid_charging')
+        t = (r['hour'], r['minute'])
+        if gc is True and (gc_on is None or t < gc_on):
+            gc_on = t
+        elif gc is False and (gc_off is None or t > gc_off):
+            gc_off = t
+
+    note = (f'{prior_year} used Time-Based Control (Tesla automatic algorithm). '
+            f'Current {current_year} rules are custom')
+    if gc_on is not None and gc_off is not None:
+        window = f'{_fmt_time(*gc_on)}\u2013{_fmt_time(*gc_off)}'
+        note += (f' \u2014 they deliberately import more during '
+                 f'super off-peak (grid charging {window}) to store energy for on-peak export.')
+    else:
+        note += '.'
+    note += (f' Q1 imports may be higher vs {prior_year} '
+             f'but summer export credits should more than offset this.')
+    return note
 
 
 def _build_ai_context():
@@ -2627,8 +2876,12 @@ def _build_ai_context():
         ).fetchall()
 
         # Pre-calculated true-up projections (baseline + optimized)
-        base_charge = float(rates.get('base_services_charge_per_day', 0.79343))
-        baseline, baseline_md, optimized, optimized_md = _build_trueup_projection(c, rates, base_charge)
+        # Derive base_charge from rate_history first, then rates.json, then hardcoded fallback
+        _rh = _load_rate_history()
+        _today_rate = _rate_for_date(_rh, today.isoformat()) if _rh else None
+        base_charge = float((_today_rate or {}).get('base_services_charge_per_day', 0)
+                            or rates.get('base_services_charge_per_day', 0.79343))
+        baseline, baseline_md, optimized, optimized_md, projection_meta = _build_trueup_projection(c, rates, base_charge)
 
         # Last 7 days of readings (sample every ~60 min)
         t7 = int((now - timedelta(days=7)).timestamp())
@@ -2698,7 +2951,7 @@ def _build_ai_context():
     rule_insights = _analyze_rules(rules, rates, SDGE_HOLIDAYS)
 
     is_summer = now.month in (6, 7, 8, 9, 10)
-    jan1_next = date(now.year + 1, 1, 1) if now.month > 1 else date(now.year, 1, 1)
+    jan1_next = date(now.year + 1, 1, 1)
     days_until_trueup = (jan1_next - today).days
 
     with _lock:
@@ -2718,12 +2971,7 @@ def _build_ai_context():
         'trueup_projection_table': baseline_md,
         'optimized_projection_table': optimized_md,
         'prior_year_monthly': prior_year_monthly,
-        'prior_year_note': (
-            f'{prior_year} used Time-Based Control (Tesla automatic algorithm). '
-            f'Current {now.year} rules are custom \u2014 they deliberately import more during '
-            f'super off-peak (grid charging 4\u20135 AM) to store energy for summer on-peak export. '
-            f'Q1 imports doubled vs {prior_year} but summer export credits should more than offset this.'
-        ),
+        'prior_year_note': _build_prior_year_note(rules, prior_year, now.year),
         'current_year_monthly': current_year_monthly,
         'daily_costs_last_7d': daily_costs_7d,
         'readings_last_7d': sampled,
@@ -2734,6 +2982,7 @@ def _build_ai_context():
             'grid_w': round(live_snapshot.get('grid_w', 0)),
             'mode': live_snapshot.get('mode', 'unknown'),
         },
+        'data_quality': projection_meta,
     }, indent=None, default=str), baseline_md, optimized_md
 
 

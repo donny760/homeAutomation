@@ -279,13 +279,14 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
                 'INSERT OR REPLACE INTO rate_history '
                 '(effective_date, summer_on_peak, summer_off_peak, summer_super_off_peak, '
                 ' winter_on_peak, winter_off_peak, winter_super_off_peak, '
-                ' source_url, fetched_at) '
-                'VALUES (?,?,?,?,?,?,?,?,?)',
+                ' base_services_charge_per_day, source_url, fetched_at) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?)',
                 (eff_date,
                  rates.get('summer_on_peak', 0), rates.get('summer_off_peak', 0),
                  rates.get('summer_super_off_peak', 0),
                  rates.get('winter_on_peak', 0), rates.get('winter_off_peak', 0),
                  rates.get('winter_super_off_peak', 0),
+                 rates.get('base_services_charge_per_day', 0),
                  pdf_url, rates['updated'])
             )
             conn.commit()

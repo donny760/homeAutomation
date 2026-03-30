@@ -1,5 +1,5 @@
 # Powerwall Dashboard — Project Context
-# Session 11 handoff — March 29 2026
+# Session 12 handoff — March 30 2026
 
 ## Status
 - Dashboard running — 5 pages: Dashboard, Event Log, Powerwall Rules, Energy Breakdown, Settings
@@ -71,13 +71,43 @@
   - Security tile: two-column layout — mode on left, open doors/windows on right
   - `.tile-detail` class for right-aligned detail text (0.82rem, line-height 1.4)
   - Nav sparkle icon (AI) enlarged from 0.7em to 0.85em
-- AI Insights on Powerwall Rules page (session 8+):
+- AI Insights on Powerwall Rules page (session 8+, accuracy overhaul session 12):
   - Rule-based engine: `_analyze_rules()` — deterministic checks against EV-TOU-2 schedule
     (charging window duration, Sunday gaps, Mar/Apr super off-peak, 4 PM boundary,
-    summer export timing, November grouping, upcoming holidays, holiday calendar health)
-  - Gemini AI engine: `_build_ai_context()` gathers 90d costs, 7d hourly readings, rules,
-    rates, holidays, live snapshot → sends to Gemini with detailed system prompt for
-    true-up trajectory, seasonal transition, rule optimization, credit maximization analysis
+    season-aware late export check (summer >=7PM, winter >=6PM), November grouping,
+    upcoming holidays, holiday calendar health,
+    TOU schedule staleness warning via `tou_periods_last_verified` setting)
+  - Gemini AI engine: `_build_ai_context()` gathers monthly summaries, 7d daily costs,
+    3-hourly readings, rules, rates, holidays, live snapshot, pre-calculated projection
+    tables, data_quality metadata → sends to Gemini with system prompt.
+    System prompt has explicit field-name-to-English translation block — Gemini must
+    never output JSON keys like on_peak_kwh or solar_w.
+  - True-up projection (`_build_trueup_projection()`): baseline + optimized tables.
+    - Data-derived TOU period weights via `_compute_period_weights()` (splits daily_costs
+      per-period signed kWh by sign — positive=import, negative=export — to get TOU
+      distributions; kWh not cost to avoid double-counting rate differences)
+    - Optimized projection uses actual avg daily on-peak export from months with active
+      export rules. Fallback: prior year same-season avg daily export (`prior_year_seasonal`),
+      then `CAPACITY * 0.50` (`capacity_estimate`)
+    - Winter projected exports unscaled from prior year (not scaled by home ratio —
+      exports driven by solar + rules, not consumption)
+    - Actual months use calendar days for base charge (not recorded days count),
+      except current incomplete month which uses recorded days
+    - Returns metadata: period_weights_source, optimized_export_source, actual/projected
+      months, projection_basis (per-month prior year source values + ratio applied)
+  - `data_quality` field in Gemini context — tells Gemini what's measured vs estimated.
+    System prompt includes "Data quality awareness" section for appropriate hedging.
+  - `base_services_charge_per_day` stored in rate_history table (migration on init).
+    Projection looks up per-month base charge from rate_history → rates.json → hardcoded.
+  - `prior_year_note` derives charging window from actual rules (`_build_prior_year_note()`),
+    no longer hardcodes "4–5 AM". Type comparisons fixed: `gc is True`/`gc is False`
+    (was `gc == 1`/`gc == 0` against bool values — worked by accident via int coercion).
+  - `_rule_charging_hours()` query now `ORDER BY hour, minute` — previously iterated in
+    rowid order and overwrote charge_start/end, giving wrong window if rules were out of
+    chronological order. Only affects Gemini context metadata.
+  - `days_until_trueup` always targets next Jan 1 (January bug fixed)
+  - Known: `_aggregate_monthly_power()` still uses SUM × avg_interval instead of trapezoid
+    integration — inaccurate with gapped Tesla cloud data. Low priority (Gemini context only).
   - Settings: `gemini_api_key` (text), `gemini_model` (default: gemini-2.0-flash)
   - UI: purple drawer on Rules page, rule-based cards shown immediately,
     AI insights loaded on demand via POST, rendered as markdown
@@ -346,6 +376,7 @@ CREATE TABLE IF NOT EXISTS rate_history (
     winter_on_peak        REAL NOT NULL,
     winter_off_peak       REAL NOT NULL,
     winter_super_off_peak REAL NOT NULL,
+    base_services_charge_per_day REAL DEFAULT 0,
     source_url            TEXT,
     fetched_at            TEXT
 );
