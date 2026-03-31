@@ -3,3 +3,4 @@ pypowerwall
 screenlogicpy
 pdfplumber
 requests
+python-dotenv

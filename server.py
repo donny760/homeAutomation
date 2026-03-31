@@ -17,6 +17,9 @@ from datetime import datetime, date, timedelta, timezone
 import asyncio
 import socket
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import Flask, jsonify, send_file, send_from_directory, request, redirect
 import pypowerwall
 from rules import seed_default_rules as _seed_rules
@@ -230,9 +233,9 @@ _SETTINGS_DEFAULTS = {
     # Nest / Google SDM
     'nest_enabled':                '0',
     'nest_poll_interval':          '60',
-    'nest_client_id':              'REDACTED_NEST_CLIENT_ID',
-    'nest_client_secret':          'REDACTED_NEST_CLIENT_SECRET',
-    'nest_project_id':             'REDACTED_NEST_PROJECT_ID',
+    'nest_client_id':              os.environ.get('NEST_CLIENT_ID', ''),
+    'nest_client_secret':          os.environ.get('NEST_CLIENT_SECRET', ''),
+    'nest_project_id':             os.environ.get('NEST_PROJECT_ID', ''),
     'nest_pubsub_subscription':    '',
     'nest_refresh_token':          '',
     'nest_access_token':           '',
