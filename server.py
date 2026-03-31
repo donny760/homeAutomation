@@ -23,6 +23,7 @@ from rules import seed_default_rules as _seed_rules
 from fetch_rates import (
     load_rates, rates_are_stale, fetch_ev_tou2_rates,
     tou_period, load_or_generate_holidays, SDGE_HOLIDAYS,
+    HOLIDAYS_PATH, RATES_PATH,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -388,6 +389,20 @@ def _log_system_error(system: str, title: str, detail: str = None) -> None:
         pass  # don't let logging errors crash the caller
 
 
+def _log_success(system: str, event_type: str, title: str, detail: str = None) -> None:
+    """Log a successful system event to the event_log table."""
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute(
+                'INSERT INTO event_log '
+                '(ts, system, event_type, title, detail, result, source) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (int(time.time()), system, event_type, title, detail, 'ok', 'live')
+            )
+    except Exception:
+        pass
+
+
 def write_reading(solar_w, home_w, battery_w, grid_w, battery_pct) -> None:
     with sqlite3.connect(DB_PATH) as c:
         c.execute(
@@ -748,7 +763,17 @@ def poller() -> None:
             holidays_months = get_setting_int('holidays_poll_months', 1)
             if _is_refresh_due(refresh_start, holidays_months) and now - last_holidays_check >= 86400:
                 try:
+                    old_year = None
+                    if os.path.exists(HOLIDAYS_PATH):
+                        with open(HOLIDAYS_PATH) as f:
+                            old_year = json.load(f).get('year')
                     load_or_generate_holidays()
+                    if os.path.exists(HOLIDAYS_PATH):
+                        with open(HOLIDAYS_PATH) as f:
+                            new_year = json.load(f).get('year')
+                        if old_year and new_year and new_year != old_year:
+                            _log_success('holidays', 'holidays_updated',
+                                         f'Holidays regenerated for {new_year}')
                     print('Holidays refreshed')
                 except Exception as exc:
                     print(f'Holidays refresh error: {exc}')
@@ -759,12 +784,29 @@ def poller() -> None:
             rates_months = get_setting_int('rates_poll_months', 1)
             if _is_refresh_due(refresh_start, rates_months) and now - last_rates_check >= 86400:
                 try:
+                    old_rates = {}
+                    if os.path.exists(RATES_PATH):
+                        with open(RATES_PATH) as f:
+                            old_rates = json.load(f)
                     page_url = get_setting('rates_page_url',
                                            'https://www.sdge.com/total-electric-rates')
                     schedule = get_setting('rate_schedule_name', 'EV-TOU')
-                    fetch_ev_tou2_rates(page_url=page_url,
-                                        schedule_name=schedule,
-                                        db_path=DB_PATH)
+                    new_rates = fetch_ev_tou2_rates(page_url=page_url,
+                                                    schedule_name=schedule,
+                                                    db_path=DB_PATH)
+                    rate_keys = ['summer_on_peak', 'summer_off_peak', 'summer_super_off_peak',
+                                 'winter_on_peak', 'winter_off_peak', 'winter_super_off_peak',
+                                 'base_services_charge_per_day']
+                    changes = []
+                    for k in rate_keys:
+                        old_v = old_rates.get(k)
+                        new_v = new_rates.get(k)
+                        if old_v is not None and new_v is not None and old_v != new_v:
+                            changes.append(f'{k}: {old_v}\u2192{new_v}')
+                    if changes:
+                        _log_success('rates', 'rates_updated',
+                                     f'Rates updated (eff. {new_rates.get("effective_date", "?")})',
+                                     detail=', '.join(changes))
                 except Exception as exc:
                     print(f'Rate fetch error: {exc}')
                     _log_system_error('rates', 'Energy rate refresh failed', str(exc))

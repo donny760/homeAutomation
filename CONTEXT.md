@@ -1578,3 +1578,14 @@ Page div (after #page-rules, before the modal):
 - All 11 circuits tracked in `_POOL_EVENT_FIELDS` with 2-poll debounce
 - No backfill capability — ScreenLogic has no historical event API, only live state polling
 - Poller uses same `pool_poll_interval` setting (default 30s); `fetch_pool()` has internal clock-aligned caching that prevents duplicate ScreenLogic queries from overlapping frontend + poller calls
+
+### Holidays & rates: success event logging
+- Added `_log_success()` helper (mirrors `_log_system_error` but with `result='ok'`)
+- Holidays: logs "Holidays regenerated for {year}" when holidays.json year changes (annual)
+- Rates: logs "Rates updated (eff. {date})" with old→new detail when any of the 7 rate values change
+- No event logged on routine polls that find no changes
+
+### Event logging independence audit
+- Verified all production event logging runs in background threads, independent of frontend
+- Powerwall mode changes: logged by `rules.py` (cron-driven), not by poller
+- Pool was the only system dependent on dashboard being open — now fixed
