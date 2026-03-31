@@ -15,6 +15,7 @@
   --rachio:     #29B5D4;
   --abode:      #9B6DFF;
   --pool:       #00BCD4;
+  --nest:       #4285F4;
   --purple:     #A87CFF;
 }
 body.light {
@@ -251,8 +252,10 @@ body {
 }
 .chart-title  { font-size: 0.82rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.09em; }
 .chart-legend { display: flex; gap: 14px; }
-.legend-item  { display: flex; align-items: center; gap: 5px; font-size: 0.82rem; color: var(--dim); }
+.legend-item  { display: flex; align-items: center; gap: 5px; font-size: 0.82rem; color: var(--dim); cursor: pointer; user-select: none; }
 .legend-dot   { width: 8px; height: 8px; border-radius: 50%; }
+.legend-dash  { width: 14px; height: 0; border-top: 2px dashed; }
+.legend-inactive { opacity: 0.35; }
 .chart-wrap   { flex: 1; position: relative; min-height: 0; }
 #day-chart    { position: absolute; inset: 0; }
 
@@ -291,7 +294,7 @@ body {
   flex-shrink: 0;
   gap: 12px;
 }
-.events-toolbar-center { display: flex; gap: 6px; }
+.events-toolbar-center { display: flex; gap: 6px; align-items: center; }
 .evf-btn {
   background: var(--badge-bg);
   border: none;
@@ -299,6 +302,7 @@ body {
   border-radius: 20px;
   padding: 4px 14px;
   font-size: 0.82rem;
+  line-height: 1.2;
   cursor: pointer;
   transition: background 0.15s, color 0.15s;
 }
@@ -308,6 +312,24 @@ body {
 .evf-btn.active[data-system="rachio"]    { background: rgba(41,181,212,0.15); color: var(--rachio); }
 .evf-btn.active[data-system="abode"]     { background: rgba(155,109,255,0.15); color: var(--abode); }
 .evf-btn.active[data-system="pool"]      { background: rgba(0,188,212,0.15); color: var(--pool); }
+.evf-btn.active[data-system="nest"]      { background: rgba(66,133,244,0.15); color: var(--nest); }
+.events-date-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.events-date-range input[type="date"] {
+  background: var(--badge-bg);
+  border: 0.5px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 3px 8px;
+  font-size: 0.78rem;
+  font-family: inherit;
+  color-scheme: dark;
+}
+.events-date-sep { color: var(--very-dim); font-size: 0.78rem; }
 .events-updated { font-size: 0.72rem; color: var(--very-dim); }
 
 .events-card {
@@ -370,6 +392,12 @@ body {
   color: var(--very-dim);
   font-size: 0.88rem;
 }
+.events-loading-more {
+  padding: 12px;
+  text-align: center;
+  color: var(--very-dim);
+  font-size: 0.78rem;
+}
 
 /* ── Page 4: Energy Costs ────────────────────────────────────────────────────*/
 #page-costs {
@@ -399,6 +427,37 @@ body {
   cursor: pointer;
 }
 .costs-rebuild-btn:hover { color: var(--text); }
+
+.costs-filters {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-shrink: 0;
+}
+.costs-filter-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.72rem;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.costs-date-input {
+  background: var(--card-bg);
+  border: 0.5px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.78rem;
+  padding: 4px 8px;
+  font-family: inherit;
+}
+.costs-date-input::-webkit-calendar-picker-indicator { filter: invert(0.7); }
+.costs-total-badge {
+  font-size: 0.72rem;
+  color: var(--very-dim);
+  margin-left: auto;
+}
 
 .costs-summary {
   display: flex;
@@ -443,7 +502,10 @@ body {
   z-index: 1;
   font-size: 0.82rem;
   font-weight: 600;
+  cursor: pointer;
+  user-select: none;
 }
+.costs-month-header:hover { background: var(--bg); }
 .costs-month-header .costs-month-label {
   font-size: 0.78rem;
   font-weight: 600;
@@ -483,6 +545,22 @@ body {
 .cr-period-on    { color: var(--amber); }
 .cr-period-off   { color: var(--green); }
 .cr-period-super { color: var(--blue); }
+.costs-chevron {
+  display: inline-block;
+  width: 14px;
+  font-size: 0.6rem;
+  color: var(--very-dim);
+  flex-shrink: 0;
+}
+.costs-sentinel {
+  padding: 8px 14px;
+  text-align: center;
+  min-height: 1px;
+}
+.costs-loading-more {
+  font-size: 0.75rem;
+  color: var(--very-dim);
+}
 .costs-empty {
   padding: 40px;
   text-align: center;

@@ -1,9 +1,17 @@
 # Powerwall Dashboard — Project Context
-# Session 12 handoff — March 30 2026
+# Session 14 handoff — March 30 2026
 
 ## Status
 - Dashboard running — 5 pages: Dashboard, Event Log, Powerwall Rules, Energy Breakdown, Settings
-- File split: dashboard.html (HTML only) + static/dashboard.css + static/dashboard.js
+- Frontend migrated from vanilla HTML/CSS/JS to Next.js + React + TypeScript (session 13)
+  - Source: frontend/src/ (App Router, all components in src/components/)
+  - CSS preserved as-is in frontend/src/app/globals.css (no Tailwind)
+  - Utility libs: src/lib/format.ts, src/lib/tou.ts, src/lib/markdown.ts
+  - Build: `cd frontend && npm run deploy` → builds static export to static/frontend/
+  - Dev: `cd frontend && npm run dev:all` → runs Flask (5000) + Next.js (3000) via concurrently
+  - Prod: Flask serves static/frontend/index.html + /_next/* assets on port 5000
+  - Old vanilla files (dashboard.html, static/dashboard.css, static/dashboard.js) deleted
+  - Old code archived in git branch `vanilla-html`
 - rules.py v2 complete — reads from SQLite, runs as Windows service
 - fetch_rates.py v2 — scrapes SDG&E rates page, finds current EV-TOU-2 PDF, parses rates,
   stores in rate_history table with effective dates
@@ -17,7 +25,9 @@
 - Dark/light theme toggle live — persists via localStorage
 - Nav clock removed (Dashboard topbar clock is the only clock)
 - Active integrations: pypowerwall (cloud), screenlogicpy (Pentair), Rachio, Abode (websocket)
-- Run: `py server.py` (port 5000)
+- Run (prod/server): `py server.py` (port 5000, serves built React from static/frontend/)
+- Run (dev): `cd frontend && npm run dev:all` (Flask 5000 + Next.js 3000, hot reload)
+- Deploy: `cd frontend && npm run deploy` then copy static/frontend/ to server
 - Flask static file caching disabled (`SEND_FILE_MAX_AGE_DEFAULT = 0`) — prevents
   stale CSS/JS on deployed browser after code changes
 - Rachio event logging live — polls `/device/{id}/event?startTime=&endTime=` every 30min
@@ -30,6 +40,10 @@
 - Event Log page live — filter pills (Powerwall, Rachio/Sprinklers, Abode, Pool, Errors), scrollable rows, date dividers, system error logging
 - Energy Breakdown page live — TOU period columns (On-Peak, Off-Peak, Super Off-Peak)
   per day with kWh + cost, month headers with per-period totals, YTD summary bar
+  - Start/End date filter inputs (default: Jan 1 → today)
+  - Infinite scroll pagination (60 days per page, IntersectionObserver sentinel)
+  - Collapsible months — click month header to expand/collapse daily rows (default: collapsed)
+  - API: `/api/costs/daily?start=&end=&limit=&offset=` returns `total` for pagination
 - Settings page live — connector cards with toggles, editable intervals, unit dropdowns
 - Rate history table — stores rates with effective dates, cost calculations use correct
   rate per date period
@@ -55,7 +69,7 @@
   - kWh-today readout texts use background rects to stay readable over flow paths
   - Solar kWh text colored #EF9F27 (orange), grid kWh text colored #888780 (gray)
   - Battery-to-grid flow path + animated overlay added (activates when battDis && gridOut)
-  - JS: `setFlow('flow-battery-grid', battDis && gridOut, ...)` in dashboard.js
+  - setFlow() logic in frontend/src/components/PowerflowSVG.tsx
 - Chart glitch filtering in /api/today (session 9):
   - Drops all-zero readings (Tesla cloud API glitch — all 4 values exactly 0)
   - Drops single-sample outliers (home_w differs >50% from both neighbors)
@@ -67,10 +81,26 @@
   - CSS var `--grid-line` set to `transparent` for light, `#222226` for dark
 - Dashboard layout refinements (session 9):
   - Tile row height reduced from 185px to 150px — more space for flow diagram + chart
-  - Pool tile: two-column layout (`.tile-split`) — temp on left, pump/edge/cleaner/salt on right
+  - Pool tile: two-column layout (`.tile-split`) — temp on left, active circuits on right
+    Only shows circuits that are ON (in green), "All off" when nothing running.
+    Tracks: Pump, Edge Pump, Cleaner, Pool Light, Water Light, Spa Light, Waterfall, Spillway.
+    Salt line always visible. All circuit data already in /api/pool response.
   - Security tile: two-column layout — mode on left, open doors/windows on right
   - `.tile-detail` class for right-aligned detail text (0.82rem, line-height 1.4)
   - Nav sparkle icon (AI) enlarged from 0.7em to 0.85em
+- Solar Forecast line on day chart (session 9):
+  - `/api/solar-forecast` endpoint — hourly shortwave_radiation from Open-Meteo,
+    scaled by (peak_solar_w / 950 W/m²) to convert to system watts
+  - `_peak_solar_w()` queries MAX(solar_w) over 14 days (fallback 8100W)
+  - Past-hour locking: cache stores {date, hours}, only future hours update on refresh
+  - Cache TTL: 3600s (1 hour), resets at midnight
+  - Frontend: 3rd dataset in DayChart.tsx — dashed amber line (rgba 0.45 opacity),
+    borderDash [6,4], borderWidth 1.5, fill: false
+  - Solar line filters out zero values (no flat line midnight to sunrise)
+  - Interactive clickable legend: Solar, Home, Forecast — click to toggle on/off
+  - `.legend-dash` CSS for dashed indicator, `.legend-inactive` (opacity 0.35)
+  - Data refs (solarDataRef, homeDataRef, forecastRef) store latest data for toggle restore
+  - Setting: `fe_forecast_interval: 3600000` (1 hour refresh)
 - AI Insights on Powerwall Rules page (session 8+, accuracy overhaul session 12):
   - Rule-based engine: `_analyze_rules()` — deterministic checks against EV-TOU-2 schedule
     (charging window duration, Sunday gaps, Mar/Apr super off-peak, 4 PM boundary,
@@ -155,6 +185,8 @@
 - Gateway: 10.0.0.177:80 — Pentair: F7-68-17, EasyTouch2 8
 - Assign static DHCP reservation for 10.0.0.177 in router
 - Access via async bridge in server.py
+- Background polled in poller() thread (pool_poll_interval setting, default 30s)
+- All circuit state changes logged to event_log with 2-poll debounce
 
 Confirmed data paths from debug endpoint /api/debug/pool:
   Pool temp:        data["body"]["0"]["last_temperature"]["value"]
@@ -169,6 +201,12 @@ Confirmed data paths from debug endpoint /api/debug/pool:
   NOTE: pump[0] is unreliable for edge pump — use circuit 506 instead
   Pool circuit:     data["circuit"]["505"]["value"]                     (0/1)
   Spa circuit:      data["circuit"]["500"]["value"]                     (0/1)
+  Pool light:       data["circuit"]["501"]["value"]                     (0/1)
+  Water light:      data["circuit"]["502"]["value"]                     (0/1)
+  Spa light:        data["circuit"]["503"]["value"]                     (0/1)
+  Waterfall:        data["circuit"]["504"]["value"]                     (0/1)
+  Spillway:         data["circuit"]["507"]["value"]                     (0/1)
+  Feature 1:        found dynamically by name (circuit ID varies)
   Air temp:         data["controller"]["sensor"]["air_temperature"]["value"]
   Salt ppm:         data["controller"]["sensor"]["salt_ppm"]["value"]   (3050)
 
@@ -323,7 +361,7 @@ CREATE TABLE readings (
     grid_w      REAL,
     battery_pct REAL
 );
--- Retain 90 days, purge older rows on each write cycle
+-- Readings kept forever (purge disabled session 14). daily_costs also kept forever.
 
 ### rules table
 CREATE TABLE IF NOT EXISTS rules (
@@ -453,7 +491,7 @@ CREATE TABLE IF NOT EXISTS event_log (
   POST   /api/debug/abode/test-event    -> inject synthetic test event
 
 ### Events
-  GET    /api/events            -> event_log entries (limit, system, days, type params)
+  GET    /api/events            -> event_log entries (limit, offset, start, end, system, type params)
 
 ### Settings
   GET    /api/settings          -> all settings + connector card definitions
@@ -1139,38 +1177,29 @@ export before committing.
 ### New API endpoint
 
 ```
-GET /api/events?limit=50&system=all&days=7
+GET /api/events?limit=50&offset=0&start=1742515200&end=1743120000&system=all
 ```
 
-Returns recent event_log entries, newest first.
+Returns paginated event_log entries, newest first. Supports `offset` for infinite scroll and `start`/`end` unix timestamps for date range filtering (falls back to `days` param if `start` not provided).
 
 ```json
-[
-  {
-    "id": 201,
-    "ts": 1743120000,
-    "ts_display": "Mar 28  6:00 AM",
-    "system": "powerwall",
-    "event_type": "mode_changed",
-    "title": "Mode → Self-Powered",
-    "detail": "rule: Weekday 6am – Self-Powered reserve 10%",
-    "result": "ok",
-    "source": "live",
-    "battery_pct": 87.3
-  },
-  {
-    "id": 198,
-    "ts": 1743033600,
-    "ts_display": "Mar 27  6:15 AM",
-    "system": "abode",
-    "event_type": "disarm",
-    "title": "System Disarmed",
-    "detail": "device: Keypad  type: Keypad  severity: 6",
-    "result": "info",
-    "source": "live",
-    "battery_pct": null
-  }
-]
+{
+  "events": [
+    {
+      "id": 201,
+      "ts": 1743120000,
+      "ts_display": "Mar 28  6:00 AM",
+      "system": "powerwall",
+      "event_type": "mode_changed",
+      "title": "Mode → Self-Powered",
+      "detail": "rule: Weekday 6am – Self-Powered reserve 10%",
+      "result": "ok",
+      "source": "live",
+      "battery_pct": 87.3
+    }
+  ],
+  "has_more": true
+}
 ```
 
 Query params:
@@ -1521,3 +1550,31 @@ Page div (after #page-rules, before the modal):
   </div>
 </div>
 ```
+
+---
+
+## Session 14 changes
+
+### No data purging
+- Removed `event_log` DELETE and `readings` DELETE from `purge_old()` — both tables preserved indefinitely
+- User requirement: never auto-delete event_log or readings data
+
+### Event Log page: infinite scroll + date range
+- `/api/events` response shape changed from flat array to `{ "events": [...], "has_more": bool }`
+- New query params: `offset` (pagination), `start`/`end` (unix timestamps for date range)
+- `days` param kept as fallback (max raised from 90 to 365)
+- Frontend loads 50 events per batch, auto-fetches more on scroll near bottom
+- Date range picker (two `<input type="date">`) in toolbar, defaults to last 7 days
+- Changing filters or dates resets offset to 0 and replaces events
+- Added Nest/Cameras filter button and system metadata
+- Error filter now server-side (passes `system` param) instead of client-only filtering
+
+### Pool: background polling + all circuits
+- **Critical fix:** `fetch_pool()` now called from `poller()` background thread (was on-demand only via `/api/pool` — pool events were only detected while dashboard was open)
+- Pool events are now detected 24/7 regardless of browser state
+- New circuits extracted from ScreenLogic:
+  - 501=Pool Light, 502=Water Light, 503=Spa Light, 504=Waterfall, 507=Spillway
+  - Feature 1 found dynamically by scanning circuit `name` field (circuit ID varies by installation)
+- All 11 circuits tracked in `_POOL_EVENT_FIELDS` with 2-poll debounce
+- No backfill capability — ScreenLogic has no historical event API, only live state polling
+- Poller uses same `pool_poll_interval` setting (default 30s); `fetch_pool()` has internal clock-aligned caching that prevents duplicate ScreenLogic queries from overlapping frontend + poller calls

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useCallback } from 'react';
+import { useEffect, useRef, useCallback, useState } from 'react';
 import { Chart, registerables } from 'chart.js';
 import 'chartjs-adapter-date-fns';
 import { fmtW } from '@/lib/format';
@@ -9,7 +9,12 @@ Chart.register(...registerables);
 
 export default function DayChart() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const chartRef = useRef<Chart | null>(null);
+  const chartRef = useRef<Chart<'line'> | null>(null);
+  const solarDataRef = useRef<{ x: number; y: number }[]>([]);
+  const homeDataRef = useRef<{ x: number; y: number }[]>([]);
+  const forecastRef = useRef<{ x: number; y: number }[]>([]);
+  const visibilityRef = useRef([true, true, true]);
+  const [visible, setVisible] = useState([true, true, true]);
 
   const syncChartTheme = useCallback((light: boolean) => {
     const chart = chartRef.current;
@@ -26,6 +31,22 @@ export default function DayChart() {
     (xScale as any).border.color = bc;
     (yScale as any).border.color = bc;
     chart.update('none');
+  }, []);
+
+  const dataRefs = [solarDataRef, homeDataRef, forecastRef];
+
+  const toggleDataset = useCallback((index: number) => {
+    setVisible((prev) => {
+      const next = [...prev];
+      next[index] = !next[index];
+      visibilityRef.current = next;
+      const chart = chartRef.current;
+      if (chart) {
+        chart.data.datasets[index].data = next[index] ? dataRefs[index].current : [];
+        chart.update('none');
+      }
+      return next;
+    });
   }, []);
 
   useEffect(() => {
@@ -55,6 +76,17 @@ export default function DayChart() {
             tension: 0.35,
             pointRadius: 0,
             borderWidth: 2,
+          },
+          {
+            label: 'Solar Forecast',
+            data: [],
+            borderColor: 'rgba(239,159,39,0.45)',
+            backgroundColor: 'transparent',
+            fill: false,
+            tension: 0.35,
+            pointRadius: 0,
+            borderWidth: 1.5,
+            borderDash: [6, 4],
           },
         ],
       },
@@ -91,6 +123,7 @@ export default function DayChart() {
             borderWidth: 1,
             titleColor: '#9e9c96',
             bodyColor: '#eeece8',
+            filter: (item) => item.parsed.y != null && item.parsed.y > 0,
             callbacks: {
               label: (ctx) => ` ${ctx.dataset.label}: ${fmtW(ctx.parsed.y ?? 0)}`,
             },
@@ -113,14 +146,17 @@ export default function DayChart() {
     };
   }, [syncChartTheme]);
 
+  // Refresh actual Solar + Home data every 60s
   useEffect(() => {
     async function refreshChart() {
       try {
         const rows = await fetch('/api/today').then((r) => r.json());
         const chart = chartRef.current;
         if (!chart) return;
-        chart.data.datasets[0].data = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.solar_w) }));
-        chart.data.datasets[1].data = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.home_w) }));
+        solarDataRef.current = rows.filter((r: any) => r.solar_w > 0).map((r: any) => ({ x: r.ts * 1000, y: r.solar_w }));
+        homeDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.home_w) }));
+        if (visibilityRef.current[0]) chart.data.datasets[0].data = solarDataRef.current;
+        if (visibilityRef.current[1]) chart.data.datasets[1].data = homeDataRef.current;
         chart.update('none');
       } catch (e) {
         console.warn('Chart:', e);
@@ -128,9 +164,29 @@ export default function DayChart() {
     }
 
     refreshChart();
-
-    // chart interval set by parent via settings; use default 60s here, parent overrides via ref
     const id = setInterval(refreshChart, 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Refresh Solar Forecast every 60 min
+  useEffect(() => {
+    async function refreshForecast() {
+      try {
+        const points = await fetch('/api/solar-forecast').then((r) => r.json());
+        const chart = chartRef.current;
+        if (!chart) return;
+        forecastRef.current = points.map((p: any) => ({ x: p.ts * 1000, y: p.solar_w }));
+        if (visibilityRef.current[2]) {
+          chart.data.datasets[2].data = forecastRef.current;
+          chart.update('none');
+        }
+      } catch (e) {
+        console.warn('Solar forecast:', e);
+      }
+    }
+
+    refreshForecast();
+    const id = setInterval(refreshForecast, 3_600_000);
     return () => clearInterval(id);
   }, []);
 
@@ -139,13 +195,26 @@ export default function DayChart() {
       <div className="chart-header">
         <div className="chart-title">Solar vs Home Load &mdash; Today</div>
         <div className="chart-legend">
-          <div className="legend-item">
+          <div
+            className={`legend-item${visible[0] ? '' : ' legend-inactive'}`}
+            onClick={() => toggleDataset(0)}
+          >
             <div className="legend-dot" style={{ background: '#EF9F27' }} />
             Solar
           </div>
-          <div className="legend-item">
+          <div
+            className={`legend-item${visible[1] ? '' : ' legend-inactive'}`}
+            onClick={() => toggleDataset(1)}
+          >
             <div className="legend-dot" style={{ background: '#378ADD' }} />
             Home
+          </div>
+          <div
+            className={`legend-item${visible[2] ? '' : ' legend-inactive'}`}
+            onClick={() => toggleDataset(2)}
+          >
+            <div className="legend-dash" style={{ borderColor: 'rgba(239,159,39,0.45)' }} />
+            Forecast
           </div>
         </div>
       </div>

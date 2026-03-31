@@ -164,9 +164,20 @@ function PoolTile() {
   const temp = d?.temp_f != null ? d.temp_f + '\u00b0F' : '--\u00b0F';
   const tempNa = d?.temp_f == null;
 
-  const pumpText = d ? 'Pump  ' + (d.pump_on ? 'On' : 'Off') + (d.pump_watts != null ? ` \u00b7 ${d.pump_watts}W` : '') : '';
-  const edgeText = d ? 'Edge Pump  ' + (d.edge_pump_on ? 'On' : 'Off') : '';
-  const cleanerText = d ? 'Cleaner  ' + (d.cleaner_on ? 'On' : 'Off') : '';
+  // Build list of active circuits
+  const circuits: { label: string; on: boolean }[] = d
+    ? [
+        { label: 'Pump' + (d.pump_watts != null ? ` \u00b7 ${d.pump_watts}W` : ''), on: !!d.pump_on },
+        { label: 'Edge Pump', on: !!d.edge_pump_on },
+        { label: 'Cleaner', on: !!d.cleaner_on },
+        { label: 'Pool Light', on: !!d.pool_light_on },
+        { label: 'Water Light', on: !!d.water_light_on },
+        { label: 'Spa Light', on: !!d.spa_light_on },
+        { label: 'Waterfall', on: !!d.waterfall_on },
+        { label: 'Spillway', on: !!d.spillway_on },
+      ]
+    : [];
+  const activeCircuits = circuits.filter((c) => c.on);
 
   let saltText = '';
   let saltColor = 'var(--dim)';
@@ -183,18 +194,20 @@ function PoolTile() {
       <div className="tile-split">
         <div className={`tile-value${tempNa ? ' tile-na' : ''}`}>{temp}</div>
         <div className="tile-detail">
-          <div className={`tile-sub${!d ? ' tile-na' : ''}`} style={d ? { color: d.pump_on ? 'var(--green)' : 'var(--dim)' } : {}}>
-            {pumpText}
-          </div>
-          <div className={`tile-sub${!d ? ' tile-na' : ''}`} style={d ? { color: d.edge_pump_on ? 'var(--green)' : 'var(--dim)' } : {}}>
-            {edgeText}
-          </div>
-          <div className={`tile-sub${!d ? ' tile-na' : ''}`} style={d ? { color: d.cleaner_on ? 'var(--green)' : 'var(--dim)' } : {}}>
-            {cleanerText}
-          </div>
-          <div className={`tile-sub${d?.salt_ppm == null ? ' tile-na' : ''}`} style={{ color: saltColor }}>
-            {saltText}
-          </div>
+          {!d && <div className="tile-sub tile-na" />}
+          {d && activeCircuits.length === 0 && (
+            <div className="tile-sub" style={{ color: 'var(--dim)' }}>All off</div>
+          )}
+          {activeCircuits.map((c) => (
+            <div key={c.label} className="tile-sub" style={{ color: 'var(--green)' }}>
+              {c.label}
+            </div>
+          ))}
+          {saltText && (
+            <div className={`tile-sub${d?.salt_ppm == null ? ' tile-na' : ''}`} style={{ color: saltColor }}>
+              {saltText}
+            </div>
+          )}
         </div>
       </div>
     </div>

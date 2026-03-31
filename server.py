@@ -17,7 +17,7 @@ from datetime import datetime, date, timedelta, timezone
 import asyncio
 import socket
 
-from flask import Flask, jsonify, send_file, send_from_directory, request
+from flask import Flask, jsonify, send_file, send_from_directory, request, redirect
 import pypowerwall
 from rules import seed_default_rules as _seed_rules
 from fetch_rates import (
@@ -32,7 +32,7 @@ BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
 DB_PATH           = os.path.join(BASE_DIR, 'powerwall.db')
 POLL_INTERVAL     = 10            # seconds between pypowerwall polls
 DB_WRITE_EVERY    = 30            # seconds between DB writes
-PURGE_DAYS        = 90            # keep 90 days of readings
+PURGE_DAYS        = 0             # disabled — keep all readings forever
 POOL_POLL_INTERVAL  = 30           # seconds between pool polls
 RACHIO_API_KEY      = 'dc3c7132-00c1-45dc-910c-0d8f06738b92'
 RACHIO_BASE         = 'https://api.rach.io/1/public'
@@ -221,10 +221,21 @@ _SETTINGS_DEFAULTS = {
     'fe_rates_interval':           '600000',  # rate card + tile
     'fe_events_interval':          '60000',   # event log
     'fe_security_interval':        '60000',   # security tile
+    'fe_forecast_interval':        '3600000', # solar forecast refresh (1 hour)
     'security_poll_interval':      '30',      # backend cache TTL
     # Gemini AI
     'gemini_api_key':              '',
     'gemini_model':                'gemini-2.0-flash',
+    # Nest / Google SDM
+    'nest_enabled':                '0',
+    'nest_poll_interval':          '60',
+    'nest_client_id':              'REDACTED_NEST_CLIENT_ID',
+    'nest_client_secret':          'REDACTED_NEST_CLIENT_SECRET',
+    'nest_project_id':             'REDACTED_NEST_PROJECT_ID',
+    'nest_pubsub_subscription':    '',
+    'nest_refresh_token':          '',
+    'nest_access_token':           '',
+    'nest_token_expiry':           '0',
 }
 
 def _seed_settings(conn):
@@ -386,10 +397,8 @@ def write_reading(solar_w, home_w, battery_w, grid_w, battery_pct) -> None:
 
 
 def purge_old() -> None:
-    cutoff = int(time.time()) - PURGE_DAYS * 86400
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute('DELETE FROM readings WHERE timestamp < ?', (cutoff,))
-        c.execute("DELETE FROM event_log WHERE ts < ? AND source != 'import'", (cutoff,))
+    """Disabled — keep all readings forever."""
+    pass
 
 
 def rebuild_daily_costs(year: int = None) -> None:
@@ -670,7 +679,9 @@ def poller() -> None:
     last_rates_check = 0
     last_rachio_event_poll = 0
     last_rain_skip_check = 0
+    last_nest_event_poll = 0
     last_port_check = 0
+    last_pool_poll = 0
 
     while True:
         poll_interval = get_setting_int('powerwall_poll_interval', POLL_INTERVAL)
@@ -780,6 +791,17 @@ def poller() -> None:
                     _log_system_error('rachio', 'Rain skip check error', str(exc))
                 last_rain_skip_check = now
 
+            # Nest camera/doorbell events (Pub/Sub pull)
+            nest_event_interval = get_setting_int('nest_poll_interval', 60)
+            if now - last_nest_event_poll >= nest_event_interval:
+                if get_setting_bool('nest_enabled', False):
+                    try:
+                        fetch_nest_events()
+                    except Exception as exc:
+                        print(f'Nest event poll error: {exc}')
+                        _log_system_error('nest', 'Event poll error', str(exc))
+                last_nest_event_poll = now
+
             # Public port exposure check (every 5 min)
             if now - last_port_check >= 300:
                 try:
@@ -787,6 +809,17 @@ def poller() -> None:
                 except Exception as exc:
                     print(f'Port check error: {exc}')
                 last_port_check = now
+
+            # Pool equipment state polling
+            pool_event_interval = get_setting_int('pool_poll_interval', POOL_POLL_INTERVAL)
+            if now - last_pool_poll >= pool_event_interval:
+                if get_setting_bool('pool_enabled', True):
+                    try:
+                        fetch_pool()
+                    except Exception as exc:
+                        print(f'Pool poll error: {exc}')
+                        _log_system_error('pool', 'Pool poll error', str(exc))
+                last_pool_poll = now
 
         except Exception as exc:
             print(f'Poller error: {exc}')
@@ -862,6 +895,73 @@ def fetch_weather() -> dict:
     return _wx_cache
 
 
+# ── Solar Forecast ────────────────────────────────────────────────────────────
+_sf_cache: dict = {}
+_sf_ts: float   = 0.0
+SF_TTL = 3600  # 1 hour
+PEAK_RAD_WM2 = 950.0  # clear-sky noon shortwave radiation for San Diego
+
+
+def _peak_solar_w() -> float:
+    cutoff = int((datetime.combine(date.today(), datetime.min.time())
+                  - timedelta(days=14)).timestamp())
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute('SELECT MAX(solar_w) FROM readings WHERE timestamp >= ?',
+                        (cutoff,)).fetchone()
+    return float(row[0]) if row and row[0] else 8100.0
+
+
+def fetch_solar_forecast() -> dict:
+    global _sf_cache, _sf_ts
+    now = datetime.now()
+    today_str = now.date().isoformat()
+    current_hour = now.hour
+
+    if _sf_cache.get('date') == today_str and time.time() - _sf_ts < SF_TTL:
+        return _sf_cache
+
+    url = (
+        'https://api.open-meteo.com/v1/forecast'
+        '?latitude=32.7157&longitude=-117.1611'
+        '&hourly=shortwave_radiation'
+        '&forecast_days=1&timezone=America%2FLos_Angeles'
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read())
+
+        hourly = data.get('hourly', {})
+        times = hourly.get('time', [])
+        rads  = hourly.get('shortwave_radiation', [])
+
+        peak_solar = _peak_solar_w()
+        scale = peak_solar / PEAK_RAD_WM2
+
+        new_hours = {}
+        for t_str, rad in zip(times, rads):
+            h = int(t_str.split('T')[1].split(':')[0])
+            new_hours[h] = round(max(0, rad * scale))
+
+        # Preserve past hours from previous fetch, only update future
+        if _sf_cache.get('date') == today_str and 'hours' in _sf_cache:
+            merged = dict(_sf_cache['hours'])
+            for h, w in new_hours.items():
+                if h >= current_hour:
+                    merged[h] = w
+        else:
+            merged = new_hours
+
+        _sf_cache = {'date': today_str, 'hours': merged}
+        _sf_ts = time.time()
+
+    except Exception as exc:
+        print(f'Solar forecast error: {exc}')
+        if not _sf_cache or _sf_cache.get('date') != today_str:
+            _sf_cache = {'date': today_str, 'hours': {}}
+
+    return _sf_cache
+
+
 # ── Pool (screenlogicpy) ─────────────────────────────────────────────────────
 async def _pool_fetch_async() -> dict:
     from screenlogicpy import ScreenLogicGateway
@@ -901,9 +1001,14 @@ async def _pool_fetch_async() -> dict:
         spa_b  = _key(body,    1, '1') or {}
         pump1  = _key(pump,    1, '1') or {}
         pump0  = _key(pump,    0, '0') or {}
-        c505   = _key(circuit, 505, '505') or {}
         c500   = _key(circuit, 500, '500') or {}
+        c501   = _key(circuit, 501, '501') or {}
+        c502   = _key(circuit, 502, '502') or {}
+        c503   = _key(circuit, 503, '503') or {}
+        c504   = _key(circuit, 504, '504') or {}
+        c505   = _key(circuit, 505, '505') or {}
         c506   = _key(circuit, 506, '506') or {}
+        c507   = _key(circuit, 507, '507') or {}
         c508   = _key(circuit, 508, '508') or {}
 
         temp_f  = _nested(pool_b, 'last_temperature', 'value')
@@ -923,6 +1028,20 @@ async def _pool_fetch_async() -> dict:
         pool_circuit_on = bool(_nested(c505, 'value'))
         spa_circuit_on  = bool(_nested(c500, 'value'))
         cleaner_on      = bool(_nested(c508, 'value'))
+        pool_light_on   = bool(_nested(c501, 'value'))
+        water_light_on  = bool(_nested(c502, 'value'))
+        spa_light_on    = bool(_nested(c503, 'value'))
+        waterfall_on    = bool(_nested(c504, 'value'))
+        spillway_on     = bool(_nested(c507, 'value'))
+
+        # Feature 1 — circuit ID unknown, find by name
+        feature1_on = None
+        for cid, cdata in circuit.items():
+            if isinstance(cdata, dict):
+                cname = _nested(cdata, 'name') or _nested(cdata, 'name', 'value') or ''
+                if isinstance(cname, str) and cname.strip() == 'Feature 1':
+                    feature1_on = bool(_nested(cdata, 'value'))
+                    break
 
         # Salt chlorine generator (SCG)
         scg = data.get('scg') or data.get(b'scg') or {}
@@ -941,6 +1060,12 @@ async def _pool_fetch_async() -> dict:
             'cleaner_on':      cleaner_on,
             'pool_circuit_on': pool_circuit_on,
             'spa_circuit_on':  spa_circuit_on,
+            'pool_light_on':   pool_light_on,
+            'water_light_on':  water_light_on,
+            'spa_light_on':    spa_light_on,
+            'waterfall_on':    waterfall_on,
+            'spillway_on':     spillway_on,
+            'feature1_on':     feature1_on,
             'salt_ppm':        int(salt_ppm) if salt_ppm is not None else None,
             'scg_active':      bool(scg_state) if scg_state is not None else None,
             'scg_pool_pct':    int(scg_pool_pct) if scg_pool_pct is not None else None,
@@ -956,6 +1081,12 @@ _POOL_EVENT_FIELDS = {
     'cleaner_on':      ('cleaner_changed',      'Cleaner'),
     'pool_circuit_on': ('pool_circuit_changed',  'Pool circuit'),
     'spa_circuit_on':  ('spa_circuit_changed',   'Spa circuit'),
+    'pool_light_on':   ('pool_light_changed',    'Pool light'),
+    'water_light_on':  ('water_light_changed',   'Water light'),
+    'spa_light_on':    ('spa_light_changed',     'Spa light'),
+    'waterfall_on':    ('waterfall_changed',     'Waterfall'),
+    'spillway_on':     ('spillway_changed',      'Spillway'),
+    'feature1_on':     ('feature1_changed',      'Feature 1'),
 }
 
 
@@ -1150,6 +1281,19 @@ def api_today():
 @app.route('/api/weather')
 def api_weather():
     return jsonify(fetch_weather())
+
+
+@app.route('/api/solar-forecast')
+def api_solar_forecast():
+    fc = fetch_solar_forecast()
+    today_str = fc.get('date', date.today().isoformat())
+    base_ts = int(datetime.strptime(today_str, '%Y-%m-%d').timestamp())
+    points = []
+    for h in sorted(fc.get('hours', {}).keys(), key=int):
+        w = fc['hours'][h]
+        if w > 0:
+            points.append({'ts': base_ts + int(h) * 3600, 'solar_w': w})
+    return jsonify(points)
 
 
 @app.route('/api/pool')
@@ -1782,6 +1926,202 @@ def start_abode_listener():
 
     t = threading.Thread(target=_run, daemon=True, name='abode-listener')
     t.start()
+
+
+# ── Nest / Google SDM ────────────────────────────────────────────────────────
+_nest_event_ts: float = 0.0
+_nest_devices: dict = {}        # device_path -> display_name cache
+_nest_devices_ts: float = 0.0
+_NEST_DEVICE_CACHE_TTL = 3600   # 1 hour
+
+NEST_EVENT_TYPE_MAP = {
+    'sdm.devices.events.CameraMotion.Motion':  'motion_detected',
+    'sdm.devices.events.CameraPerson.Person':  'person_detected',
+    'sdm.devices.events.DoorbellChime.Chime':  'doorbell_press',
+}
+
+NEST_EVENT_TITLE_MAP = {
+    'motion_detected': 'Motion Detected',
+    'person_detected': 'Person Detected',
+    'doorbell_press':  'Doorbell Pressed',
+}
+
+
+def _nest_ensure_token() -> str | None:
+    """Return a valid access token, refreshing if expired. Returns None on failure."""
+    access_token = get_setting('nest_access_token', '')
+    expiry = get_setting_int('nest_token_expiry', 0)
+
+    if access_token and time.time() < expiry:
+        return access_token
+
+    refresh_token = get_setting('nest_refresh_token', '')
+    if not refresh_token:
+        return None
+
+    client_id     = get_setting('nest_client_id', '')
+    client_secret = get_setting('nest_client_secret', '')
+
+    try:
+        resp = _requests.post('https://oauth2.googleapis.com/token', data={
+            'client_id':     client_id,
+            'client_secret': client_secret,
+            'refresh_token': refresh_token,
+            'grant_type':    'refresh_token',
+        }, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+
+        new_token  = data['access_token']
+        new_expiry = str(int(time.time()) + data.get('expires_in', 3600) - 60)
+
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                      ('nest_access_token', new_token))
+            c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                      ('nest_token_expiry', new_expiry))
+            c.commit()
+        return new_token
+
+    except Exception as exc:
+        print(f'Nest token refresh error: {exc}')
+        _log_system_error('nest', 'Token refresh failed', str(exc))
+        return None
+
+
+def _nest_get_device_name(device_path: str, token: str) -> str:
+    """Return human-readable device name, using cache. Falls back to device ID fragment."""
+    global _nest_devices, _nest_devices_ts
+
+    if not _nest_devices or time.time() - _nest_devices_ts > _NEST_DEVICE_CACHE_TTL:
+        project_id = get_setting('nest_project_id', '')
+        try:
+            resp = _requests.get(
+                f'https://smartdevicemanagement.googleapis.com/v1/enterprises/{project_id}/devices',
+                headers={'Authorization': f'Bearer {token}'},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            devices = resp.json().get('devices', [])
+            _nest_devices = {}
+            for d in devices:
+                name = d.get('name', '')
+                traits = d.get('traits', {})
+                custom = traits.get('sdm.devices.traits.Info', {}).get('customName', '')
+                dev_type = d.get('type', '').rsplit('.', 1)[-1]
+                display = custom or dev_type or 'Unknown'
+                _nest_devices[name] = display
+            _nest_devices_ts = time.time()
+        except Exception as exc:
+            print(f'Nest device list error: {exc}')
+
+    if device_path in _nest_devices:
+        return _nest_devices[device_path]
+    return device_path.rsplit('/', 1)[-1][:6] if device_path else 'Unknown'
+
+
+def fetch_nest_events() -> int:
+    """Pull Nest camera/doorbell events from Pub/Sub and log new ones. Returns insert count."""
+    import base64 as _b64
+
+    if not get_setting_bool('nest_enabled', False):
+        return 0
+
+    subscription = get_setting('nest_pubsub_subscription', '')
+    if not subscription:
+        return 0
+
+    token = _nest_ensure_token()
+    if not token:
+        return 0
+
+    inserted = 0
+    try:
+        resp = _requests.post(
+            f'https://pubsub.googleapis.com/v1/{subscription}:pull',
+            headers={'Authorization': f'Bearer {token}'},
+            json={'maxMessages': 50, 'returnImmediately': True},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        messages = resp.json().get('receivedMessages', [])
+
+        if not messages:
+            return 0
+
+        rows = []
+        ack_ids = []
+
+        for msg in messages:
+            ack_ids.append(msg['ackId'])
+            try:
+                raw = _b64.b64decode(msg['message']['data']).decode('utf-8')
+                payload = json.loads(raw)
+
+                resource_update = payload.get('resourceUpdate', {})
+                device_path = resource_update.get('name', '')
+                events = resource_update.get('events', {})
+
+                ts_str = payload.get('timestamp', '')
+                if ts_str:
+                    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                    ts = int(dt.timestamp())
+                else:
+                    ts = int(time.time())
+
+                event_id = payload.get('eventId', '')
+                device_name = _nest_get_device_name(device_path, token)
+
+                for sdm_event_key in events:
+                    event_type = NEST_EVENT_TYPE_MAP.get(sdm_event_key)
+                    if not event_type:
+                        continue
+
+                    title = f'{device_name}: {NEST_EVENT_TITLE_MAP.get(event_type, event_type)}'
+                    session_id = events[sdm_event_key].get('eventSessionId', '')
+                    detail = f'device: {device_name}  eventId: {event_id}  session: {session_id}'
+                    rows.append((ts, 'nest', event_type, title, detail, 'info', 'live'))
+
+            except Exception:
+                continue
+
+        # Batch deduplicate (same pattern as Rachio)
+        if rows:
+            with sqlite3.connect(DB_PATH, timeout=30) as c:
+                existing = set(
+                    c.execute(
+                        'SELECT ts, title FROM event_log WHERE system = ?', ('nest',)
+                    ).fetchall()
+                )
+                for row in rows:
+                    ts_val, sys_, evt, title, detail, result, source = row
+                    if (ts_val, title) not in existing:
+                        c.execute(
+                            'INSERT INTO event_log '
+                            '(ts, system, event_type, title, detail, result, source) '
+                            'VALUES (?,?,?,?,?,?,?)', row)
+                        existing.add((ts_val, title))
+                        inserted += 1
+
+        # Always ack ALL messages to prevent redelivery
+        if ack_ids:
+            _requests.post(
+                f'https://pubsub.googleapis.com/v1/{subscription}:acknowledge',
+                headers={'Authorization': f'Bearer {token}'},
+                json={'ackIds': ack_ids},
+                timeout=15,
+            )
+
+        if inserted:
+            print(f'Nest events: logged {inserted} new events')
+
+    except _requests.exceptions.Timeout:
+        print('Nest poll: timeout (no events)')
+    except Exception as exc:
+        print(f'Nest event poll error: {exc}')
+        _log_system_error('nest', 'Event poll error', str(exc))
+
+    return inserted
 
 
 # ── Rules helpers ────────────────────────────────────────────────────────────
@@ -3134,17 +3474,27 @@ def api_costs_ytd():
 
 @app.route('/api/costs/daily')
 def api_costs_daily():
-    year = int(request.args.get('year', date.today().year))
-    jan1  = f'{year}-01-01'
-    dec31 = f'{year}-12-31'
+    # Support start/end date filters (default: current year) + pagination
+    today = date.today()
+    start = request.args.get('start', f'{today.year}-01-01')
+    end   = request.args.get('end', today.isoformat())
+    limit  = int(request.args.get('limit', 0))   # 0 = no limit
+    offset = int(request.args.get('offset', 0))
     with sqlite3.connect(DB_PATH) as c:
-        rows = c.execute(
-            'SELECT date, import_kwh, export_kwh, import_cost, export_credit, '
-            '       on_peak_kwh, off_peak_kwh, super_off_peak_kwh, '
-            '       on_peak_cost, off_peak_cost, super_off_peak_cost '
-            'FROM daily_costs WHERE date >= ? AND date <= ? ORDER BY date DESC',
-            (jan1, dec31)
-        ).fetchall()
+        # Total count for pagination
+        total = c.execute(
+            'SELECT COUNT(*) FROM daily_costs WHERE date >= ? AND date <= ?',
+            (start, end)
+        ).fetchone()[0]
+        sql = ('SELECT date, import_kwh, export_kwh, import_cost, export_credit, '
+               '       on_peak_kwh, off_peak_kwh, super_off_peak_kwh, '
+               '       on_peak_cost, off_peak_cost, super_off_peak_cost '
+               'FROM daily_costs WHERE date >= ? AND date <= ? ORDER BY date DESC')
+        params: list = [start, end]
+        if limit > 0:
+            sql += ' LIMIT ? OFFSET ?'
+            params += [limit, offset]
+        rows = c.execute(sql, params).fetchall()
     rates = load_rates()
     rates_as_of = (rates.get('updated') or '')[:10] if rates else ''
     days = [
@@ -3164,7 +3514,8 @@ def api_costs_daily():
         }
         for r in rows
     ]
-    return jsonify({'year': year, 'rates_as_of': rates_as_of, 'days': days})
+    return jsonify({'start': start, 'end': end, 'total': total,
+                    'rates_as_of': rates_as_of, 'days': days})
 
 
 @app.route('/api/costs/rebuild', methods=['POST'])
@@ -3322,30 +3673,132 @@ def api_debug_abode_test_event():
     return jsonify({'ok': True, 'ts': ts, 'event_type': evt, 'title': title})
 
 
+# ── Nest OAuth + debug ───────────────────────────────────────────────────────
+@app.route('/nest/auth')
+def nest_auth():
+    """Redirect user to Google OAuth consent screen for Nest/SDM access."""
+    import urllib.parse
+    client_id  = get_setting('nest_client_id', '')
+    project_id = get_setting('nest_project_id', '')
+    if not client_id or not project_id:
+        return jsonify({'error': 'Nest client_id or project_id not configured'}), 400
+
+    redirect_uri = request.url_root.rstrip('/') + '/nest/callback'
+    params = urllib.parse.urlencode({
+        'client_id':     client_id,
+        'redirect_uri':  redirect_uri,
+        'response_type': 'code',
+        'scope':         'https://www.googleapis.com/auth/sdm.service https://www.googleapis.com/auth/pubsub',
+        'access_type':   'offline',
+        'prompt':        'consent',
+    })
+    url = f'https://nestservices.google.com/partnerconnections/{project_id}/auth?{params}'
+    return redirect(url)
+
+
+@app.route('/nest/callback')
+def nest_callback():
+    """Exchange authorization code for tokens, store refresh_token."""
+    code = request.args.get('code')
+    error = request.args.get('error')
+    if error:
+        return f'<h2>Nest authorization failed</h2><p>{error}</p>', 400
+    if not code:
+        return '<h2>Missing authorization code</h2>', 400
+
+    client_id     = get_setting('nest_client_id', '')
+    client_secret = get_setting('nest_client_secret', '')
+    redirect_uri  = request.url_root.rstrip('/') + '/nest/callback'
+
+    try:
+        resp = _requests.post('https://oauth2.googleapis.com/token', data={
+            'client_id':     client_id,
+            'client_secret': client_secret,
+            'code':          code,
+            'grant_type':    'authorization_code',
+            'redirect_uri':  redirect_uri,
+        }, timeout=15)
+        resp.raise_for_status()
+        tokens = resp.json()
+    except Exception as exc:
+        return f'<h2>Token exchange failed</h2><pre>{exc}</pre>', 500
+
+    refresh_token = tokens.get('refresh_token', '')
+    access_token  = tokens.get('access_token', '')
+    expires_in    = tokens.get('expires_in', 3600)
+
+    with sqlite3.connect(DB_PATH) as c:
+        for k, v in [
+            ('nest_refresh_token', refresh_token),
+            ('nest_access_token',  access_token),
+            ('nest_token_expiry',  str(int(time.time()) + expires_in - 60)),
+        ]:
+            c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (k, v))
+        c.commit()
+
+    return ('<h2>Nest connected successfully!</h2>'
+            '<p>You can close this tab and return to the dashboard.</p>'
+            '<p>Enable the Nest connector in Settings to start receiving events.</p>')
+
+
+@app.route('/api/debug/nest/status')
+def api_debug_nest_status():
+    token = get_setting('nest_access_token', '')
+    expiry = get_setting_int('nest_token_expiry', 0)
+    return jsonify({
+        'enabled': get_setting_bool('nest_enabled', False),
+        'has_refresh_token': bool(get_setting('nest_refresh_token', '')),
+        'token_valid': bool(token and time.time() < expiry),
+        'token_expiry': expiry,
+        'subscription': get_setting('nest_pubsub_subscription', ''),
+        'cached_devices': _nest_devices,
+        'devices_cache_age': int(time.time() - _nest_devices_ts) if _nest_devices_ts else None,
+    })
+
+
 # ── Event Log endpoint ────────────────────────────────────────────────────────
 @app.route('/api/events')
 def api_events():
     limit  = min(int(request.args.get('limit', 50)), 500)
+    offset = max(int(request.args.get('offset', 0)), 0)
     system = request.args.get('system', 'all')
-    days   = min(int(request.args.get('days', 7)), 90)
     etype  = request.args.get('type')
 
-    cutoff = int(time.time()) - days * 86400
-    query  = 'SELECT id,ts,system,event_type,title,detail,result,source,battery_pct FROM event_log WHERE ts >= ?'
-    params = [cutoff]
+    # Date range: accept start/end unix timestamps, fall back to days param
+    start_ts = request.args.get('start')
+    end_ts   = request.args.get('end')
+    if start_ts:
+        start_ts = int(start_ts)
+    else:
+        days = min(int(request.args.get('days', 7)), 365)
+        start_ts = int(time.time()) - days * 86400
+    if end_ts:
+        end_ts = int(end_ts)
 
-    if system != 'all':
+    query  = 'SELECT id,ts,system,event_type,title,detail,result,source,battery_pct FROM event_log WHERE ts >= ?'
+    params: list = [start_ts]
+
+    if end_ts:
+        query += ' AND ts <= ?'
+        params.append(end_ts)
+    if system == 'errors':
+        query += " AND (result = 'failed' OR event_type = 'error')"
+    elif system != 'all':
         query += ' AND system = ?'
         params.append(system)
     if etype:
         query += ' AND event_type = ?'
         params.append(etype)
 
-    query += ' ORDER BY ts DESC LIMIT ?'
-    params.append(limit)
+    query += ' ORDER BY ts DESC LIMIT ? OFFSET ?'
+    params.append(limit + 1)   # fetch one extra to detect has_more
+    params.append(offset)
 
     with sqlite3.connect(DB_PATH) as c:
         rows = c.execute(query, params).fetchall()
+
+    has_more = len(rows) > limit
+    rows = rows[:limit]
 
     results = []
     for row in rows:
@@ -3367,7 +3820,7 @@ def api_events():
             'source':      source,
             'battery_pct': batt,
         })
-    return jsonify(results)
+    return jsonify({'events': results, 'has_more': has_more})
 
 
 # ── Settings endpoints ────────────────────────────────────────────────────────
@@ -3423,6 +3876,19 @@ def api_settings():
             'type': 'websocket',
             'enabled_key': 'abode_enabled',
             'intervals': [],
+        },
+        {
+            'key': 'nest',
+            'label': 'Nest (Camera/Doorbell)',
+            'type': 'on-demand',
+            'enabled_key': 'nest_enabled',
+            'intervals': [
+                {'key': 'nest_poll_interval',       'label': 'Poll interval',        'unit': 's'},
+                {'key': 'nest_pubsub_subscription', 'label': 'Pub/Sub subscription', 'unit': 'text'},
+                {'key': 'nest_client_id',           'label': 'OAuth Client ID',      'unit': 'text'},
+                {'key': 'nest_client_secret',       'label': 'OAuth Client Secret',  'unit': 'text'},
+                {'key': 'nest_project_id',          'label': 'Device Access Project', 'unit': 'text'},
+            ],
         },
         {
             'key': 'maintenance',
