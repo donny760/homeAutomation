@@ -78,6 +78,28 @@ def is_sdge_holiday(d: date) -> bool:
     return d in SDGE_HOLIDAYS
 
 
+_HOLIDAY_NAMES = {
+    (1, 1): "New Year's Day", (7, 4): 'Independence Day',
+    (11, 11): "Veterans Day", (12, 25): 'Christmas Day',
+}
+
+
+def holiday_name(d: date) -> str:
+    """Return display name for an SDG&E holiday date."""
+    key = (d.month, d.day)
+    if key in _HOLIDAY_NAMES:
+        return _HOLIDAY_NAMES[key]
+    if d.month == 2 and d.weekday() == 0 and 15 <= d.day <= 21:
+        return "Presidents' Day"
+    if d.month == 5 and d.weekday() == 0 and d.day >= 25:
+        return 'Memorial Day'
+    if d.month == 9 and d.weekday() == 0 and d.day <= 7:
+        return 'Labor Day'
+    if d.month == 11 and d.weekday() == 3 and 22 <= d.day <= 28:
+        return 'Thanksgiving'
+    return 'SDG&E Holiday'
+
+
 # ── TOU period classification ─────────────────────────────────────────────────
 
 _DEFAULT_TOU_PERIODS = {
@@ -96,6 +118,13 @@ _DEFAULT_TOU_PERIODS = {
 def _hour_in_ranges(h, ranges):
     """Check if hour h falls within any [start, end) range."""
     return any(s <= h < e for s, e in ranges)
+
+
+def holiday_super_off_peak(hour: int, periods: dict = None) -> bool:
+    """True if *hour* falls in the weekend/holiday super off-peak window."""
+    p = periods or _DEFAULT_TOU_PERIODS
+    ranges = p.get('weekend_holiday', {}).get('super_off_peak', [])
+    return _hour_in_ranges(hour, ranges)
 
 
 def tou_period(dt: datetime, periods: dict = None):

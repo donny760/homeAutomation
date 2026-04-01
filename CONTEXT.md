@@ -1,5 +1,5 @@
 # Powerwall Dashboard — Project Context
-# Session 14 handoff — March 30 2026
+# Session 16 handoff — March 31 2026
 
 ## Status
 - Dashboard running — 5 pages: Dashboard, Event Log, Powerwall Rules, Energy Breakdown, Settings
@@ -101,11 +101,22 @@
   - `.legend-dash` CSS for dashed indicator, `.legend-inactive` (opacity 0.35)
   - Data refs (solarDataRef, homeDataRef, forecastRef) store latest data for toggle restore
   - Setting: `fe_forecast_interval: 3600000` (1 hour refresh)
+- Topbar removed, weather moved to nav bar (session 9):
+  - Topbar component deleted from Dashboard.tsx — reclaims 66px for visuals
+  - Nav right side: compact time/date ("3:33 PM · Mar 31"), weather icon + temp, AQI badge, theme toggle
+  - WMO code → Unicode icon mapping in Nav.tsx (☀⛅☁🌧❄⛈ etc.)
+  - AQI fetched from Open-Meteo Air Quality API (`us_aqi`), color-coded badge
+    (green ≤50, amber ≤100, orange ≤150, red >150)
+  - `/api/weather` now includes `weathercode` (int) and `aqi` (int|null) fields
+  - Chart card changed from fixed `height: 210px` to `flex: 1; min-height: 160px`
+  - Main-row changed from `flex: 1` to `flex: 2` — flow diagram gets proportionally more space
+  - Both visuals scale with window size
 - AI Insights on Powerwall Rules page (session 8+, accuracy overhaul session 12):
-  - Rule-based engine: `_analyze_rules()` — deterministic checks against EV-TOU-2 schedule
-    (charging window duration, Sunday gaps, Mar/Apr super off-peak, 4 PM boundary,
-    season-aware late export check (summer >=7PM, winter >=6PM), November grouping,
-    upcoming holidays, holiday calendar health,
+  - Rule-based engine: `_analyze_rules(rules, rates, holidays, tou_periods)` — deterministic
+    checks against EV-TOU-2 schedule. All TOU time references derived from `tou_periods` param.
+    (charging window duration, Sunday gaps, Mar/Apr super off-peak, on-peak boundary,
+    season-aware late export check, November grouping, upcoming holidays with automatic
+    battery hold info, holiday calendar health,
     TOU schedule staleness warning via `tou_periods_last_verified` setting)
   - Gemini AI engine: `_build_ai_context()` gathers monthly summaries, 7d daily costs,
     3-hourly readings, rules, rates, holidays, live snapshot, pre-calculated projection
@@ -141,6 +152,24 @@
   - Settings: `gemini_api_key` (text), `gemini_model` (default: gemini-2.0-flash)
   - UI: purple drawer on Rules page, rule-based cards shown immediately,
     AI insights loaded on demand via POST, rendered as markdown
+- Holiday-aware rules engine (session 15):
+  - On SDG&E holidays during super off-peak, `current_target_state()` in rules.py
+    automatically overrides: reserve → 100%, grid_export → pv_only. This holds the
+    battery for on-peak export instead of discharging at low super off-peak rates.
+  - All TOU time windows derived from configurable `tou_periods` DB setting — not hardcoded.
+    Off-peak and on-peak periods follow normal rules unchanged.
+  - Logs event_log entry once per holiday: "Holiday: {name} — Reserve → 100%, Export → PV-only
+    (super off-peak hold)" with event_type='holiday_override'
+  - Upcoming Automations widget shows synthetic holiday entry with planned action
+  - `holiday_name()` and `holiday_super_off_peak(hour, periods)` shared from fetch_rates.py
+- TOU times fully derived from `tou_periods` setting (session 15):
+  - All TOU time references in `_analyze_rules()` insights, `_upcoming_firings()` holiday
+    entries, Gemini system prompt, and `_rule_export_hours()` fallback are derived from the
+    configurable `tou_periods` setting — no hardcoded hours.
+  - `_GEMINI_SYSTEM` constant replaced with `_gemini_system_prompt(tou_periods)` function
+    that interpolates derived time boundaries into the prompt.
+  - `_fmt_hour(h)` utility formats hour int as "2 PM", "midnight", etc.
+  - If SDG&E changes TOU hours, updating `tou_periods` in Settings propagates everywhere.
 
 ### Pending
 - rules.py: write event_log rows on automation fire / skip / fail
@@ -519,8 +548,9 @@ CREATE TABLE IF NOT EXISTS event_log (
 ## SDG&E TOU reference
 Plan: EV-TOU-2
 Summer: June-October  |  Winter: November-May
-On-peak: 4pm-9pm daily (except holidays)
-Super off-peak: midnight-6am + weekends/holidays all day
+Weekday: super off-peak midnight-6am, off-peak 6am-4pm, on-peak 4-9pm, off-peak 9pm-midnight
+Weekend/Holiday: super off-peak midnight-2pm, off-peak 2-4pm, on-peak 4-9pm, off-peak 9pm-midnight
+On-peak (4-9pm) applies EVERY day including weekends and holidays
 Holidays: New Year's Day, Presidents' Day, Memorial Day, Independence Day,
           Labor Day, Veterans Day, Thanksgiving Day, Christmas Day
 
@@ -620,7 +650,7 @@ def current_rate(rates):
 ## SDG&E Holidays — auto-generated annual list
 
 SDG&E treats holidays like weekends for TOU:
-- Super off-peak all day EXCEPT 4pm-9pm which remains on-peak
+- Super off-peak midnight–2 PM, off-peak 2–4 PM, on-peak 4–9 PM, off-peak 9 PM–midnight
 - holidays.json auto-regenerates each Jan when year changes
 
 Official SDG&E holidays (from sdge.com):
@@ -808,9 +838,9 @@ Compact card, top-right of Rules page, above the rules table.
 SDG&E EV-TOU-2   updated Jan 1 2026        [now: OFF-PEAK]
 
            Summer ◀   Winter
-On-peak    $0.784      $0.514      4pm – 9pm daily
-Off-peak   $0.487      $0.457      6am – 4pm, 9pm – midnight
-Super OFP  $0.258      $0.251      midnight – 6am + weekends
+On-peak    $0.784      $0.514      4pm – 9pm daily (incl weekends/holidays)
+Off-peak   $0.487      $0.457      Wkday: 6am–4pm, 9pm–midnight | Wkend/Hol: 2–4pm, 9pm–midnight
+Super OFP  $0.258      $0.251      Wkday: midnight–6am | Wkend/Hol: midnight–2pm
 ```
 
 ### Season column treatment (SESSION 5)

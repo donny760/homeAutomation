@@ -18,7 +18,7 @@ import asyncio
 import socket
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 from flask import Flask, jsonify, send_file, send_from_directory, request, redirect
 import pypowerwall
@@ -27,13 +27,14 @@ from fetch_rates import (
     load_rates, rates_are_stale, fetch_ev_tou2_rates,
     tou_period, load_or_generate_holidays, SDGE_HOLIDAYS,
     HOLIDAYS_PATH, RATES_PATH,
+    holiday_name, holiday_super_off_peak, is_sdge_holiday,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PW_EMAIL          = 'don@nsdsolutions.com'
 PW_CAPACITY_KWH   = 40.5          # 3× Powerwall 2 usable capacity (3 × 13.5 kWh)
 BASE_DIR          = os.path.dirname(os.path.abspath(__file__))
-DB_PATH           = os.path.join(BASE_DIR, 'powerwall.db')
+DB_PATH           = os.environ.get('DB_PATH', os.path.join(BASE_DIR, 'powerwall.db'))
 POLL_INTERVAL     = 10            # seconds between pypowerwall polls
 DB_WRITE_EVERY    = 30            # seconds between DB writes
 PURGE_DAYS        = 0             # disabled — keep all readings forever
@@ -926,11 +927,26 @@ def fetch_weather() -> dict:
         _wx_cache = {
             'temp_f':          round(cw.get('temperature', 0) * 9 / 5 + 32, 1),
             'desc':            WMO.get(cw.get('weathercode', 0), ''),
+            'weathercode':     cw.get('weathercode', 0),
             'tomorrow_cloud':  clouds_tm,
             'tomorrow_rain':   rain_tm,
             'bad_forecast':    (clouds_tm or 0) > 60 or (rain_tm or 0) > 1,
             'rain_history':    rain_history,
         }
+
+        # Fetch AQI from Open-Meteo Air Quality API
+        try:
+            aqi_url = (
+                'https://air-quality-api.open-meteo.com/v1/air-quality'
+                '?latitude=32.7157&longitude=-117.1611'
+                '&current=us_aqi&timezone=America%2FLos_Angeles'
+            )
+            with urllib.request.urlopen(aqi_url, timeout=10) as aq:
+                aqi_data = json.loads(aq.read())
+            _wx_cache['aqi'] = aqi_data.get('current', {}).get('us_aqi')
+        except Exception:
+            _wx_cache['aqi'] = None
+
         _wx_ts = time.time()
     except Exception as exc:
         print(f'Weather error: {exc}')
@@ -2213,8 +2229,31 @@ def _upcoming_firings(rules, hours=48):
     now = datetime.now()
     cutoff = now + timedelta(hours=hours)
     events = []
+    tou = _load_tou_periods()
     for delta_days in (0, 1, 2):
         d = now.date() + timedelta(days=delta_days)
+        # Synthetic holiday entry — notify user of automatic battery hold
+        if is_sdge_holiday(d):
+            fire_dt = datetime(d.year, d.month, d.day, 0, 0)
+            if fire_dt <= cutoff:
+                name = holiday_name(d)
+                # Derive end hour from TOU periods setting
+                p = tou or {}
+                sop_ranges = p.get('weekend_holiday', {}).get('super_off_peak', [[0, 14]])
+                end_hour = max(e for _, e in sop_ranges)
+                end_12 = end_hour % 12 or 12
+                ampm = 'AM' if end_hour < 12 else 'PM'
+                events.append({
+                    'fire_time':        fire_dt.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'source':           'powerwall',
+                    'name':             f'Holiday: {name} — battery hold until {end_12} {ampm}',
+                    'holiday_override':  True,
+                    'mode':             None,
+                    'reserve':          100,
+                    'grid_charging':    None,
+                    'grid_export':      'pv_only',
+                    'conditions':       [],
+                })
         for rule in rules:
             if not rule['enabled']:
                 continue
@@ -2343,29 +2382,19 @@ def api_rules_toggle(rid):
 
 
 # ── Rules Insights engine ────────────────────────────────────────────────────
-_HOLIDAY_NAMES = {
-    (1, 1): "New Year's Day", (7, 4): 'Independence Day',
-    (11, 11): "Veterans Day", (12, 25): 'Christmas Day',
-}
+# holiday_name() imported from fetch_rates
 
 
-def _holiday_name(d):
-    """Return display name for an SDG&E holiday date."""
-    key = (d.month, d.day)
-    if key in _HOLIDAY_NAMES:
-        return _HOLIDAY_NAMES[key]
-    if d.month == 2 and d.weekday() == 0 and 15 <= d.day <= 21:
-        return "Presidents' Day"
-    if d.month == 5 and d.weekday() == 0 and d.day >= 25:
-        return 'Memorial Day'
-    if d.month == 9 and d.weekday() == 0 and d.day <= 7:
-        return 'Labor Day'
-    if d.month == 11 and d.weekday() == 3 and 22 <= d.day <= 28:
-        return 'Thanksgiving'
-    return 'SDG&E Holiday'
+def _fmt_hour(h):
+    """Format hour int as '2 PM', '12 AM', etc."""
+    ampm = 'AM' if h < 12 else 'PM'
+    h12 = h % 12 or 12
+    if h == 0:
+        return 'midnight'
+    return f'{h12} {ampm}'
 
 
-def _analyze_rules(rules, rates, holidays):
+def _analyze_rules(rules, rates, holidays, tou_periods=None):
     """Deterministic analysis of Powerwall rules against EV-TOU-2 rate schedule."""
     insights = []
     now = datetime.now()
@@ -2376,6 +2405,30 @@ def _analyze_rules(rules, rates, holidays):
     sop_summer = rates.get('summer_super_off_peak', 0.26)
     on_summer  = rates.get('summer_on_peak', 0.78)
     on_winter  = rates.get('winter_on_peak', 0.51)
+
+    # Derive TOU time boundaries from configurable periods
+    _tp = tou_periods or {}
+    _wd = _tp.get('weekday', {})
+    _wh = _tp.get('weekend_holiday', {})
+
+    # Weekday super off-peak window (e.g. midnight–6 AM)
+    wd_sop_ranges = _wd.get('super_off_peak', [[0, 6]])
+    wd_sop_start  = _fmt_hour(min(s for s, _ in wd_sop_ranges))
+    wd_sop_end    = _fmt_hour(max(e for _, e in wd_sop_ranges))
+
+    # Mar/Apr bonus super off-peak window (e.g. 10 AM–2 PM)
+    mar_apr_ranges = _wd.get('super_off_peak_winter_mar_apr', [[10, 14]])
+    mar_apr_start_h = min(s for s, _ in mar_apr_ranges)
+    mar_apr_end_h   = max(e for _, e in mar_apr_ranges)
+    mar_apr_start   = _fmt_hour(mar_apr_start_h)
+    mar_apr_end     = _fmt_hour(mar_apr_end_h)
+
+    # On-peak window (e.g. 4 PM–9 PM)
+    on_peak_ranges = _wd.get('on_peak', [[16, 21]])
+    on_start_h = min(s for s, _ in on_peak_ranges)
+    on_end_h   = max(e for _, e in on_peak_ranges)
+    on_start   = _fmt_hour(on_start_h)
+    on_end     = _fmt_hour(on_end_h)
 
     # ── 1. Grid charging window duration ─────────────────────────────────────
     charge_on  = [r for r in enabled if r.get('grid_charging') is True]
@@ -2402,9 +2455,9 @@ def _analyze_rules(rules, rates, holidays):
                             f'"{on_r["name"]}" charges from {on_r["hour"]}:{on_r["minute"]:02d} '
                             f'until "{best_off["name"]}" stops it at {best_off["hour"]}:{best_off["minute"]:02d}. '
                             f'At ~5 kW that adds only ~{kwh} kWh to a 40.5 kWh battery bank (3× Powerwall 2). '
-                            f'Super off-peak runs midnight\u20136 AM at ${sop_winter:.3f}/kWh.'
+                            f'Super off-peak runs {wd_sop_start}\u2013{wd_sop_end} at ${sop_winter:.3f}/kWh.'
                         ),
-                        'action': 'Start grid charging earlier (midnight or 1 AM) to fully charge at super off-peak rates.',
+                        'action': 'Start grid charging earlier to fully charge at super off-peak rates.',
                         'rule_id': on_r['id'],
                     })
     else:
@@ -2415,7 +2468,7 @@ def _analyze_rules(rules, rates, holidays):
                 f'Charging from grid during super off-peak (${sop_winter:.3f}/kWh) offsets '
                 f'on-peak usage (${on_summer:.3f}/kWh) \u2014 a {on_summer / sop_winter:.1f}x saving.'
             ),
-            'action': 'Add a rule to enable grid charging during midnight\u20136 AM (super off-peak).',
+            'action': f'Add a rule to enable grid charging during {wd_sop_start}\u2013{wd_sop_end} (super off-peak).',
         })
 
     # ── 2. Sunday grid charging gap ──────────────────────────────────────────
@@ -2439,29 +2492,29 @@ def _analyze_rules(rules, rates, holidays):
                    if r.get('mode') == 'autonomous'
                    and {3, 4} & set(r['months'])
                    and {0, 1, 2, 3, 4} & set(r['days'])
-                   and 10 <= r['hour'] < 14]
+                   and mar_apr_start_h <= r['hour'] < mar_apr_end_h]
     if not mar_apr_tbc:
         insights.append({
             'severity': 'suggestion',
             'title':  'Mar/Apr weekday super off-peak window not utilized',
             'detail': (
-                'EV-TOU-2 has a bonus super off-peak window 10 AM\u20132 PM on weekdays in March & April '
+                f'EV-TOU-2 has a bonus super off-peak window {mar_apr_start}\u2013{mar_apr_end} on weekdays in March & April '
                 f'(${sop_winter:.3f}/kWh). Switching to Time-Based Control enables grid charging.'
             ),
-            'action': 'Create rules: Time-Based Control at 10 AM and Self-Powered at 2 PM, weekdays, Mar\u2013Apr.',
+            'action': f'Create rules: Time-Based Control at {mar_apr_start} and Self-Powered at {mar_apr_end}, weekdays, Mar\u2013Apr.',
         })
 
-    # ── 4. No rule at 4 PM on-peak boundary ─────────────────────────────────
-    at_4pm = [r for r in enabled if r['hour'] == 16 and r['minute'] <= 5]
-    if not at_4pm:
+    # ── 4. No rule at on-peak boundary ──────────────────────────────────────
+    at_on_start = [r for r in enabled if r['hour'] == on_start_h and r['minute'] <= 5]
+    if not at_on_start:
         insights.append({
             'severity': 'suggestion',
-            'title':  'No rule at 4 PM on-peak boundary',
+            'title':  f'No rule at {on_start} on-peak boundary',
             'detail': (
-                f'On-peak starts at 4 PM (${on_summer:.3f}/kWh summer, ${on_winter:.3f}/kWh winter). '
+                f'On-peak starts at {on_start} (${on_summer:.3f}/kWh summer, ${on_winter:.3f}/kWh winter). '
                 f'No rule adjusts Powerwall settings at this critical transition.'
             ),
-            'action': 'Consider a 4 PM rule to set Self-Powered mode and verify reserve covers the 4\u20139 PM peak.',
+            'action': f'Consider a {on_start} rule to set Self-Powered mode and verify reserve covers the {on_start}\u2013{on_end} peak.',
         })
 
     # ── 5. Battery export starts late (season-aware) ────────────────────────
@@ -2478,13 +2531,13 @@ def _analyze_rules(rules, rates, holidays):
                          and {0, 1, 2, 3, 4} & set(r['days'])]
         for r in season_export:
             if r['hour'] >= late_hour:
-                missed = r['hour'] - 16
+                missed = r['hour'] - on_start_h
                 insights.append({
                     'severity': 'suggestion',
-                    'title':  f'Battery export starts at {r["hour"]}:{r["minute"]:02d} \u2014 on-peak begins 4 PM',
+                    'title':  f'Battery export starts at {r["hour"]}:{r["minute"]:02d} \u2014 on-peak begins {on_start}',
                     'detail': (
                         f'"{r["name"]}" enables battery export {missed}+ hours after on-peak starts. '
-                        f'On-peak runs 4\u20139 PM at ${rate_val:.3f}/kWh ({season_label}).'
+                        f'On-peak runs {on_start}\u2013{on_end} at ${rate_val:.3f}/kWh ({season_label}).'
                     ),
                     'action': f'Consider starting export earlier to capture more {season_label} on-peak value.',
                     'rule_id': r['id'],
@@ -2510,21 +2563,27 @@ def _analyze_rules(rules, rates, holidays):
     upcoming = sorted(d for d in holidays if today <= d <= today + timedelta(days=90))
     weekday_holidays = [d for d in upcoming if d.weekday() < 5]
 
+    # Derive holiday super off-peak end hour from TOU periods
+    _p = tou_periods or {}
+    _hol_sop = _p.get('weekend_holiday', {}).get('super_off_peak', [[0, 14]])
+    _hol_sop_end = _fmt_hour(max(e for _, e in _hol_sop))
+    _hol_on  = _p.get('weekend_holiday', {}).get('on_peak', [[16, 21]])
+    _hol_on_start = _fmt_hour(min(s for s, _ in _hol_on))
+    _hol_on_end   = _fmt_hour(max(e for _, e in _hol_on))
+
     for hd in weekday_holidays:
-        name = _holiday_name(hd)
+        name = holiday_name(hd)
         day_name = hd.strftime('%A')
         insights.append({
-            'severity':     'warning',
-            'title':        f'{name} ({hd.strftime("%b %d")}) falls on a {day_name}',
+            'severity':     'info',
+            'title':        f'{name} ({hd.strftime("%b %d")}) — automatic battery hold',
             'detail': (
-                f'{name} uses the weekend/holiday TOU schedule: super off-peak midnight\u20132 PM, '
-                f'on-peak 4\u20139 PM. Your weekday rules will fire but assume the regular schedule '
-                f'(super off-peak only midnight\u20136 AM).'
+                f'{name} falls on a {day_name} and uses the holiday TOU schedule: '
+                f'super off-peak midnight\u2013{_hol_sop_end}, on-peak {_hol_on_start}\u2013{_hol_on_end}. '
+                f'The system will automatically set reserve to 100% '
+                f'and export to PV-only during super off-peak to hold the battery for on-peak.'
             ),
-            'action': (
-                f'Disable weekday rules for {hd.strftime("%b %d")} or create holiday rules '
-                f'that leverage the extended super off-peak window (midnight\u20132 PM).'
-            ),
+            'action': 'No action needed — holiday override is automatic.',
             'holiday_date': hd.isoformat(),
         })
 
@@ -2534,8 +2593,8 @@ def _analyze_rules(rules, rates, holidays):
             'severity': 'warning',
             'title':  'No holiday dates configured',
             'detail': (
-                'SDG&E holidays use a different TOU schedule (super off-peak midnight\u20132 PM). '
-                'Without holiday dates, rules can\u2019t account for these changes.'
+                f'SDG&E holidays use a different TOU schedule (super off-peak midnight\u2013{_hol_sop_end}). '
+                'Without holiday dates, the automatic battery hold cannot activate.'
             ),
             'action': 'Refresh holiday dates via Settings.',
         })
@@ -2577,12 +2636,36 @@ def api_rules_insights():
         rules = _load_all_rules(c)
     rates    = load_rates() or {}
     holidays = SDGE_HOLIDAYS
-    insights = _analyze_rules(rules, rates, holidays)
+    insights = _analyze_rules(rules, rates, holidays, _load_tou_periods())
     return jsonify(insights)
 
 
 # ── Gemini AI Insights ───────────────────────────────────────────────────────
-_GEMINI_SYSTEM = """\
+def _gemini_system_prompt(tou_periods=None):
+    """Build the Gemini system prompt with TOU times derived from settings."""
+    _tp = tou_periods or {}
+    _wd = _tp.get('weekday', {})
+    _wh = _tp.get('weekend_holiday', {})
+
+    wd_sop = _wd.get('super_off_peak', [[0, 6]])
+    wd_sop_end = _fmt_hour(max(e for _, e in wd_sop))
+
+    mar_apr = _wd.get('super_off_peak_winter_mar_apr', [[10, 14]])
+    mar_apr_start = _fmt_hour(min(s for s, _ in mar_apr))
+    mar_apr_end   = _fmt_hour(max(e for _, e in mar_apr))
+
+    on_pk = _wd.get('on_peak', [[16, 21]])
+    on_start = _fmt_hour(min(s for s, _ in on_pk))
+    on_end   = _fmt_hour(max(e for _, e in on_pk))
+
+    hol_sop = _wh.get('super_off_peak', [[0, 14]])
+    hol_sop_end = _fmt_hour(max(e for _, e in hol_sop))
+
+    hol_on = _wh.get('on_peak', [[16, 21]])
+    hol_on_start = _fmt_hour(min(s for s, _ in hol_on))
+    hol_on_end   = _fmt_hour(max(e for _, e in hol_on))
+
+    return f"""\
 You are an energy optimization advisor for a specific home in San Diego, CA.
 
 ## System
@@ -2615,9 +2698,9 @@ Use the exact summer_on_peak, summer_off_peak, summer_super_off_peak, winter_on_
 winter_off_peak, winter_super_off_peak values from the rates object provided.
 
 Key EV-TOU-2 nuances:
-- On-peak (4–9 PM) applies EVERY day including weekends and holidays — no exemptions
-- Super off-peak bonus window: 10 AM–2 PM weekdays in March and April only
-- Holidays follow weekend schedule: super off-peak all day except 4–9 PM on-peak
+- On-peak ({on_start}–{on_end}) applies EVERY day including weekends and holidays — no exemptions
+- Super off-peak bonus window: {mar_apr_start}–{mar_apr_end} weekdays in March and April only
+- Holidays follow weekend schedule: super off-peak midnight–{hol_sop_end}, on-peak {hol_on_start}–{hol_on_end}, off-peak fills the remaining hours
 - November is WINTER season despite being adjacent to summer export months
 
 ## How to read the rules
@@ -2699,7 +2782,7 @@ Based on the current season and when the next season starts:
 
 **3. Rule optimization**
 Review the current rules against actual usage patterns. Focus on:
-- Is the battery sitting fully charged during the expensive on-peak hours (4-9 PM)
+- Is the battery sitting fully charged during the expensive on-peak hours ({on_start}-{on_end})
   without actively exporting? How much money is being left on the table, and what
   would it cost in overnight charging to make up for earlier export?
 - Is the overnight grid charging window long enough to fully recharge the battery?
@@ -3007,7 +3090,10 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
                 if latest_end is None or t > latest_end:
                     latest_end = t
         if earliest_start is not None and latest_end is None:
-            latest_end = 21.0  # on-peak ends at 9 PM
+            # Fall back to on-peak end from TOU periods
+            _tp = _load_tou_periods() or {}
+            _on_pk = _tp.get('weekday', {}).get('on_peak', [[16, 21]])
+            latest_end = float(max(e for _, e in _on_pk))
         if earliest_start is not None and latest_end is not None and latest_end > earliest_start:
             return latest_end - earliest_start
         return 0
@@ -3338,7 +3424,7 @@ def _build_ai_context():
         })
 
     # Rule-based insights for additional context
-    rule_insights = _analyze_rules(rules, rates, SDGE_HOLIDAYS)
+    rule_insights = _analyze_rules(rules, rates, SDGE_HOLIDAYS, _load_tou_periods())
 
     is_summer = now.month in (6, 7, 8, 9, 10)
     jan1_next = date(now.year + 1, 1, 1)
@@ -3396,9 +3482,10 @@ def api_rules_ai_insights():
 
     try:
         context, table_md, opt_md = _build_ai_context()
+        system_prompt = _gemini_system_prompt(_load_tou_periods())
         url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
         payload = {
-            'system_instruction': {'parts': [{'text': _GEMINI_SYSTEM}]},
+            'system_instruction': {'parts': [{'text': system_prompt}]},
             'contents': [{'parts': [{'text': f'Here is the current home energy data:\n\n{context}'}]}],
             'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 65536},
         }
@@ -3447,10 +3534,11 @@ def api_rules_ai_insights_debug():
         return jsonify({'ok': False, 'error': 'No API key'}), 400
 
     context, _, _ = _build_ai_context()
+    system_prompt = _gemini_system_prompt(_load_tou_periods())
     user_msg = f'Here is the current home energy data:\n\n{context}'
     url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
     payload = {
-        'system_instruction': {'parts': [{'text': _GEMINI_SYSTEM}]},
+        'system_instruction': {'parts': [{'text': system_prompt}]},
         'contents': [{'parts': [{'text': user_msg}]}],
         'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 65536},
     }
@@ -3475,7 +3563,7 @@ def api_rules_ai_insights_debug():
     return jsonify({
         'ok': resp.status_code == 200,
         'model': model,
-        'system_prompt_chars': len(_GEMINI_SYSTEM),
+        'system_prompt_chars': len(system_prompt),
         'context_chars': len(context),
         'finish_reason': finish_reason,
         'usage': {
@@ -3486,7 +3574,7 @@ def api_rules_ai_insights_debug():
         },
         'response_chars': len(text),
         'response_text': text,
-        'system_prompt': _GEMINI_SYSTEM,
+        'system_prompt': system_prompt,
     })
 
 

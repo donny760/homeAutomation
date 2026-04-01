@@ -7,19 +7,20 @@ echo  Home Automation -- Git Commit
 echo ========================================
 echo.
 
+git add -A
 git status
 echo.
 
-set /p MSG="Enter commit message: "
+echo Generating commit message...
+claude -p "Read CONTEXT.md and the staged git diff. Write a single concise commit message (1-2 sentences) summarizing what changed. Output ONLY the message, nothing else." > %TEMP%\commitmsg.txt
 
-if "%MSG%"=="" (
-    echo No message entered. Aborting.
-    pause
-    exit /b 1
-)
+set /p MSG=<%TEMP%\commitmsg.txt
+echo.
+echo Commit message: %MSG%
+echo.
 
-git add -A
 git commit -m "%MSG%"
+git push origin main
 
 echo.
 echo Done!

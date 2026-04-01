@@ -14,12 +14,16 @@ import os, sys, time, logging, sqlite3, json
 from datetime import datetime, date, timedelta
 
 import pypowerwall
+from dotenv import load_dotenv
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
+
+from fetch_rates import is_sdge_holiday, holiday_name, holiday_super_off_peak
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PW_EMAIL      = 'don@nsdsolutions.com'
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
-DB_PATH       = os.path.join(BASE_DIR, 'powerwall.db')
-LOG_PATH      = os.path.join(BASE_DIR, 'rules.log')
+DB_PATH       = os.environ.get('DB_PATH', os.path.join(BASE_DIR, 'powerwall.db'))
+LOG_PATH      = os.environ.get('LOG_PATH', os.path.join(BASE_DIR, 'rules.log'))
 EVAL_INTERVAL = 60    # seconds between evaluations
 LOOP_SLEEP    = 30    # main loop cadence in seconds
 
@@ -282,7 +286,8 @@ def _rule_fires_at(rule: dict, d: date) -> datetime | None:
     return datetime(d.year, d.month, d.day, rule['hour'], rule['minute'])
 
 
-def current_target_state(dt: datetime, rules: list, live: dict) -> dict:
+def current_target_state(dt: datetime, rules: list, live: dict,
+                         tou_periods: dict = None) -> dict:
     state = {
         'mode':          'autonomous',
         'reserve':       20,
@@ -303,6 +308,13 @@ def current_target_state(dt: datetime, rules: list, live: dict) -> dict:
         for key in ('mode', 'reserve', 'grid_charging', 'grid_export'):
             if rule[key] is not None:
                 state[key] = rule[key]
+
+    # Holiday override: hold battery during super off-peak to preserve
+    # charge for on-peak export.  Off-peak and on-peak follow normal rules.
+    if is_sdge_holiday(dt.date()) and holiday_super_off_peak(dt.hour, tou_periods):
+        state['reserve']    = 100
+        state['grid_export'] = 'pv_only'
+        state['_holiday']    = holiday_name(dt.date())
 
     return state
 
@@ -412,6 +424,7 @@ def main_loop(stop_fn=None):
     last_eval  = 0.0
     last_state = {}
     first_run  = True
+    last_holiday_logged = None   # date — log holiday override once per day
 
     while True:
         if stop_fn and stop_fn():
@@ -438,14 +451,37 @@ def main_loop(stop_fn=None):
                 rules = load_rules_from_db(conn)
                 live  = get_live_state(pw)
                 dt    = datetime.now()
-                target = current_target_state(dt, rules, live)
+
+                # Load configurable TOU periods from DB
+                tou_row = conn.execute(
+                    "SELECT value FROM settings WHERE key = 'tou_periods'"
+                ).fetchone()
+                tou_periods = None
+                if tou_row:
+                    try:
+                        tou_periods = json.loads(tou_row[0])
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+                target = current_target_state(dt, rules, live, tou_periods)
                 nxt    = next_rule_fire(dt, rules)
 
+                # Log holiday override once per day
+                hol = target.pop('_holiday', None)
+                if hol and last_holiday_logged != dt.date():
+                    log.info('Holiday override active: %s', hol)
+                    log_event(conn, 'powerwall', 'holiday_override',
+                              f'Holiday: {hol} — Reserve → 100%, '
+                              f'Export → PV-only (super off-peak hold)',
+                              result='ok', battery_pct=live.get('battery_pct'))
+                    last_holiday_logged = dt.date()
+
                 log.info(
-                    'STATE  mode=%-16s reserve=%s  grid_charge=%-5s  grid_export=%s',
+                    'STATE  mode=%-16s reserve=%s  grid_charge=%-5s  grid_export=%s%s',
                     target['mode'],
                     f"{target['reserve']}%" if target['reserve'] is not None else 'none',
                     target['grid_charging'], target['grid_export'],
+                    '  [HOLIDAY]' if hol else '',
                 )
                 if nxt:
                     log.info('Next rule fires at %s', nxt.strftime('%Y-%m-%d %H:%M'))

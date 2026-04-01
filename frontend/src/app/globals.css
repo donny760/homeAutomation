@@ -78,6 +78,13 @@ body {
   letter-spacing: 0.02em;
 }
 .theme-btn:hover { color: var(--text); border-color: var(--dim); }
+.nav-right    { display: flex; align-items: center; gap: 14px; }
+.nav-time     { font-size: 0.82rem; color: var(--very-dim); }
+.nav-wx       { display: flex; align-items: center; gap: 4px; }
+.nav-wx-icon  { font-size: 1rem; line-height: 1; }
+.nav-wx-temp  { font-size: 0.88rem; font-weight: 500; }
+.nav-aqi      { font-size: 0.78rem; font-weight: 600; }
+.nav-sparkle  { color: var(--purple); font-size: 0.85em; }
 
 /* ── Pages ───────────────────────────────────────────────────────────────────*/
 .page { display: none; flex: 1; overflow: hidden; }
@@ -91,21 +98,6 @@ body {
   gap: 10px;
 }
 #page-dashboard.active { display: flex; }
-
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 56px;
-  flex-shrink: 0;
-}
-.topbar-left { display: flex; align-items: baseline; gap: 14px; }
-.clock { font-size: 2.5rem; font-weight: 200; letter-spacing: -0.03em; line-height: 1; }
-.date-str { font-size: 1.05rem; color: var(--dim); font-weight: 300; }
-.topbar-right { display: flex; flex-direction: column; align-items: flex-end; gap: 2px; }
-.wx-temp  { font-size: 2.1rem; font-weight: 200; line-height: 1; }
-.wx-desc  { font-size: 1rem; color: var(--dim); }
-.wx-fcst  { font-size: 0.85rem; color: var(--very-dim); }
 
 .card {
   background: var(--card-bg);
@@ -132,7 +124,7 @@ body {
 .tile-na    { color: var(--standby); }
 
 /* ── Main row (flow + automations) ──────────────────────────────────────────*/
-.main-row { display: flex; gap: 10px; flex: 1; min-height: 0; }
+.main-row { display: flex; gap: 10px; flex: 2; min-height: 0; }
 .flow-col  { flex: 3; min-width: 0; display: flex; flex-direction: column; }
 .flow-col .flow-card { flex: 1; min-height: 0; }
 .automations-col { flex: 2; min-width: 0; display: flex; flex-direction: column; }
@@ -241,8 +233,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  height: 210px;
-  flex-shrink: 0;
+  flex: 1;
+  min-height: 160px;
 }
 .chart-header {
   display: flex;
@@ -793,8 +785,6 @@ body {
   transition: background 0.15s, color 0.15s;
 }
 .btn-insights:hover { background: var(--purple); color: #111; }
-
-.nav-sparkle { color: var(--purple); font-size: 0.85em; }
 
 /* ── Insights Drawer ─────────────────────────────────────────────────────────*/
 .insights-backdrop {
