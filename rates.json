@@ -1,12 +1,12 @@
 {
-  "summer_on_peak": 0.78432,
-  "summer_off_peak": 0.48689,
-  "summer_super_off_peak": 0.25826,
-  "winter_on_peak": 0.5137,
-  "winter_off_peak": 0.45711,
-  "winter_super_off_peak": 0.25088,
+  "summer_on_peak": 0.78953,
+  "summer_off_peak": 0.49245,
+  "summer_super_off_peak": 0.25984,
+  "winter_on_peak": 0.51924,
+  "winter_off_peak": 0.46271,
+  "winter_super_off_peak": 0.25247,
   "base_services_charge_per_day": 0.79343,
-  "updated": "2026-03-31T19:00:48.760300",
-  "source_url": "https://www.sdge.com/sites/default/files/regulatory/1-1-26%20Schedule%20EV-TOU%20%26%20EV-TOU-2%20Total%20Rates%20Tables.pdf",
-  "effective_date": "2026-01-01"
+  "updated": "2026-04-14T04:59:21.105048",
+  "source_url": "https://www.sdge.com/sites/default/files/regulatory/4-1-26%20Schedule%20EV-TOU%20%26%20EV-TOU-2%20Total%20Rates%20Tables.pdf",
+  "effective_date": "2026-04-01"
 }

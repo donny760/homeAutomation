@@ -233,7 +233,7 @@ _SETTINGS_DEFAULTS = {
     'gemini_model':                'gemini-2.0-flash',
     # Nest / Google SDM
     'nest_enabled':                '0',
-    'nest_poll_interval':          '60',
+    'nest_poll_interval':          '45',
     'nest_client_id':              os.environ.get('NEST_CLIENT_ID', ''),
     'nest_client_secret':          os.environ.get('NEST_CLIENT_SECRET', ''),
     'nest_project_id':             os.environ.get('NEST_PROJECT_ID', ''),
@@ -402,6 +402,26 @@ def _log_success(system: str, event_type: str, title: str, detail: str = None) -
                 '(ts, system, event_type, title, detail, result, source) '
                 'VALUES (?,?,?,?,?,?,?)',
                 (int(time.time()), system, event_type, title, detail, 'ok', 'live')
+            )
+    except Exception:
+        pass
+
+
+def _backfill_rates_event_url() -> None:
+    """One-time: append source_url to existing rates_updated events that don't have one."""
+    try:
+        if not os.path.exists(RATES_PATH):
+            return
+        with open(RATES_PATH) as f:
+            src_url = json.load(f).get('source_url')
+        if not src_url:
+            return
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute(
+                "UPDATE event_log SET detail = detail || '  ' || ? "
+                "WHERE system='rates' AND event_type='rates_updated' "
+                "AND (detail IS NULL OR detail NOT LIKE '%http%')",
+                (src_url,)
             )
     except Exception:
         pass
@@ -808,9 +828,13 @@ def poller() -> None:
                         if old_v is not None and new_v is not None and old_v != new_v:
                             changes.append(f'{k}: {old_v}\u2192{new_v}')
                     if changes:
+                        detail_parts = [', '.join(changes)]
+                        src_url = new_rates.get('source_url')
+                        if src_url:
+                            detail_parts.append(src_url)
                         _log_success('rates', 'rates_updated',
                                      f'Rates updated (eff. {new_rates.get("effective_date", "?")})',
-                                     detail=', '.join(changes))
+                                     detail='  '.join(detail_parts))
                 except Exception as exc:
                     print(f'Rate fetch error: {exc}')
                     _log_system_error('rates', 'Energy rate refresh failed', str(exc))
@@ -1994,11 +2018,13 @@ _nest_event_ts: float = 0.0
 _nest_devices: dict = {}        # device_path -> display_name cache
 _nest_devices_ts: float = 0.0
 _NEST_DEVICE_CACHE_TTL = 3600   # 1 hour
+NEST_MEDIA_DIR = os.path.join(BASE_DIR, 'nest_media')
 
 NEST_EVENT_TYPE_MAP = {
-    'sdm.devices.events.CameraMotion.Motion':  'motion_detected',
-    'sdm.devices.events.CameraPerson.Person':  'person_detected',
-    'sdm.devices.events.DoorbellChime.Chime':  'doorbell_press',
+    'sdm.devices.events.CameraMotion.Motion':   'motion_detected',
+    'sdm.devices.events.CameraPerson.Person':   'person_detected',
+    'sdm.devices.events.DoorbellChime.Chime':   'doorbell_press',
+    'sdm.devices.events.CameraClipPreview.ClipPreview': 'clip_preview',  # handled specially — not logged as own event
 }
 
 NEST_EVENT_TITLE_MAP = {
@@ -2006,6 +2032,43 @@ NEST_EVENT_TITLE_MAP = {
     'person_detected': 'Person Detected',
     'doorbell_press':  'Doorbell Pressed',
 }
+
+
+def _nest_download_clip(preview_url, session_id, device_name, ts, token):
+    """Download MP4 clip from ClipPreview. Returns relative path (under NEST_MEDIA_DIR) or None."""
+    try:
+        date_folder = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
+        device_slug = ''.join(c if c.isalnum() else '_' for c in device_name) or 'unknown'
+        filename = f'{ts}_{device_slug}_{session_id[:12]}.mp4'
+        rel_path = f'{date_folder}/{filename}'
+        abs_dir = os.path.join(NEST_MEDIA_DIR, date_folder)
+        abs_path = os.path.join(abs_dir, filename)
+
+        if os.path.exists(abs_path):
+            return rel_path  # already downloaded
+
+        os.makedirs(abs_dir, exist_ok=True)
+
+        # Try with Bearer token first; fall back to no-auth (URL may be pre-signed)
+        for headers in ({'Authorization': f'Bearer {token}'}, {}):
+            try:
+                resp = _requests.get(preview_url, headers=headers, timeout=30, stream=True)
+                if resp.status_code == 200:
+                    with open(abs_path, 'wb') as f:
+                        for chunk in resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                    return rel_path
+                if resp.status_code != 401:
+                    break
+            except Exception:
+                break
+
+        print(f'Nest clip download failed: session {session_id[:12]}')
+        return None
+    except Exception as exc:
+        print(f'Nest clip download error: {exc}')
+        return None
 
 
 def _nest_ensure_token() -> str | None:
@@ -2110,7 +2173,9 @@ def fetch_nest_events() -> int:
         if not messages:
             return 0
 
-        rows = []
+        # Two-pass: first collect events and clips separately, keyed by session_id
+        pending_events = []   # list of dicts: ts, event_type, title, device_name, event_id, session_id
+        clips_by_session = {} # session_id -> {'previewUrl', 'ts', 'device_name'}
         ack_ids = []
 
         for msg in messages:
@@ -2133,22 +2198,58 @@ def fetch_nest_events() -> int:
                 event_id = payload.get('eventId', '')
                 device_name = _nest_get_device_name(device_path, token)
 
-                for sdm_event_key in events:
+                for sdm_event_key, edata in events.items():
                     event_type = NEST_EVENT_TYPE_MAP.get(sdm_event_key)
                     if not event_type:
                         continue
 
-                    title = f'{device_name}: {NEST_EVENT_TITLE_MAP.get(event_type, event_type)}'
-                    session_id = events[sdm_event_key].get('eventSessionId', '')
-                    detail = f'device: {device_name}  eventId: {event_id}  session: {session_id}'
-                    rows.append((ts, 'nest', event_type, title, detail, 'info', 'live'))
+                    session_id = edata.get('eventSessionId', '')
+
+                    if event_type == 'clip_preview':
+                        preview_url = edata.get('previewUrl', '')
+                        if preview_url and session_id:
+                            clips_by_session[session_id] = {
+                                'previewUrl': preview_url,
+                                'ts': ts,
+                                'device_name': device_name,
+                            }
+                        continue
+
+                    pending_events.append({
+                        'ts': ts,
+                        'event_type': event_type,
+                        'device_name': device_name,
+                        'event_id': event_id,
+                        'session_id': session_id,
+                    })
 
             except Exception:
                 continue
 
-        # Batch deduplicate (same pattern as Rachio)
-        if rows:
-            with sqlite3.connect(DB_PATH, timeout=30) as c:
+        # Download clips for sessions present in this batch
+        clip_paths = {}  # session_id -> rel_path
+        for sid, info in clips_by_session.items():
+            path = _nest_download_clip(info['previewUrl'], sid, info['device_name'], info['ts'], token)
+            if path:
+                clip_paths[sid] = path
+
+        # Build event rows, attaching media path if clip was captured in this batch
+        rows = []
+        sessions_with_pending_event = set()
+        for ev in pending_events:
+            sessions_with_pending_event.add(ev['session_id'])
+            title = f'{ev["device_name"]}: {NEST_EVENT_TITLE_MAP.get(ev["event_type"], ev["event_type"])}'
+            detail = f'device: {ev["device_name"]}  eventId: {ev["event_id"]}  session: {ev["session_id"]}'
+            if ev['session_id'] in clip_paths:
+                detail += f'  media: {clip_paths[ev["session_id"]]}'
+            rows.append((ev['ts'], 'nest', ev['event_type'], title, detail, 'info', 'live'))
+
+        # Cross-batch correlation: ClipPreviews whose matching event arrived in a previous batch
+        cross_batch_clips = {sid: path for sid, path in clip_paths.items() if sid not in sessions_with_pending_event}
+
+        # Insert new event rows + apply cross-batch clip updates
+        with sqlite3.connect(DB_PATH, timeout=30) as c:
+            if rows:
                 existing = set(
                     c.execute(
                         'SELECT ts, title FROM event_log WHERE system = ?', ('nest',)
@@ -2163,6 +2264,16 @@ def fetch_nest_events() -> int:
                             'VALUES (?,?,?,?,?,?,?)', row)
                         existing.add((ts_val, title))
                         inserted += 1
+
+            for sid, path in cross_batch_clips.items():
+                # Update any existing nest event rows matching this session_id that don't already have media
+                c.execute(
+                    "UPDATE event_log SET detail = detail || ? "
+                    "WHERE system = 'nest' AND detail LIKE ? AND detail NOT LIKE '%media:%'",
+                    (f'  media: {path}', f'%session: {sid}%')
+                )
+                if c.rowcount:
+                    print(f'Nest clip attached to {c.rowcount} existing event(s) for session {sid[:12]}')
 
         # Always ack ALL messages to prevent redelivery
         if ack_ids:
@@ -3889,6 +4000,12 @@ def api_debug_nest_status():
     })
 
 
+@app.route('/api/nest/media/<path:filename>')
+def api_nest_media(filename):
+    """Serve Nest MP4 clips. Path: YYYY-MM-DD/file.mp4"""
+    return send_from_directory(NEST_MEDIA_DIR, filename, mimetype='video/mp4')
+
+
 # ── Event Log endpoint ────────────────────────────────────────────────────────
 @app.route('/api/events')
 def api_events():
@@ -4117,7 +4234,9 @@ except ImportError:
 
 def _start():
     os.chdir(BASE_DIR)
+    os.makedirs(NEST_MEDIA_DIR, exist_ok=True)
     init_db()
+    _backfill_rates_event_url()
     backfill_history()
     threading.Thread(target=rebuild_daily_costs, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()

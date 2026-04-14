@@ -8,6 +8,19 @@ interface EventItem {
   title: string;
   result?: string;
   event_type?: string;
+  detail?: string;
+}
+
+function extractUrl(detail?: string): string | null {
+  if (!detail) return null;
+  const m = detail.match(/https?:\/\/\S+/);
+  return m ? m[0] : null;
+}
+
+function extractMedia(detail?: string): string | null {
+  if (!detail) return null;
+  const m = detail.match(/media:\s*(\S+)/);
+  return m ? m[1] : null;
 }
 
 const SYSTEM_META: Record<string, { icon: string; label: string; color: string }> = {
@@ -17,6 +30,9 @@ const SYSTEM_META: Record<string, { icon: string; label: string; color: string }
   pool: { icon: '\ud83c\udfca', label: 'Pool', color: 'var(--pool)' },
   myq: { icon: '\ud83d\ude97', label: 'MyQ', color: 'var(--gray)' },
   nest: { icon: '\ud83d\udcf7', label: 'Cameras', color: 'var(--nest)' },
+  rates: { icon: '\ud83d\udcb2', label: 'Rates', color: 'var(--amber)' },
+  holidays: { icon: '\ud83d\udcc5', label: 'Holidays', color: 'var(--amber)' },
+  system: { icon: '\u2699\ufe0f', label: 'System', color: 'var(--gray)' },
 };
 
 const FILTERS: { key: string; label: string }[] = [
@@ -26,6 +42,9 @@ const FILTERS: { key: string; label: string }[] = [
   { key: 'abode', label: '\ud83d\udd12 Abode' },
   { key: 'pool', label: '\ud83c\udfca Pool' },
   { key: 'nest', label: '\ud83d\udcf7 Cameras' },
+  { key: 'rates', label: '\ud83d\udcb2 Rates' },
+  { key: 'holidays', label: '\ud83d\udcc5 Holidays' },
+  { key: 'system', label: '\u2699\ufe0f System' },
   { key: 'errors', label: 'Errors' },
 ];
 
@@ -60,6 +79,7 @@ export default function EventLog({ isActive }: EventLogProps) {
   const [hasMore, setHasMore] = useState(true);
   const [startDate, setStartDate] = useState(weekAgo);
   const [endDate, setEndDate] = useState(today);
+  const [videoSrc, setVideoSrc] = useState<string | null>(null);
 
   const offsetRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
@@ -189,6 +209,14 @@ export default function EventLog({ isActive }: EventLogProps) {
               const meta = SYSTEM_META[e.system] || { icon: '?', label: e.system, color: 'var(--dim)' };
               const timeStr = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
               const isErr = isErrorEvent(e);
+              const url = extractUrl(e.detail);
+              const media = extractMedia(e.detail);
+              const rowClass = `event-row${isErr ? ' error' : ''}${url || media ? ' linkable' : ''}`;
+              const onRowClick = media
+                ? () => setVideoSrc(`/api/nest/media/${media}`)
+                : url
+                ? () => window.open(url, '_blank', 'noopener,noreferrer')
+                : undefined;
               return (
                 <span key={i}>
                   {showDivider && (
@@ -196,13 +224,17 @@ export default function EventLog({ isActive }: EventLogProps) {
                       <span>{dateKey}</span>
                     </div>
                   )}
-                  <div className={`event-row${isErr ? ' error' : ''}`} data-system={e.system}>
+                  <div className={rowClass} data-system={e.system} onClick={onRowClick}>
                     <div className="event-accent" style={{ background: isErr ? '#e05252' : meta.color }} />
                     <div className="event-ts">{timeStr}</div>
                     <div className="event-system" style={{ color: meta.color }}>
                       {meta.icon} {meta.label}
                     </div>
-                    <div className="event-title">{e.title}</div>
+                    <div className="event-title">
+                      {e.title}
+                      {media && <span className="event-link-icon">{'\u25B6\uFE0F'}</span>}
+                      {!media && url && <span className="event-link-icon">{'\u{1F517}'}</span>}
+                    </div>
                   </div>
                 </span>
               );
@@ -216,6 +248,14 @@ export default function EventLog({ isActive }: EventLogProps) {
           </>
         )}
       </div>
+      {videoSrc && (
+        <div className="nest-video-modal" onClick={() => setVideoSrc(null)}>
+          <div className="nest-video-modal-inner" onClick={(e) => e.stopPropagation()}>
+            <button className="nest-video-close" onClick={() => setVideoSrc(null)}>&times;</button>
+            <video controls autoPlay src={videoSrc} />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -24,7 +24,7 @@
   period-specific left border (amber/green/blue), NOW badge tracks period accent
 - Dark/light theme toggle live — persists via localStorage
 - Nav clock removed (Dashboard topbar clock is the only clock)
-- Active integrations: pypowerwall (cloud), screenlogicpy (Pentair), Rachio, Abode (websocket)
+- Active integrations: pypowerwall (cloud), screenlogicpy (Pentair), Rachio, Abode (websocket), Nest/Google SDM (Pub/Sub pull)
 - Run (prod/server): `py server.py` (port 5000, serves built React from static/frontend/)
 - Run (dev): `cd frontend && npm run dev:all` (Flask 5000 + Next.js 3000, hot reload)
 - Deploy: `cd frontend && npm run deploy` then copy static/frontend/ to server
@@ -37,7 +37,8 @@
   weather-based skip (never shortens existing delay). Disabled by default (`rain_skip_enabled`).
   Own settings card in UI with enable toggle.
 - Active rain delays appear in Upcoming Automations with "Rain Delay" badge + muted styling
-- Event Log page live — filter pills (Powerwall, Rachio/Sprinklers, Abode, Pool, Errors), scrollable rows, date dividers, system error logging
+- Event Log page live — filter pills (Powerwall, Rachio/Sprinklers, Abode, Pool, Cameras, Errors), scrollable rows, date dividers, system error logging
+  - Errors filter fixed (session 16): moved from client-side to server-side SQL filtering — previously fetched 50 events then filtered client-side, breaking pagination when errors were sparse
 - Energy Breakdown page live — TOU period columns (On-Peak, Off-Peak, Super Off-Peak)
   per day with kWh + cost, month headers with per-period totals, YTD summary bar
   - Start/End date filter inputs (default: Jan 1 → today)
@@ -176,6 +177,9 @@
 - Verify Rachio device event API response fields against RACHIO_EVENT_TYPE_MAP
   (hit /api/debug/rachio/events to inspect raw data)
 - Verify device.rainDelayExpirationDate field exists (hit /api/debug/rachio to check)
+- Nest: add CameraSound.Sound event type when desired
+- Nest: implement clip retrieval via internal Google API (nest-camera-frontend.googleapis.com)
+- Nest: give doorbell and Hub Max custom names in Google Home app so event titles are descriptive
 
 ---
 
@@ -295,6 +299,52 @@ Debug endpoints:
 
 ---
 
+## Data connection — Nest / Google SDM (session 16)
+- API: Smart Device Management (SDM) REST API + Google Cloud Pub/Sub
+- OAuth Client ID: 357462282092-1lrof4k31ubs3bf74qoavjq5op9aeh2s.apps.googleusercontent.com
+- Device Access Project ID: 2884c1bb-5996-4db1-99f9-87e6c81c67b0
+- GCP Project ID: homeassisant01 (NOTE: typo in project name, missing 't')
+- Pub/Sub subscription: projects/homeassisant01/subscriptions/nest-events-pull
+- Events delivered via Pub/Sub pull (server polls every 60s, configurable)
+- OAuth flow: GET /nest/auth → Google consent → /nest/callback stores refresh_token
+- Token auto-refresh: _nest_ensure_token() refreshes access_token before expiry
+- Device name cache: _nest_get_device_name() caches SDM device list (1-hour TTL)
+
+Devices (confirmed via SDM API):
+  DOORBELL: (unnamed) — Nest Doorbell
+  CAMERA: Living Room camera — Nest Camera
+  DISPLAY: (unnamed) — Nest Hub Max (has built-in camera)
+
+Event types captured (sound excluded for now):
+  sdm.devices.events.CameraMotion.Motion  → motion_detected
+  sdm.devices.events.CameraPerson.Person  → person_detected
+  sdm.devices.events.DoorbellChime.Chime  → doorbell_press
+
+Title format: "{device_name}: {event_title}" (e.g. "Living Room camera: Person Detected")
+Dedup: (ts, title) tuple, same pattern as Rachio/Abode
+System name in event_log: 'nest'
+Frontend filter: "📷 Cameras" (--nest: #4285F4, Google blue)
+
+Pub/Sub notes:
+  - Messages retained up to 7 days if server is down (configurable in GCP)
+  - returnImmediately: true avoids long-polling timeouts on empty queues
+  - All messages ack'd after processing (even dupes/malformed) to prevent redelivery
+  - No backfill needed — Pub/Sub retention handles downtime
+
+Clip/image access:
+  - Official SDM: time-limited previewUrl (expires ~30s), not practical with 60s polling
+  - Internal API exists (nest-camera-frontend.googleapis.com) for timestamp-based clip retrieval
+    but uses different auth — deferred for future implementation
+
+Debug endpoint: GET /api/debug/nest/status
+
+Settings (stored in settings table):
+  nest_enabled, nest_poll_interval, nest_client_id, nest_client_secret,
+  nest_project_id, nest_pubsub_subscription, nest_refresh_token,
+  nest_access_token, nest_token_expiry
+
+---
+
 ## Hardware / location
 - 3× Tesla Powerwall 2 (40.5 kWh total usable capacity)
 - SDG&E EV-TOU-2 plan, San Diego CA (lat 32.7157, lon -117.1611)
@@ -325,7 +375,7 @@ D:\projects\homeAutomation\
 
 ## Navigation — 5 pages
 Dashboard:         live power flow, chart, pool tile, upcoming automations widget
-Event Log:         filterable event timeline (Powerwall, Rachio/Sprinklers, Abode, Pool) + system errors
+Event Log:         filterable event timeline (Powerwall, Rachio/Sprinklers, Abode, Pool, Cameras) + system errors
 Powerwall Rules:   rules manager (CRUD table + add/edit form) + rate card
 Energy Breakdown:  daily cost breakdown by TOU period (On-Peak, Off-Peak, Super Off-Peak)
 Settings:          connector toggles, polling intervals, SDG&E rate config, Gemini AI config
