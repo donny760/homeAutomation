@@ -233,7 +233,7 @@ _SETTINGS_DEFAULTS = {
     'gemini_model':                'gemini-2.0-flash',
     # Nest / Google SDM
     'nest_enabled':                '0',
-    'nest_poll_interval':          '45',
+    'nest_poll_interval':          '15',
     'nest_client_id':              os.environ.get('NEST_CLIENT_ID', ''),
     'nest_client_secret':          os.environ.get('NEST_CLIENT_SECRET', ''),
     'nest_project_id':             os.environ.get('NEST_PROJECT_ID', ''),
@@ -2016,15 +2016,16 @@ def start_abode_listener():
 # ── Nest / Google SDM ────────────────────────────────────────────────────────
 _nest_event_ts: float = 0.0
 _nest_devices: dict = {}        # device_path -> display_name cache
+_nest_devices_raw: list = []    # last raw device list from SDM API (for debug)
 _nest_devices_ts: float = 0.0
 _NEST_DEVICE_CACHE_TTL = 3600   # 1 hour
+_nest_event_counters: dict = {} # running tally of event types seen over time
 NEST_MEDIA_DIR = os.path.join(BASE_DIR, 'nest_media')
 
 NEST_EVENT_TYPE_MAP = {
-    'sdm.devices.events.CameraMotion.Motion':   'motion_detected',
-    'sdm.devices.events.CameraPerson.Person':   'person_detected',
-    'sdm.devices.events.DoorbellChime.Chime':   'doorbell_press',
-    'sdm.devices.events.CameraClipPreview.ClipPreview': 'clip_preview',  # handled specially — not logged as own event
+    'sdm.devices.events.CameraMotion.Motion':  'motion_detected',
+    'sdm.devices.events.CameraPerson.Person':  'person_detected',
+    'sdm.devices.events.DoorbellChime.Chime':  'doorbell_press',
 }
 
 NEST_EVENT_TITLE_MAP = {
@@ -2034,40 +2035,63 @@ NEST_EVENT_TITLE_MAP = {
 }
 
 
-def _nest_download_clip(preview_url, session_id, device_name, ts, token):
-    """Download MP4 clip from ClipPreview. Returns relative path (under NEST_MEDIA_DIR) or None."""
+def _nest_download_snapshot(device_path, inner_event_id, device_name, ts, token):
+    """Generate and download a JPEG snapshot for a camera event.
+
+    Uses CameraEventImage.GenerateImage — URL is valid for ~30s after the event fires,
+    so this must be called promptly. Returns relative path or None.
+    """
     try:
+        if not device_path or not inner_event_id:
+            return None
+
         date_folder = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
         device_slug = ''.join(c if c.isalnum() else '_' for c in device_name) or 'unknown'
-        filename = f'{ts}_{device_slug}_{session_id[:12]}.mp4'
+        filename = f'{ts}_{device_slug}_{inner_event_id[:12]}.jpg'
         rel_path = f'{date_folder}/{filename}'
         abs_dir = os.path.join(NEST_MEDIA_DIR, date_folder)
         abs_path = os.path.join(abs_dir, filename)
 
         if os.path.exists(abs_path):
-            return rel_path  # already downloaded
+            return rel_path
+
+        # Step 1: GenerateImage command returns {url, token}
+        cmd_resp = _requests.post(
+            f'https://smartdevicemanagement.googleapis.com/v1/{device_path}:executeCommand',
+            headers={'Authorization': f'Bearer {token}'},
+            json={
+                'command': 'sdm.devices.commands.CameraEventImage.GenerateImage',
+                'params': {'eventId': inner_event_id},
+            },
+            timeout=15,
+        )
+        if cmd_resp.status_code != 200:
+            # Common: 400 "Event id not found" if URL expired, or device doesn't support event images
+            return None
+        result = cmd_resp.json().get('results', {})
+        img_url = result.get('url')
+        img_token = result.get('token')
+        if not img_url or not img_token:
+            return None
+
+        # Step 2: Download the JPEG using the returned token as Basic auth
+        img_resp = _requests.get(
+            img_url,
+            headers={'Authorization': f'Basic {img_token}'},
+            timeout=15,
+            stream=True,
+        )
+        if img_resp.status_code != 200:
+            return None
 
         os.makedirs(abs_dir, exist_ok=True)
-
-        # Try with Bearer token first; fall back to no-auth (URL may be pre-signed)
-        for headers in ({'Authorization': f'Bearer {token}'}, {}):
-            try:
-                resp = _requests.get(preview_url, headers=headers, timeout=30, stream=True)
-                if resp.status_code == 200:
-                    with open(abs_path, 'wb') as f:
-                        for chunk in resp.iter_content(chunk_size=65536):
-                            if chunk:
-                                f.write(chunk)
-                    return rel_path
-                if resp.status_code != 401:
-                    break
-            except Exception:
-                break
-
-        print(f'Nest clip download failed: session {session_id[:12]}')
-        return None
+        with open(abs_path, 'wb') as f:
+            for chunk in img_resp.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+        return rel_path
     except Exception as exc:
-        print(f'Nest clip download error: {exc}')
+        print(f'Nest snapshot error: {exc}')
         return None
 
 
@@ -2113,35 +2137,49 @@ def _nest_ensure_token() -> str | None:
         return None
 
 
+def _nest_refresh_devices(token):
+    """Refresh the device cache. Stores {device_path: {'name': ..., 'has_event_image': bool}}."""
+    global _nest_devices, _nest_devices_ts, _nest_devices_raw
+    project_id = get_setting('nest_project_id', '')
+    try:
+        resp = _requests.get(
+            f'https://smartdevicemanagement.googleapis.com/v1/enterprises/{project_id}/devices',
+            headers={'Authorization': f'Bearer {token}'},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        devices = resp.json().get('devices', [])
+        _nest_devices = {}
+        _nest_devices_raw = devices
+        for d in devices:
+            name = d.get('name', '')
+            traits = d.get('traits', {})
+            custom = traits.get('sdm.devices.traits.Info', {}).get('customName', '')
+            dev_type = d.get('type', '').rsplit('.', 1)[-1]
+            display = custom or dev_type or 'Unknown'
+            _nest_devices[name] = {
+                'name': display,
+                'has_event_image': 'sdm.devices.traits.CameraEventImage' in traits,
+            }
+        _nest_devices_ts = time.time()
+    except Exception as exc:
+        print(f'Nest device list error: {exc}')
+
+
 def _nest_get_device_name(device_path: str, token: str) -> str:
     """Return human-readable device name, using cache. Falls back to device ID fragment."""
-    global _nest_devices, _nest_devices_ts
-
     if not _nest_devices or time.time() - _nest_devices_ts > _NEST_DEVICE_CACHE_TTL:
-        project_id = get_setting('nest_project_id', '')
-        try:
-            resp = _requests.get(
-                f'https://smartdevicemanagement.googleapis.com/v1/enterprises/{project_id}/devices',
-                headers={'Authorization': f'Bearer {token}'},
-                timeout=15,
-            )
-            resp.raise_for_status()
-            devices = resp.json().get('devices', [])
-            _nest_devices = {}
-            for d in devices:
-                name = d.get('name', '')
-                traits = d.get('traits', {})
-                custom = traits.get('sdm.devices.traits.Info', {}).get('customName', '')
-                dev_type = d.get('type', '').rsplit('.', 1)[-1]
-                display = custom or dev_type or 'Unknown'
-                _nest_devices[name] = display
-            _nest_devices_ts = time.time()
-        except Exception as exc:
-            print(f'Nest device list error: {exc}')
+        _nest_refresh_devices(token)
 
     if device_path in _nest_devices:
-        return _nest_devices[device_path]
+        return _nest_devices[device_path].get('name', 'Unknown')
     return device_path.rsplit('/', 1)[-1][:6] if device_path else 'Unknown'
+
+
+def _nest_device_has_event_image(device_path: str) -> bool:
+    """Check if a device supports CameraEventImage (cached). Assumes cache already warm."""
+    info = _nest_devices.get(device_path)
+    return bool(info and info.get('has_event_image'))
 
 
 def fetch_nest_events() -> int:
@@ -2173,9 +2211,12 @@ def fetch_nest_events() -> int:
         if not messages:
             return 0
 
-        # Two-pass: first collect events and clips separately, keyed by session_id
-        pending_events = []   # list of dicts: ts, event_type, title, device_name, event_id, session_id
-        clips_by_session = {} # session_id -> {'previewUrl', 'ts', 'device_name'}
+        # Ensure device cache is warm (for trait lookups)
+        if not _nest_devices or time.time() - _nest_devices_ts > _NEST_DEVICE_CACHE_TTL:
+            _nest_refresh_devices(token)
+
+        # Parse each message, attempt snapshot capture immediately (URL expires fast)
+        rows = []
         ack_ids = []
 
         for msg in messages:
@@ -2195,61 +2236,38 @@ def fetch_nest_events() -> int:
                 else:
                     ts = int(time.time())
 
-                event_id = payload.get('eventId', '')
+                outer_event_id = payload.get('eventId', '')
                 device_name = _nest_get_device_name(device_path, token)
+                supports_snapshot = _nest_device_has_event_image(device_path)
 
                 for sdm_event_key, edata in events.items():
+                    # Running counter across all calls (for debugging)
+                    _nest_event_counters[sdm_event_key] = _nest_event_counters.get(sdm_event_key, 0) + 1
+
                     event_type = NEST_EVENT_TYPE_MAP.get(sdm_event_key)
                     if not event_type:
                         continue
 
                     session_id = edata.get('eventSessionId', '')
+                    inner_event_id = edata.get('eventId', '')
 
-                    if event_type == 'clip_preview':
-                        preview_url = edata.get('previewUrl', '')
-                        if preview_url and session_id:
-                            clips_by_session[session_id] = {
-                                'previewUrl': preview_url,
-                                'ts': ts,
-                                'device_name': device_name,
-                            }
-                        continue
+                    title = f'{device_name}: {NEST_EVENT_TITLE_MAP.get(event_type, event_type)}'
+                    detail = f'device: {device_name}  eventId: {outer_event_id}  session: {session_id}'
 
-                    pending_events.append({
-                        'ts': ts,
-                        'event_type': event_type,
-                        'device_name': device_name,
-                        'event_id': event_id,
-                        'session_id': session_id,
-                    })
+                    # Attempt snapshot capture for devices that support CameraEventImage
+                    if supports_snapshot and inner_event_id:
+                        path = _nest_download_snapshot(device_path, inner_event_id, device_name, ts, token)
+                        if path:
+                            detail += f'  media: {path}'
+
+                    rows.append((ts, 'nest', event_type, title, detail, 'info', 'live'))
 
             except Exception:
                 continue
 
-        # Download clips for sessions present in this batch
-        clip_paths = {}  # session_id -> rel_path
-        for sid, info in clips_by_session.items():
-            path = _nest_download_clip(info['previewUrl'], sid, info['device_name'], info['ts'], token)
-            if path:
-                clip_paths[sid] = path
-
-        # Build event rows, attaching media path if clip was captured in this batch
-        rows = []
-        sessions_with_pending_event = set()
-        for ev in pending_events:
-            sessions_with_pending_event.add(ev['session_id'])
-            title = f'{ev["device_name"]}: {NEST_EVENT_TITLE_MAP.get(ev["event_type"], ev["event_type"])}'
-            detail = f'device: {ev["device_name"]}  eventId: {ev["event_id"]}  session: {ev["session_id"]}'
-            if ev['session_id'] in clip_paths:
-                detail += f'  media: {clip_paths[ev["session_id"]]}'
-            rows.append((ev['ts'], 'nest', ev['event_type'], title, detail, 'info', 'live'))
-
-        # Cross-batch correlation: ClipPreviews whose matching event arrived in a previous batch
-        cross_batch_clips = {sid: path for sid, path in clip_paths.items() if sid not in sessions_with_pending_event}
-
-        # Insert new event rows + apply cross-batch clip updates
-        with sqlite3.connect(DB_PATH, timeout=30) as c:
-            if rows:
+        # Batch deduplicate (same pattern as Rachio)
+        if rows:
+            with sqlite3.connect(DB_PATH, timeout=30) as c:
                 existing = set(
                     c.execute(
                         'SELECT ts, title FROM event_log WHERE system = ?', ('nest',)
@@ -2264,16 +2282,6 @@ def fetch_nest_events() -> int:
                             'VALUES (?,?,?,?,?,?,?)', row)
                         existing.add((ts_val, title))
                         inserted += 1
-
-            for sid, path in cross_batch_clips.items():
-                # Update any existing nest event rows matching this session_id that don't already have media
-                c.execute(
-                    "UPDATE event_log SET detail = detail || ? "
-                    "WHERE system = 'nest' AND detail LIKE ? AND detail NOT LIKE '%media:%'",
-                    (f'  media: {path}', f'%session: {sid}%')
-                )
-                if c.rowcount:
-                    print(f'Nest clip attached to {c.rowcount} existing event(s) for session {sid[:12]}')
 
         # Always ack ALL messages to prevent redelivery
         if ack_ids:
@@ -4000,6 +4008,92 @@ def api_debug_nest_status():
     })
 
 
+@app.route('/api/debug/nest/devices')
+def api_debug_nest_devices():
+    """Dump full device list with traits. Shows what events each device supports."""
+    token = _nest_ensure_token()
+    if not token:
+        return jsonify({'error': 'no valid token'}), 401
+    # Force refresh
+    _nest_refresh_devices(token)
+    summary = []
+    for d in _nest_devices_raw:
+        traits = d.get('traits', {})
+        summary.append({
+            'type': d.get('type', ''),
+            'name': d.get('name', ''),
+            'customName': traits.get('sdm.devices.traits.Info', {}).get('customName', ''),
+            'traits': list(traits.keys()),
+            'has_clip_preview': 'sdm.devices.traits.CameraClipPreview' in traits,
+            'has_event_image': 'sdm.devices.traits.CameraEventImage' in traits,
+            'has_motion': 'sdm.devices.traits.CameraMotion' in traits,
+            'has_person': 'sdm.devices.traits.CameraPerson' in traits,
+        })
+    return jsonify({
+        'devices': summary,
+        'event_counters': _nest_event_counters,
+    })
+
+
+@app.route('/api/debug/nest/peek')
+def api_debug_nest_peek():
+    """Pull messages from Pub/Sub WITHOUT acknowledging (so they redeliver).
+    Useful for seeing what Google is actually publishing."""
+    import base64 as _b64
+    subscription = get_setting('nest_pubsub_subscription', '')
+    if not subscription:
+        return jsonify({'error': 'no subscription configured'}), 400
+    token = _nest_ensure_token()
+    if not token:
+        return jsonify({'error': 'no valid token'}), 401
+    try:
+        resp = _requests.post(
+            f'https://pubsub.googleapis.com/v1/{subscription}:pull',
+            headers={'Authorization': f'Bearer {token}'},
+            json={'maxMessages': 20, 'returnImmediately': True},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        messages = resp.json().get('receivedMessages', [])
+        decoded = []
+        for m in messages:
+            try:
+                raw = _b64.b64decode(m['message']['data']).decode('utf-8')
+                decoded.append(json.loads(raw))
+            except Exception as e:
+                decoded.append({'decode_error': str(e)})
+        return jsonify({'count': len(messages), 'messages': decoded})
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/debug/nest/media-stats')
+def api_debug_nest_media_stats():
+    """Check nest_media folder contents and event_log for media links."""
+    stats = {'media_dir': NEST_MEDIA_DIR, 'exists': os.path.exists(NEST_MEDIA_DIR)}
+    if stats['exists']:
+        total_files = 0
+        total_bytes = 0
+        by_date = {}
+        for root, dirs, files in os.walk(NEST_MEDIA_DIR):
+            mp4s = [f for f in files if f.endswith('.mp4')]
+            if mp4s:
+                date = os.path.basename(root)
+                size = sum(os.path.getsize(os.path.join(root, f)) for f in mp4s)
+                by_date[date] = {'count': len(mp4s), 'bytes': size}
+                total_files += len(mp4s)
+                total_bytes += size
+        stats['total_files'] = total_files
+        stats['total_mb'] = round(total_bytes / 1024 / 1024, 2)
+        stats['by_date'] = by_date
+    with sqlite3.connect(DB_PATH) as c:
+        total_nest = c.execute("SELECT COUNT(*) FROM event_log WHERE system='nest'").fetchone()[0]
+        with_media = c.execute("SELECT COUNT(*) FROM event_log WHERE system='nest' AND detail LIKE '%media:%'").fetchone()[0]
+    stats['nest_events_total'] = total_nest
+    stats['nest_events_with_media'] = with_media
+    return jsonify(stats)
+
+
 @app.route('/api/nest/media/<path:filename>')
 def api_nest_media(filename):
     """Serve Nest MP4 clips. Path: YYYY-MM-DD/file.mp4"""
@@ -4241,8 +4335,8 @@ def _start():
     threading.Thread(target=rebuild_daily_costs, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     start_abode_listener()
-    print('Dashboard \u2192 http://localhost:5000')
-    app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False)
+    print('Dashboard \u2192 http://localhost:5001')
+    app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

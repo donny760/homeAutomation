@@ -371,7 +371,8 @@ body {
   max-width: 80vw;
   max-height: 80vh;
 }
-.nest-video-modal video {
+.nest-video-modal video,
+.nest-video-modal img {
   display: block;
   max-width: 80vw;
   max-height: 80vh;

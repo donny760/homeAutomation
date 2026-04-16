@@ -232,7 +232,11 @@ export default function EventLog({ isActive }: EventLogProps) {
                     </div>
                     <div className="event-title">
                       {e.title}
-                      {media && <span className="event-link-icon">{'\u25B6\uFE0F'}</span>}
+                      {media && (
+                        <span className="event-link-icon">
+                          {media.match(/\.(jpg|jpeg|png)$/i) ? '\u{1F4F7}' : '\u25B6\uFE0F'}
+                        </span>
+                      )}
                       {!media && url && <span className="event-link-icon">{'\u{1F517}'}</span>}
                     </div>
                   </div>
@@ -252,7 +256,11 @@ export default function EventLog({ isActive }: EventLogProps) {
         <div className="nest-video-modal" onClick={() => setVideoSrc(null)}>
           <div className="nest-video-modal-inner" onClick={(e) => e.stopPropagation()}>
             <button className="nest-video-close" onClick={() => setVideoSrc(null)}>&times;</button>
-            <video controls autoPlay src={videoSrc} />
+            {videoSrc.match(/\.(jpg|jpeg|png)$/i) ? (
+              <img src={videoSrc} alt="Nest event snapshot" />
+            ) : (
+              <video controls autoPlay src={videoSrc} />
+            )}
           </div>
         </div>
       )}
