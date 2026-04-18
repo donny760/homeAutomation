@@ -17,7 +17,6 @@ interface ScheduleEntry {
 
 export default function AutomationsPanel() {
   const [items, setItems] = useState<ScheduleEntry[]>([]);
-  const [updated, setUpdated] = useState('');
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -25,7 +24,6 @@ export default function AutomationsPanel() {
       try {
         const data = await fetch('/api/schedule').then((r) => r.json());
         setItems((data.schedule || []).slice(0, 5));
-        setUpdated(new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }));
         setLoading(false);
       } catch (e) {
         console.warn('Automations:', e);
@@ -41,7 +39,6 @@ export default function AutomationsPanel() {
       <div className="auto-card card">
         <div className="auto-header">
           <div className="auto-title">Upcoming Automations</div>
-          <div className="auto-updated">{updated}</div>
         </div>
         <div className="auto-list">
           {loading ? (

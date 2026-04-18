@@ -17,7 +17,7 @@ import pypowerwall
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
-from fetch_rates import is_sdge_holiday, holiday_name, holiday_super_off_peak
+from fetch_rates import is_sdge_holiday, holiday_name
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PW_EMAIL      = 'don@nsdsolutions.com'
@@ -279,15 +279,17 @@ def evaluate_conditions(conditions: list, live: dict) -> bool:
 
 # ── State reconstruction ──────────────────────────────────────────────────────
 def _rule_fires_at(rule: dict, d: date) -> datetime | None:
-    if d.weekday() not in rule['days']:
-        return None
+    weekday = d.weekday()
+    if weekday not in rule['days']:
+        # On holidays, fire if rule includes any weekend day (Sat=5 or Sun=6)
+        if not (is_sdge_holiday(d) and rule['days'] & {5, 6}):
+            return None
     if d.month not in rule['months']:
         return None
     return datetime(d.year, d.month, d.day, rule['hour'], rule['minute'])
 
 
-def current_target_state(dt: datetime, rules: list, live: dict,
-                         tou_periods: dict = None) -> dict:
+def current_target_state(dt: datetime, rules: list, live: dict) -> dict:
     state = {
         'mode':          'autonomous',
         'reserve':       20,
@@ -309,12 +311,8 @@ def current_target_state(dt: datetime, rules: list, live: dict,
             if rule[key] is not None:
                 state[key] = rule[key]
 
-    # Holiday override: hold battery during super off-peak to preserve
-    # charge for on-peak export.  Off-peak and on-peak follow normal rules.
-    if is_sdge_holiday(dt.date()) and holiday_super_off_peak(dt.hour, tou_periods):
-        state['reserve']    = 100
-        state['grid_export'] = 'pv_only'
-        state['_holiday']    = holiday_name(dt.date())
+    if is_sdge_holiday(dt.date()):
+        state['_holiday'] = holiday_name(dt.date())
 
     return state
 
@@ -452,27 +450,15 @@ def main_loop(stop_fn=None):
                 live  = get_live_state(pw)
                 dt    = datetime.now()
 
-                # Load configurable TOU periods from DB
-                tou_row = conn.execute(
-                    "SELECT value FROM settings WHERE key = 'tou_periods'"
-                ).fetchone()
-                tou_periods = None
-                if tou_row:
-                    try:
-                        tou_periods = json.loads(tou_row[0])
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-
-                target = current_target_state(dt, rules, live, tou_periods)
+                target = current_target_state(dt, rules, live)
                 nxt    = next_rule_fire(dt, rules)
 
-                # Log holiday override once per day
+                # Log holiday once per day
                 hol = target.pop('_holiday', None)
                 if hol and last_holiday_logged != dt.date():
-                    log.info('Holiday override active: %s', hol)
-                    log_event(conn, 'powerwall', 'holiday_override',
-                              f'Holiday: {hol} — Reserve → 100%, '
-                              f'Export → PV-only (super off-peak hold)',
+                    log.info('Holiday active: %s — weekend rules apply', hol)
+                    log_event(conn, 'powerwall', 'holiday_active',
+                              f'Holiday: {hol} — weekend rules apply',
                               result='ok', battery_pct=live.get('battery_pct'))
                     last_holiday_logged = dt.date()
 

@@ -15,7 +15,6 @@ import requests as _requests
 from datetime import datetime, date, timedelta, timezone
 
 import asyncio
-import socket
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
@@ -27,7 +26,7 @@ from fetch_rates import (
     load_rates, rates_are_stale, fetch_ev_tou2_rates,
     tou_period, load_or_generate_holidays, SDGE_HOLIDAYS,
     HOLIDAYS_PATH, RATES_PATH,
-    holiday_name, holiday_super_off_peak, is_sdge_holiday,
+    holiday_name, is_sdge_holiday,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -65,6 +64,19 @@ _security_ts: float = 0.0
 # Rachio cache
 _rachio_schedule: list = []
 _rachio_ts: float      = 0.0
+
+# Switches (Kasa/Alexa/Nest-thermostat) caches
+_kasa_devices: dict     = {}   # mac -> {alias, ip, on, last_seen, host_obj}
+_kasa_ts: float         = 0.0
+_alexa_login            = None # alexapy AlexaLogin instance
+_alexa_client           = None # alexapy AlexaAPI instance
+_alexa_devices: dict    = {}   # entity_id -> {name, on, kind, appliance_id, serial}
+_alexa_routines: dict   = {}   # automation_id -> {name}
+_alexa_ts: float        = 0.0
+_nest_thermostats: dict = {}   # device_name -> {...thermostat traits...}
+_tuya_devices: dict     = {}   # dev_id -> {name, ip, local_key, version, on, last_seen}
+_tuya_ts: float         = 0.0
+_switches_lock          = threading.Lock()
 
 
 
@@ -147,6 +159,20 @@ def init_db() -> None:
             c.execute('ALTER TABLE rate_history ADD COLUMN base_services_charge_per_day REAL DEFAULT 0')
         except Exception:
             pass
+        # Switches drawer metadata — Kasa/Alexa/Pool/Nest devices surfaced as tiles
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS switches_meta (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider    TEXT NOT NULL,
+                external_id TEXT NOT NULL,
+                kind        TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                room        TEXT DEFAULT '',
+                sort_order  INTEGER DEFAULT 0,
+                hidden      INTEGER DEFAULT 0,
+                UNIQUE(provider, external_id)
+            )
+        ''')
         # Settings table
         c.execute('''
             CREATE TABLE IF NOT EXISTS settings (
@@ -241,6 +267,22 @@ _SETTINGS_DEFAULTS = {
     'nest_refresh_token':          '',
     'nest_access_token':           '',
     'nest_token_expiry':           '0',
+    'nest_thermostat_enabled':     '0',
+    # Kasa (TP-Link smart plugs, LAN discovery)
+    'kasa_enabled':                '0',
+    'kasa_poll_interval':          '10',
+    # Alexa (plugs + routines via alexapy)
+    'alexa_enabled':               '0',
+    'alexa_poll_interval':         '60',
+    'alexa_email':                 os.environ.get('ALEXA_EMAIL', ''),
+    'alexa_password':              os.environ.get('ALEXA_PASSWORD', ''),
+    'alexa_url':                   os.environ.get('ALEXA_URL', 'amazon.com'),
+    'alexa_otp_pending':           '0',
+    # Pool control (write path; read path is pool_enabled)
+    'pool_control_enabled':        '0',
+    # Tuya (tinytuya, LAN control of Smart Life / Tuya-platform devices)
+    'tuya_enabled':                '0',
+    'tuya_poll_interval':          '15',
 }
 
 def _seed_settings(conn):
@@ -645,69 +687,6 @@ def backfill_history() -> None:
         print(f'Backfill error: {exc}')
 
 
-# ── Public port check ────────────────────────────────────────────────────────
-_port_open: bool = False    # assume closed on startup (no log needed)
-_port_open_since: float = 0
-
-def _get_public_ip() -> str | None:
-    try:
-        req = urllib.request.Request('https://ifconfig.me', headers={'User-Agent': 'curl/7'})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            return r.read().decode().strip()
-    except Exception:
-        return None
-
-def check_public_port(port: int = 5000) -> None:
-    """Check if our public IP has the given port open; only log when OPEN."""
-    global _port_open, _port_open_since
-    pub_ip = _get_public_ip()
-    if not pub_ip:
-        return
-    try:
-        s = socket.create_connection((pub_ip, port), timeout=5)
-        s.close()
-        is_open = True
-    except (OSError, socket.timeout):
-        is_open = False
-
-    if is_open == _port_open:
-        if is_open and _port_open_since:
-            # Still open — update event with duration
-            mins = int((time.time() - _port_open_since) / 60)
-            if mins >= 5:
-                dur = f'{mins} min' if mins < 60 else f'{mins // 60}h {mins % 60}m'
-                title = f'Port {port} is OPEN publicly ({dur})'
-                detail = f'Public IP: {pub_ip}'
-                print(f'Port check: {title}')
-                with sqlite3.connect(DB_PATH) as c:
-                    # Update the existing open event instead of creating new ones
-                    c.execute(
-                        'UPDATE event_log SET title=?, ts=? '
-                        'WHERE system="system" AND event_type="port_check" AND result="warning" '
-                        'ORDER BY ts DESC LIMIT 1',
-                        (title, int(time.time()))
-                    )
-        return
-
-    _port_open = is_open
-
-    if is_open:
-        _port_open_since = time.time()
-        title = f'Port {port} is OPEN publicly'
-        detail = f'Public IP: {pub_ip}'
-        print(f'Port check: {title} ({detail})')
-        with sqlite3.connect(DB_PATH) as c:
-            c.execute(
-                'INSERT INTO event_log '
-                '(ts, system, event_type, title, detail, result, source) '
-                'VALUES (?,?,?,?,?,?,?)',
-                (int(time.time()), 'system', 'port_check', title, detail, 'warning', 'live')
-            )
-    else:
-        # Port closed — silently update state, no log entry
-        _port_open_since = 0
-
-
 # ── Poller thread ─────────────────────────────────────────────────────────────
 def poller() -> None:
     pw = None
@@ -719,8 +698,10 @@ def poller() -> None:
     last_rachio_event_poll = 0
     last_rain_skip_check = 0
     last_nest_event_poll = 0
-    last_port_check = 0
     last_pool_poll = 0
+    last_kasa_poll = 0
+    last_alexa_poll = 0
+    last_tuya_poll = 0
 
     while True:
         poll_interval = get_setting_int('powerwall_poll_interval', POLL_INTERVAL)
@@ -861,7 +842,7 @@ def poller() -> None:
                     _log_system_error('rachio', 'Rain skip check error', str(exc))
                 last_rain_skip_check = now
 
-            # Nest camera/doorbell events (Pub/Sub pull)
+            # Nest camera/doorbell events (Pub/Sub pull) + thermostat refresh
             nest_event_interval = get_setting_int('nest_poll_interval', 60)
             if now - last_nest_event_poll >= nest_event_interval:
                 if get_setting_bool('nest_enabled', False):
@@ -870,15 +851,14 @@ def poller() -> None:
                     except Exception as exc:
                         print(f'Nest event poll error: {exc}')
                         _log_system_error('nest', 'Event poll error', str(exc))
+                    if get_setting_bool('nest_thermostat_enabled', False):
+                        try:
+                            token = _nest_ensure_token()
+                            if token:
+                                _nest_refresh_devices(token)
+                        except Exception as exc:
+                            print(f'Nest thermostat poll error: {exc}')
                 last_nest_event_poll = now
-
-            # Public port exposure check (every 5 min)
-            if now - last_port_check >= 300:
-                try:
-                    check_public_port()
-                except Exception as exc:
-                    print(f'Port check error: {exc}')
-                last_port_check = now
 
             # Pool equipment state polling
             pool_event_interval = get_setting_int('pool_poll_interval', POOL_POLL_INTERVAL)
@@ -890,6 +870,46 @@ def poller() -> None:
                         print(f'Pool poll error: {exc}')
                         _log_system_error('pool', 'Pool poll error', str(exc))
                 last_pool_poll = now
+
+            # Kasa smart plug state polling (LAN, fast)
+            kasa_poll_interval = get_setting_int('kasa_poll_interval', 10)
+            if now - last_kasa_poll >= kasa_poll_interval:
+                if get_setting_bool('kasa_enabled', False):
+                    try:
+                        # First time after enable: discover; otherwise just poll state
+                        if not _kasa_devices:
+                            _kasa_refresh_devices()
+                        else:
+                            _kasa_poll_state()
+                    except Exception as exc:
+                        print(f'Kasa poll error: {exc}')
+                        _log_system_error('kasa', 'State poll error', str(exc))
+                last_kasa_poll = now
+
+            # Alexa state polling (cloud, slow) — Phase 3 stub
+            alexa_poll_interval = get_setting_int('alexa_poll_interval', 60)
+            if now - last_alexa_poll >= alexa_poll_interval:
+                if get_setting_bool('alexa_enabled', False):
+                    try:
+                        _alexa_poll_state()
+                    except Exception as exc:
+                        print(f'Alexa poll error: {exc}')
+                        _log_system_error('alexa', 'State poll error', str(exc))
+                last_alexa_poll = now
+
+            # Tuya state polling (LAN, sync socket calls)
+            tuya_poll_interval = get_setting_int('tuya_poll_interval', 15)
+            if now - last_tuya_poll >= tuya_poll_interval:
+                if get_setting_bool('tuya_enabled', False):
+                    try:
+                        if not _tuya_devices:
+                            _tuya_refresh_devices()
+                        else:
+                            _tuya_poll_state()
+                    except Exception as exc:
+                        print(f'Tuya poll error: {exc}')
+                        _log_system_error('tuya', 'State poll error', str(exc))
+                last_tuya_poll = now
 
         except Exception as exc:
             print(f'Poller error: {exc}')
@@ -1241,6 +1261,104 @@ def fetch_pool() -> dict:
         if not _pool:
             _pool = {'temp_f': None, 'pump_on': None, 'spa_temp_f': None}
     return _pool
+
+
+# ── Pool circuit control (screenlogicpy async_set_circuit) ────────────────────
+# External IDs are stored in switches_meta so user-edited name/room survive
+# reboots + rediscovery. For most circuits the external_id is the numeric
+# circuit ID as a string. Feature 1's ScreenLogic circuit ID is assigned
+# dynamically — we resolve it by name at toggle time.
+POOL_CIRCUITS = [
+    # (external_id, circuit_id, default_name,  pool_cache_field)
+    ('500',   500,  'Spa',         'spa_circuit_on'),
+    ('501',   501,  'Pool Light',  'pool_light_on'),
+    ('502',   502,  'Water Light', 'water_light_on'),
+    ('503',   503,  'Spa Light',   'spa_light_on'),
+    ('504',   504,  'Waterfall',   'waterfall_on'),
+    ('505',   505,  'Pool',        'pool_circuit_on'),
+    ('506',   506,  'Edge Pump',   'edge_pump_on'),
+    ('507',   507,  'Spillway',    'spillway_on'),
+    ('508',   508,  'Cleaner',     'cleaner_on'),
+    ('feat1', None, 'Feature 1',   'feature1_on'),
+]
+POOL_EXT_TO_FIELD = {ext: field for ext, _, _, field in POOL_CIRCUITS}
+
+
+def _pool_discover_circuits() -> int:
+    """Upsert the known pool circuits into switches_meta. Safe to call on
+    every startup — existing user edits (name, room, hidden) are preserved."""
+    with sqlite3.connect(DB_PATH) as c:
+        for ext_id, _, default_name, _ in POOL_CIRCUITS:
+            row = c.execute(
+                'SELECT id FROM switches_meta WHERE provider=? AND external_id=?',
+                ('pool', ext_id)
+            ).fetchone()
+            if row is None:
+                c.execute(
+                    'INSERT INTO switches_meta (provider, external_id, kind, name) '
+                    'VALUES (?,?,?,?)',
+                    ('pool', ext_id, 'circuit', default_name)
+                )
+    return len(POOL_CIRCUITS)
+
+
+async def _pool_resolve_feature1_id(gateway) -> int:
+    """Scan gateway data for the 'Feature 1' circuit and return its circuit ID."""
+    data = gateway.get_data()
+    circuit = data.get('circuit') or data.get(b'circuit') or {}
+    for cid, cdata in circuit.items():
+        if not isinstance(cdata, dict):
+            continue
+        name = cdata.get('name') or cdata.get(b'name')
+        if isinstance(name, dict):
+            name = name.get('value')
+        if isinstance(name, bytes):
+            name = name.decode('utf-8', errors='ignore')
+        if isinstance(name, str) and name.strip() == 'Feature 1':
+            try:
+                return int(cid)
+            except (TypeError, ValueError):
+                continue
+    raise ValueError('Feature 1 circuit not found on ScreenLogic gateway')
+
+
+async def _pool_set_circuit_async(ext_id: str, on: bool) -> bool:
+    """Set a pool circuit on/off via screenlogicpy. Returns the new state."""
+    from screenlogicpy import ScreenLogicGateway
+    from screenlogicpy.discovery import async_discover
+    gateways = await async_discover()
+    if not gateways:
+        raise RuntimeError('No ScreenLogic gateway found via UDP discovery')
+    gw      = gateways[0]
+    gateway = ScreenLogicGateway()
+    await gateway.async_connect(ip=gw['ip'], port=gw.get('port', 80))
+    try:
+        if ext_id == 'feat1':
+            await gateway.async_update()
+            circuit_id = await _pool_resolve_feature1_id(gateway)
+        else:
+            try:
+                circuit_id = int(ext_id)
+            except ValueError:
+                raise ValueError(f'Invalid pool circuit ext_id: {ext_id}')
+        await gateway.async_set_circuit(circuit_id, 1 if on else 0)
+    finally:
+        await gateway.async_disconnect()
+    return bool(on)
+
+
+def pool_set_circuit(ext_id: str, on: bool) -> bool:
+    """Sync wrapper for pool circuit toggle. Returns the new state."""
+    result = asyncio.run(_pool_set_circuit_async(ext_id, on))
+    # Nudge the cache so /api/switches reflects the new state immediately and
+    # the next _log_pool_changes doesn't double-log (it compares against
+    # _pool_prev, which we advance here).
+    field = POOL_EXT_TO_FIELD.get(ext_id)
+    if field:
+        _pool[field] = on
+        _pool_prev[field] = on
+        _pool_pending.pop(field, None)
+    return result
 
 
 # ── Security (Abode device state) ────────────────────────────────────────────
@@ -2020,6 +2138,8 @@ _nest_devices_raw: list = []    # last raw device list from SDM API (for debug)
 _nest_devices_ts: float = 0.0
 _NEST_DEVICE_CACHE_TTL = 3600   # 1 hour
 _nest_event_counters: dict = {} # running tally of event types seen over time
+_nest_snapshot_stats: dict = {'attempted': 0, 'success': 0, 'expired': 0, 'error': 0, 'skipped_no_trait': 0, 'skipped_no_eventid': 0, 'last_error': None}
+_nest_poll_stats: dict = {'calls': 0, 'last_call_ts': None, 'last_pull_count': None, 'last_error': None, 'pull_count_total': 0}
 NEST_MEDIA_DIR = os.path.join(BASE_DIR, 'nest_media')
 
 NEST_EVENT_TYPE_MAP = {
@@ -2056,6 +2176,7 @@ def _nest_download_snapshot(device_path, inner_event_id, device_name, ts, token)
             return rel_path
 
         # Step 1: GenerateImage command returns {url, token}
+        _nest_snapshot_stats['attempted'] += 1
         cmd_resp = _requests.post(
             f'https://smartdevicemanagement.googleapis.com/v1/{device_path}:executeCommand',
             headers={'Authorization': f'Bearer {token}'},
@@ -2066,7 +2187,9 @@ def _nest_download_snapshot(device_path, inner_event_id, device_name, ts, token)
             timeout=15,
         )
         if cmd_resp.status_code != 200:
-            # Common: 400 "Event id not found" if URL expired, or device doesn't support event images
+            _nest_snapshot_stats['expired'] += 1
+            _nest_snapshot_stats['last_error'] = f'GenerateImage {cmd_resp.status_code}: {cmd_resp.text[:200]}'
+            print(f'Nest snapshot: GenerateImage returned {cmd_resp.status_code} for event {inner_event_id[:12]}')
             return None
         result = cmd_resp.json().get('results', {})
         img_url = result.get('url')
@@ -2089,8 +2212,12 @@ def _nest_download_snapshot(device_path, inner_event_id, device_name, ts, token)
             for chunk in img_resp.iter_content(chunk_size=65536):
                 if chunk:
                     f.write(chunk)
+        _nest_snapshot_stats['success'] += 1
+        print(f'Nest snapshot saved: {rel_path}')
         return rel_path
     except Exception as exc:
+        _nest_snapshot_stats['error'] += 1
+        _nest_snapshot_stats['last_error'] = str(exc)
         print(f'Nest snapshot error: {exc}')
         return None
 
@@ -2137,9 +2264,34 @@ def _nest_ensure_token() -> str | None:
         return None
 
 
+def _c_to_f(c):
+    """Celsius to Fahrenheit, rounded to 0.1."""
+    if c is None:
+        return None
+    try:
+        return round(float(c) * 9.0 / 5.0 + 32.0, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _f_to_c(f):
+    """Fahrenheit to Celsius."""
+    if f is None:
+        return None
+    try:
+        return round((float(f) - 32.0) * 5.0 / 9.0, 2)
+    except (TypeError, ValueError):
+        return None
+
+
 def _nest_refresh_devices(token):
-    """Refresh the device cache. Stores {device_path: {'name': ..., 'has_event_image': bool}}."""
-    global _nest_devices, _nest_devices_ts, _nest_devices_raw
+    """Refresh the device cache. Parses cameras/doorbells + thermostats.
+
+    Stores camera/doorbell metadata in `_nest_devices` (unchanged for the
+    existing camera event flow) and thermostat state in `_nest_thermostats`,
+    upserting a switches_meta row for each thermostat.
+    """
+    global _nest_devices, _nest_devices_ts, _nest_devices_raw, _nest_thermostats
     project_id = get_setting('nest_project_id', '')
     try:
         resp = _requests.get(
@@ -2151,19 +2303,169 @@ def _nest_refresh_devices(token):
         devices = resp.json().get('devices', [])
         _nest_devices = {}
         _nest_devices_raw = devices
+        thermostats = {}
         for d in devices:
             name = d.get('name', '')
             traits = d.get('traits', {})
             custom = traits.get('sdm.devices.traits.Info', {}).get('customName', '')
-            dev_type = d.get('type', '').rsplit('.', 1)[-1]
-            display = custom or dev_type or 'Unknown'
+            dev_type_full = d.get('type', '')
+            dev_type = dev_type_full.rsplit('.', 1)[-1]
+            # Fall back to parentRelations.displayName — that's the room name
+            # from Google Home (e.g. "Entryway") when customName is empty.
+            room_name = ''
+            for pr in d.get('parentRelations', []) or []:
+                dn = pr.get('displayName')
+                if isinstance(dn, str) and dn.strip():
+                    room_name = dn.strip()
+                    break
+            display = custom or room_name or dev_type or 'Unknown'
             _nest_devices[name] = {
                 'name': display,
                 'has_event_image': 'sdm.devices.traits.CameraEventImage' in traits,
             }
+            if dev_type_full == 'sdm.devices.types.THERMOSTAT':
+                tmode    = traits.get('sdm.devices.traits.ThermostatMode', {}) or {}
+                setpt    = traits.get('sdm.devices.traits.ThermostatTemperatureSetpoint', {}) or {}
+                hvac     = traits.get('sdm.devices.traits.ThermostatHvac', {}) or {}
+                ambient  = traits.get('sdm.devices.traits.Temperature', {}) or {}
+                humidity = traits.get('sdm.devices.traits.Humidity', {}) or {}
+                eco      = traits.get('sdm.devices.traits.ThermostatEco', {}) or {}
+                thermostats[name] = {
+                    'display_name':   display,
+                    'mode':           tmode.get('mode'),
+                    'available_modes': tmode.get('availableModes', []),
+                    'setpoint_heat_c': setpt.get('heatCelsius'),
+                    'setpoint_cool_c': setpt.get('coolCelsius'),
+                    'ambient_c':      ambient.get('ambientTemperatureCelsius'),
+                    'humidity':       humidity.get('ambientHumidityPercent'),
+                    'hvac_status':    hvac.get('status'),
+                    'eco_mode':       eco.get('mode'),
+                }
+        _nest_thermostats = thermostats
         _nest_devices_ts = time.time()
+        # Upsert thermostat metadata rows. If an existing row still has the
+        # un-edited default name ('THERMOSTAT'), update it to the better name
+        # now available (customName or room displayName). Preserve any name
+        # the user has edited.
+        if thermostats:
+            with sqlite3.connect(DB_PATH) as c:
+                for dev_path, info in thermostats.items():
+                    new_name = info['display_name']
+                    row = c.execute(
+                        'SELECT id, name FROM switches_meta WHERE provider=? AND external_id=?',
+                        ('nest', dev_path)
+                    ).fetchone()
+                    if row is None:
+                        c.execute(
+                            'INSERT INTO switches_meta (provider, external_id, kind, name) '
+                            'VALUES (?,?,?,?)',
+                            ('nest', dev_path, 'thermostat', new_name)
+                        )
+                    elif row[1] in ('THERMOSTAT', 'Unknown') and new_name != row[1]:
+                        c.execute(
+                            'UPDATE switches_meta SET name=? WHERE id=?',
+                            (new_name, row[0])
+                        )
     except Exception as exc:
         print(f'Nest device list error: {exc}')
+
+
+def _nest_thermostat_command(device_path: str, command: str, params: dict) -> dict:
+    """Send a SDM executeCommand to a thermostat. Returns API response body or raises."""
+    token = _nest_ensure_token()
+    if not token:
+        raise RuntimeError('Nest not authenticated')
+    url = (
+        'https://smartdevicemanagement.googleapis.com/v1/'
+        f'{device_path}:executeCommand'
+    )
+    resp = _requests.post(
+        url,
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type':  'application/json',
+        },
+        json={'command': command, 'params': params},
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        detail = ''
+        try:
+            detail = resp.json().get('error', {}).get('message', resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f'SDM command {command} failed ({resp.status_code}): {detail}')
+    return resp.json() if resp.content else {}
+
+
+def nest_set_thermostat(device_path: str, *, mode: str = None,
+                        setpoint_f: float = None,
+                        setpoint_heat_f: float = None,
+                        setpoint_cool_f: float = None) -> dict:
+    """Apply one or more thermostat changes. Valid mode values: OFF/HEAT/COOL/HEATCOOL.
+
+    setpoint_f is used when current mode is HEAT or COOL (sets that single
+    setpoint). For HEATCOOL/Auto, pass both setpoint_heat_f and setpoint_cool_f.
+    Refreshes the cache afterward so /api/switches reflects the change.
+    """
+    info = _nest_thermostats.get(device_path)
+    if info is None:
+        raise ValueError(f'Unknown Nest thermostat: {device_path}')
+    # Mode change
+    if mode:
+        mode = mode.upper()
+        valid = {'OFF', 'HEAT', 'COOL', 'HEATCOOL'}
+        if mode not in valid:
+            raise ValueError(f'Invalid mode: {mode}')
+        _nest_thermostat_command(
+            device_path,
+            'sdm.devices.commands.ThermostatMode.SetMode',
+            {'mode': mode},
+        )
+        info['mode'] = mode  # optimistic
+    # Setpoint(s) — decide which command based on current (or just-set) mode
+    current_mode = (mode or info.get('mode') or '').upper()
+    if setpoint_heat_f is not None and setpoint_cool_f is not None:
+        _nest_thermostat_command(
+            device_path,
+            'sdm.devices.commands.ThermostatTemperatureSetpoint.SetRange',
+            {
+                'heatCelsius': _f_to_c(setpoint_heat_f),
+                'coolCelsius': _f_to_c(setpoint_cool_f),
+            },
+        )
+        info['setpoint_heat_c'] = _f_to_c(setpoint_heat_f)
+        info['setpoint_cool_c'] = _f_to_c(setpoint_cool_f)
+    elif setpoint_f is not None:
+        if current_mode == 'HEAT':
+            _nest_thermostat_command(
+                device_path,
+                'sdm.devices.commands.ThermostatTemperatureSetpoint.SetHeat',
+                {'heatCelsius': _f_to_c(setpoint_f)},
+            )
+            info['setpoint_heat_c'] = _f_to_c(setpoint_f)
+        elif current_mode == 'COOL':
+            _nest_thermostat_command(
+                device_path,
+                'sdm.devices.commands.ThermostatTemperatureSetpoint.SetCool',
+                {'coolCelsius': _f_to_c(setpoint_f)},
+            )
+            info['setpoint_cool_c'] = _f_to_c(setpoint_f)
+        else:
+            raise ValueError(
+                f'setpoint_f requires mode=HEAT or COOL (current: {current_mode}). '
+                'For HEATCOOL/Auto, pass setpoint_heat_f AND setpoint_cool_f.'
+            )
+    # Pull fresh state so the next /api/switches query has authoritative
+    # mode + setpoints. Mode transitions change which setpoints SDM returns
+    # (OFF → HEAT reveals heatCelsius, etc.).
+    try:
+        token = _nest_ensure_token()
+        if token:
+            _nest_refresh_devices(token)
+    except Exception as exc:
+        print(f'Nest post-command refresh failed: {exc}')
+    return dict(_nest_thermostats.get(device_path, info))
 
 
 def _nest_get_device_name(device_path: str, token: str) -> str:
@@ -2186,15 +2488,21 @@ def fetch_nest_events() -> int:
     """Pull Nest camera/doorbell events from Pub/Sub and log new ones. Returns insert count."""
     import base64 as _b64
 
+    _nest_poll_stats['calls'] += 1
+    _nest_poll_stats['last_call_ts'] = int(time.time())
+
     if not get_setting_bool('nest_enabled', False):
+        _nest_poll_stats['last_error'] = 'disabled'
         return 0
 
     subscription = get_setting('nest_pubsub_subscription', '')
     if not subscription:
+        _nest_poll_stats['last_error'] = 'no subscription'
         return 0
 
     token = _nest_ensure_token()
     if not token:
+        _nest_poll_stats['last_error'] = 'no token'
         return 0
 
     inserted = 0
@@ -2207,6 +2515,9 @@ def fetch_nest_events() -> int:
         )
         resp.raise_for_status()
         messages = resp.json().get('receivedMessages', [])
+        _nest_poll_stats['last_pull_count'] = len(messages)
+        _nest_poll_stats['pull_count_total'] += len(messages)
+        _nest_poll_stats['last_error'] = None
 
         if not messages:
             return 0
@@ -2255,7 +2566,11 @@ def fetch_nest_events() -> int:
                     detail = f'device: {device_name}  eventId: {outer_event_id}  session: {session_id}'
 
                     # Attempt snapshot capture for devices that support CameraEventImage
-                    if supports_snapshot and inner_event_id:
+                    if not supports_snapshot:
+                        _nest_snapshot_stats['skipped_no_trait'] += 1
+                    elif not inner_event_id:
+                        _nest_snapshot_stats['skipped_no_eventid'] += 1
+                    else:
                         path = _nest_download_snapshot(device_path, inner_event_id, device_name, ts, token)
                         if path:
                             detail += f'  media: {path}'
@@ -2296,12 +2611,1031 @@ def fetch_nest_events() -> int:
             print(f'Nest events: logged {inserted} new events')
 
     except _requests.exceptions.Timeout:
+        _nest_poll_stats['last_error'] = 'timeout'
         print('Nest poll: timeout (no events)')
     except Exception as exc:
+        _nest_poll_stats['last_error'] = str(exc)[:200]
         print(f'Nest event poll error: {exc}')
         _log_system_error('nest', 'Event poll error', str(exc))
 
     return inserted
+
+
+# ── Kasa (TP-Link smart plugs + dimmers + bulbs, LAN discovery) ──────────────
+def _kasa_read_brightness(dev) -> int:
+    """Return current brightness 0-100 or None if device is not dimmable."""
+    # Path 1: features dict (python-kasa 0.7+)
+    try:
+        feat = getattr(dev, 'features', {}) or {}
+        if 'brightness' in feat:
+            val = getattr(feat['brightness'], 'value', None)
+            if val is not None:
+                return int(val)
+    except Exception:
+        pass
+    # Path 2: Light module
+    try:
+        from kasa import Module  # type: ignore
+        mods = getattr(dev, 'modules', {}) or {}
+        light = mods.get(Module.Light) if hasattr(Module, 'Light') else None
+        if light is not None and hasattr(light, 'brightness'):
+            return int(light.brightness)
+    except Exception:
+        pass
+    # Path 3: direct attribute (older API)
+    try:
+        b = getattr(dev, 'brightness', None)
+        if b is not None and getattr(dev, 'is_dimmable', False):
+            return int(b)
+    except Exception:
+        pass
+    return None
+
+
+async def _kasa_set_brightness_on_device(dev, brightness: int) -> None:
+    """Set brightness on an already-connected device.  Raises if not dimmable."""
+    b = max(0, min(100, int(brightness)))
+    # Path 1: features
+    feat = getattr(dev, 'features', {}) or {}
+    if 'brightness' in feat:
+        await feat['brightness'].set_value(b)
+        return
+    # Path 2: Light module
+    try:
+        from kasa import Module  # type: ignore
+        mods = getattr(dev, 'modules', {}) or {}
+        light = mods.get(Module.Light) if hasattr(Module, 'Light') else None
+        if light is not None and hasattr(light, 'set_brightness'):
+            await light.set_brightness(b)
+            return
+    except Exception:
+        pass
+    # Path 3: direct method
+    if hasattr(dev, 'set_brightness'):
+        await dev.set_brightness(b)
+        return
+    raise ValueError('Device is not dimmable')
+
+
+async def _kasa_discover_async() -> dict:
+    """Run LAN discovery, return {mac: {alias, ip, on, model, dimmable, brightness}}."""
+    from kasa import Discover
+    try:
+        discovered = await Discover.discover()
+    except Exception as exc:
+        print(f'Kasa discovery error: {exc}')
+        raise
+    out = {}
+    for ip, dev in discovered.items():
+        try:
+            await dev.update()
+        except Exception as exc:
+            print(f'Kasa update failed for {ip}: {exc}')
+            continue
+        mac = (getattr(dev, 'mac', None) or '').upper()
+        if not mac:
+            continue
+        brightness = _kasa_read_brightness(dev)
+        out[mac] = {
+            'alias':      getattr(dev, 'alias', None) or f'Kasa {mac[-5:]}',
+            'ip':         ip,
+            'on':         bool(getattr(dev, 'is_on', False)),
+            'model':      getattr(dev, 'model', ''),
+            'dimmable':   brightness is not None,
+            'brightness': brightness,
+        }
+    return out
+
+
+def _kasa_refresh_devices() -> int:
+    """Discover Kasa devices on the LAN, cache state, upsert metadata to DB.
+
+    Upserts on (provider, external_id). Preserves user edits to name/room/
+    sort_order/hidden.  Updates kind if dimmable flag changes between runs
+    (e.g. new firmware reveals a feature, or a bulb replaces a plug).
+    """
+    global _kasa_devices, _kasa_ts
+    try:
+        devices = asyncio.run(_kasa_discover_async())
+    except Exception as exc:
+        print(f'Kasa refresh error: {exc}')
+        _log_system_error('kasa', 'Discovery failed', str(exc))
+        return 0
+    now = time.time()
+    with _switches_lock:
+        _kasa_devices = {mac: {**info, 'last_seen': now} for mac, info in devices.items()}
+        _kasa_ts = now
+    with sqlite3.connect(DB_PATH) as c:
+        for mac, info in devices.items():
+            kind = 'dimmer' if info.get('dimmable') else 'plug'
+            existing = c.execute(
+                'SELECT id, kind FROM switches_meta WHERE provider=? AND external_id=?',
+                ('kasa', mac)
+            ).fetchone()
+            if existing is None:
+                c.execute(
+                    'INSERT INTO switches_meta (provider, external_id, kind, name) '
+                    'VALUES (?,?,?,?)',
+                    ('kasa', mac, kind, info['alias'])
+                )
+            elif existing[1] != kind:
+                c.execute('UPDATE switches_meta SET kind=? WHERE id=?', (kind, existing[0]))
+    return len(devices)
+
+
+async def _kasa_update_state_async() -> None:
+    """Re-query is_on + brightness for each cached Kasa device."""
+    from kasa import Discover
+    for mac, info in list(_kasa_devices.items()):
+        ip = info.get('ip')
+        if not ip:
+            continue
+        try:
+            dev = await Discover.discover_single(ip)
+            await dev.update()
+            info['on']        = bool(getattr(dev, 'is_on', False))
+            info['last_seen'] = time.time()
+            if info.get('dimmable'):
+                b = _kasa_read_brightness(dev)
+                if b is not None:
+                    info['brightness'] = b
+        except Exception as exc:
+            info['on'] = None
+            print(f'Kasa state poll failed for {mac} ({ip}): {exc}')
+
+
+def _kasa_poll_state() -> None:
+    """Refresh cached state for all known Kasa devices.  Called from poller."""
+    if not _kasa_devices:
+        return
+    try:
+        asyncio.run(_kasa_update_state_async())
+    except Exception as exc:
+        print(f'Kasa poll error: {exc}')
+
+
+async def _kasa_set_async(mac: str, on: bool) -> bool:
+    """Set Kasa device on/off. Returns new is_on state. Raises on failure."""
+    from kasa import Discover
+    info = _kasa_devices.get(mac)
+    if not info:
+        raise ValueError(f'Unknown Kasa MAC: {mac}')
+    ip = info.get('ip')
+    if not ip:
+        raise ValueError(f'No IP for Kasa {mac}')
+    dev = await Discover.discover_single(ip)
+    await dev.update()
+    if on:
+        await dev.turn_on()
+    else:
+        await dev.turn_off()
+    await dev.update()
+    new_state = bool(getattr(dev, 'is_on', False))
+    info['on'] = new_state
+    info['last_seen'] = time.time()
+    if info.get('dimmable'):
+        b = _kasa_read_brightness(dev)
+        if b is not None:
+            info['brightness'] = b
+    return new_state
+
+
+async def _kasa_set_brightness_async(mac: str, brightness: int) -> dict:
+    """Set brightness 0-100 on a Kasa dimmer.  Turns device on if b>0 and off,
+    turns off if b=0 and on.  Returns {on, brightness}."""
+    from kasa import Discover
+    info = _kasa_devices.get(mac)
+    if not info:
+        raise ValueError(f'Unknown Kasa MAC: {mac}')
+    if not info.get('dimmable'):
+        raise ValueError(f'Kasa {mac} is not dimmable')
+    ip = info.get('ip')
+    if not ip:
+        raise ValueError(f'No IP for Kasa {mac}')
+    b = max(0, min(100, int(brightness)))
+    dev = await Discover.discover_single(ip)
+    await dev.update()
+    was_on = bool(getattr(dev, 'is_on', False))
+    if b > 0:
+        if not was_on:
+            await dev.turn_on()
+            await dev.update()
+        await _kasa_set_brightness_on_device(dev, b)
+    else:
+        if was_on:
+            await dev.turn_off()
+    await dev.update()
+    new_on = bool(getattr(dev, 'is_on', False))
+    new_b  = _kasa_read_brightness(dev)
+    info['on']         = new_on
+    info['brightness'] = new_b if new_b is not None else b
+    info['last_seen']  = time.time()
+    return {'on': new_on, 'brightness': info['brightness']}
+
+
+def kasa_set(mac: str, on: bool) -> bool:
+    """Sync wrapper for Kasa on/off.  Returns new state."""
+    return asyncio.run(_kasa_set_async(mac, on))
+
+
+def kasa_set_brightness(mac: str, brightness: int) -> dict:
+    """Sync wrapper for Kasa dimmer brightness.  Returns {on, brightness}."""
+    return asyncio.run(_kasa_set_brightness_async(mac, brightness))
+
+
+# ── Alexa (alexapy, routines-based control) ──────────────────────────────────
+# Amazon's unofficial login is fragile; alexapy reverse-engineers it via HTML
+# scraping + cookie persistence. We only support Alexa ROUTINES in V1 — the
+# user creates "XYZ On" / "XYZ Off" routines in the Alexa app and we trigger
+# them by name via AlexaAPI.run_routine(). That pattern works consistently for
+# Amazon Smart Plugs and any third-party device linked to Alexa.
+_ALEXA_COOKIE_DIR = os.path.join(BASE_DIR, 'alexa_state')
+
+
+def _alexa_outputpath(fname: str) -> str:
+    os.makedirs(_ALEXA_COOKIE_DIR, exist_ok=True)
+    return os.path.join(_ALEXA_COOKIE_DIR, fname)
+
+
+def _alexa_status_dict(login) -> dict:
+    """Normalize login.status into a plain dict for JSON return."""
+    return dict(login.status or {}) if login is not None else {}
+
+
+async def _alexa_build_login_async():
+    """Construct an AlexaLogin using current settings. Tries to load cookie.
+
+    oauth_login=False uses the classic form-scraping login path, which
+    populates status dict (captcha_required, securitycode_required, etc.)
+    on the first page Amazon serves — OAuth mode often exits silently.
+    debug=True saves HTML snapshots to _ALEXA_COOKIE_DIR for diagnosis.
+    """
+    from alexapy import AlexaLogin
+    email    = get_setting('alexa_email', '')
+    password = get_setting('alexa_password', '')
+    url      = get_setting('alexa_url', 'amazon.com') or 'amazon.com'
+    if not email or not password:
+        raise RuntimeError('Alexa email/password not configured')
+    login = AlexaLogin(
+        url=url,
+        email=email,
+        password=password,
+        outputpath=_alexa_outputpath,
+        debug=True,
+        oauth_login=False,
+    )
+    try:
+        await login.load_cookie()
+    except Exception as exc:
+        print(f'Alexa cookie load failed (fresh login will be attempted): {exc}')
+    return login
+
+
+async def _alexa_test_loggedin_safe(login) -> bool:
+    """Wrap test_loggedin so an error just returns False, not raises."""
+    if login is None:
+        return False
+    try:
+        return bool(await login.test_loggedin())
+    except Exception as exc:
+        print(f'Alexa test_loggedin error: {exc}')
+        return False
+
+
+async def _alexa_login_start_async() -> dict:
+    """Begin a fresh login (or resume from cookie)."""
+    global _alexa_login
+    _alexa_login = await _alexa_build_login_async()
+    try:
+        await _alexa_login.login()
+    except Exception as exc:
+        print(f'Alexa login error: {exc}')
+        raise
+    logged_in = await _alexa_test_loggedin_safe(_alexa_login)
+    if logged_in:
+        try:
+            await _alexa_login.save_cookiefile()
+        except Exception as exc:
+            print(f'Alexa cookie save failed: {exc}')
+    status = _alexa_status_dict(_alexa_login)
+    status['logged_in'] = logged_in
+    return status
+
+
+async def _alexa_login_submit_otp_async(otp: str) -> dict:
+    """Submit OTP / security code to complete a pending login."""
+    global _alexa_login
+    if _alexa_login is None:
+        raise RuntimeError('No pending Alexa login; call /alexa/auth first')
+    # alexapy's form scraper populates field names dynamically via
+    # status['securitycode_tag']. Pass the code under common names so
+    # whichever one matches the current form gets used.
+    tag = None
+    try:
+        tag = (_alexa_login.status or {}).get('securitycode_tag')
+    except Exception:
+        pass
+    data = {'otpCode': otp, 'code': otp, 'otp': otp}
+    if isinstance(tag, str) and tag:
+        data[tag] = otp
+    await _alexa_login.login(data=data)
+    logged_in = await _alexa_test_loggedin_safe(_alexa_login)
+    if logged_in:
+        try:
+            await _alexa_login.save_cookiefile()
+        except Exception as exc:
+            print(f'Alexa cookie save failed: {exc}')
+    status = _alexa_status_dict(_alexa_login)
+    status['logged_in'] = logged_in
+    return status
+
+
+class _AlexaDeviceShim:
+    """Minimal device shim for AlexaAPI — exposes fields run_behavior reads."""
+    def __init__(self, d: dict):
+        self._device_type         = d.get('deviceType') or ''
+        self.device_serial_number = d.get('serialNumber') or ''
+        self._locale              = d.get('locale') or 'en-US'
+
+
+async def _alexa_pick_echo_async(login) -> dict:
+    """Return the first usable Echo device from the account."""
+    from alexapy import AlexaAPI
+    devices = await AlexaAPI.get_devices(login) or []
+    if not devices:
+        raise RuntimeError('No Alexa devices on account')
+    # Prefer a non-app device with a serial number
+    for d in devices:
+        if d.get('serialNumber') and d.get('deviceType'):
+            return d
+    return devices[0]
+
+
+async def _alexa_build_api_async():
+    """Return an AlexaAPI bound to one Echo, suitable for run_routine()."""
+    global _alexa_client
+    from alexapy import AlexaAPI
+    if _alexa_login is None:
+        raise RuntimeError('Alexa not logged in')
+    if _alexa_client is not None:
+        return _alexa_client
+    echo = await _alexa_pick_echo_async(_alexa_login)
+    _alexa_client = AlexaAPI(_AlexaDeviceShim(echo), _alexa_login)
+    return _alexa_client
+
+
+async def _alexa_refresh_async() -> int:
+    """Fetch Alexa routines, upsert to switches_meta as kind='routine'."""
+    global _alexa_routines
+    from alexapy import AlexaAPI
+    if _alexa_login is None:
+        return 0
+    automations = await AlexaAPI.get_automations(_alexa_login) or []
+    new: dict = {}
+    for a in automations:
+        if not isinstance(a, dict):
+            continue
+        aid  = a.get('automationId')
+        name = a.get('name')
+        if not aid or not isinstance(name, str) or not name.strip():
+            continue
+        new[aid] = {'name': name.strip()}
+    _alexa_routines = new
+    with sqlite3.connect(DB_PATH) as c:
+        for aid, info in new.items():
+            row = c.execute(
+                'SELECT id, name FROM switches_meta WHERE provider=? AND external_id=?',
+                ('alexa', aid)
+            ).fetchone()
+            if row is None:
+                c.execute(
+                    'INSERT INTO switches_meta (provider, external_id, kind, name) '
+                    'VALUES (?,?,?,?)',
+                    ('alexa', aid, 'routine', info['name'])
+                )
+    return len(new)
+
+
+async def _alexa_run_routine_async(automation_id: str) -> None:
+    """Fire an Alexa routine by its automation ID (looks up the name from cache)."""
+    info = _alexa_routines.get(automation_id)
+    if info is None:
+        # Fall back: refresh and retry once in case cache is stale
+        await _alexa_refresh_async()
+        info = _alexa_routines.get(automation_id)
+    if info is None:
+        raise ValueError(f'Unknown Alexa routine: {automation_id}')
+    api = await _alexa_build_api_async()
+    await api.run_routine(info['name'])
+
+
+def alexa_run_routine(automation_id: str) -> None:
+    """Sync wrapper for Alexa routine trigger."""
+    asyncio.run(_alexa_run_routine_async(automation_id))
+
+
+def _alexa_refresh_devices() -> int:
+    """Discovery entrypoint (used by /api/switches/rediscover).
+
+    Auto-attempts cookie-based login if _alexa_login is None but credentials
+    are present. For fresh logins (or OTP flow) the user hits /alexa/auth.
+    """
+    global _alexa_login
+    if _alexa_login is None:
+        try:
+            asyncio.run(_alexa_login_start_async())
+        except Exception as exc:
+            print(f'Alexa auto-login failed: {exc}')
+            _log_system_error('alexa', 'Auto-login failed', str(exc))
+            return 0
+    if not _alexa_status_dict(_alexa_login).get('login_successful'):
+        print('Alexa not logged in; skipping refresh. Use /alexa/auth.')
+        return 0
+    try:
+        return asyncio.run(_alexa_refresh_async())
+    except Exception as exc:
+        print(f'Alexa refresh error: {exc}')
+        _log_system_error('alexa', 'Refresh failed', str(exc))
+        return 0
+
+
+def _alexa_poll_state() -> None:
+    """Routines have no state; nothing to poll in V1."""
+    pass
+
+
+# ── Tuya (tinytuya, LAN control of Smart Life / Tuya-platform devices) ───────
+# Requires the user to run `python -m tinytuya wizard` once — that reaches out
+# to the Tuya Cloud developer portal and produces devices.json with local keys
+# for every device on the account. Our integration is then fully LAN-based.
+_TUYA_DEVICEFILE = os.path.join(BASE_DIR, 'devices.json')
+
+
+def _tuya_load_devicefile() -> list:
+    """Load devices.json produced by tinytuya wizard. Returns list of dicts."""
+    if not os.path.exists(_TUYA_DEVICEFILE):
+        return []
+    try:
+        with open(_TUYA_DEVICEFILE, encoding='utf-8') as f:
+            data = json.load(f)
+        # Wizard output is a list of device dicts
+        if isinstance(data, list):
+            return data
+        # Some versions wrap it
+        if isinstance(data, dict) and 'devices' in data:
+            return data['devices']
+        return []
+    except Exception as exc:
+        print(f'Tuya devicefile load error: {exc}')
+        return []
+
+
+def _tuya_make_outlet(dev_id: str, info: dict):
+    """Construct a tinytuya OutletDevice for a cached device."""
+    import tinytuya
+    ip = info.get('ip')
+    if not ip:
+        raise RuntimeError(f'Tuya device {dev_id} has no IP; run rediscover')
+    try:
+        version = float(info.get('version', '3.3'))
+    except (TypeError, ValueError):
+        version = 3.3
+    return tinytuya.OutletDevice(
+        dev_id=dev_id,
+        address=ip,
+        local_key=info.get('local_key', ''),
+        version=version,
+    )
+
+
+def _parse_tuya_ext_id(ext_id: str):
+    """Extract (dev_id, dp_idx) from switches_meta external_id.
+    Format: '<dev_id>:<dp>' (multi-outlet) or '<dev_id>' (single-outlet back-compat)."""
+    if ':' in ext_id:
+        a, b = ext_id.split(':', 1)
+        return a, b
+    return ext_id, '1'
+
+
+def _tuya_probe_dps(dev_id: str, info: dict) -> dict:
+    """Connect to a device and return its current dps dict, or {} on error."""
+    try:
+        dev = _tuya_make_outlet(dev_id, info)
+        status = dev.status()
+        if isinstance(status, dict):
+            return status.get('dps') or {}
+    except Exception as exc:
+        print(f'Tuya probe failed for {dev_id}: {exc}')
+    return {}
+
+
+def _tuya_refresh_devices() -> int:
+    """Load devices.json, scan LAN, probe each device for its switch DPs,
+    upsert one switches_meta row per outlet (multi-outlet strips split)."""
+    global _tuya_devices, _tuya_ts
+    file_devs = _tuya_load_devicefile()
+    if not file_devs:
+        print('Tuya: no devices.json found. Run `python -m tinytuya wizard`.')
+        _log_system_error('tuya', 'devices.json missing',
+                          f'Expected at {_TUYA_DEVICEFILE}. Run tinytuya wizard.')
+        return 0
+
+    # LAN scan (~18s UDP listen) so we learn each device's current IP + version.
+    import tinytuya
+    try:
+        scan = tinytuya.deviceScan(verbose=False, color=False, poll=False) or {}
+    except Exception as exc:
+        print(f'Tuya LAN scan error: {exc}')
+        scan = {}
+
+    scan_by_id: dict = {}
+    for ip_key, sinfo in (scan.items() if isinstance(scan, dict) else []):
+        if isinstance(sinfo, dict):
+            dev_id = sinfo.get('gwId') or sinfo.get('id')
+            ip     = sinfo.get('ip') or ip_key
+            ver    = sinfo.get('version', '3.3')
+            if dev_id:
+                scan_by_id[dev_id] = {'ip': ip, 'version': ver}
+
+    new: dict = {}
+    for d in file_devs:
+        dev_id = d.get('id')
+        if not dev_id:
+            continue
+        name = (d.get('name') or '').strip() or f'Tuya {dev_id[-5:]}'
+        key  = d.get('key') or d.get('local_key') or ''
+        if not key:
+            continue
+        lan = scan_by_id.get(dev_id, {})
+        ip  = lan.get('ip') or d.get('ip') or ''
+        ver = lan.get('version') or d.get('version') or '3.3'
+        new[dev_id] = {
+            'name':      name,
+            'ip':        ip,
+            'local_key': key,
+            'version':   str(ver),
+            'category':  d.get('category', ''),
+            'online':    bool(ip),
+            'last_seen': time.time() if ip else 0,
+            'dp_state':  {},   # filled by probe
+            'switch_dps': ['1'],  # DPs we consider togglable; populated by probe
+        }
+
+    # Probe each reachable device to discover its switch DPs.
+    for dev_id, info in new.items():
+        if not info.get('ip'):
+            continue
+        dps = _tuya_probe_dps(dev_id, info)
+        info['dp_state'] = dps
+        switch_dps = []
+        for dp_idx, val in dps.items():
+            if isinstance(val, bool):
+                switch_dps.append(dp_idx)
+        if switch_dps:
+            # Sort numerically when possible (DP '1' before '10' etc.)
+            info['switch_dps'] = sorted(
+                switch_dps, key=lambda s: int(s) if s.isdigit() else 999
+            )
+
+    with _switches_lock:
+        _tuya_devices = new
+        _tuya_ts = time.time()
+
+    # Upsert one row per switch DP per device.
+    total_tiles = 0
+    with sqlite3.connect(DB_PATH) as c:
+        for dev_id, info in new.items():
+            dps_list = info['switch_dps']
+            for idx, dp_idx in enumerate(dps_list):
+                ext_id = f'{dev_id}:{dp_idx}'
+                default_name = (
+                    f'{info["name"]} {idx + 1}' if len(dps_list) > 1
+                    else info['name']
+                )
+                row = c.execute(
+                    'SELECT id FROM switches_meta WHERE provider=? AND external_id=?',
+                    ('tuya', ext_id)
+                ).fetchone()
+                if row is None:
+                    c.execute(
+                        'INSERT INTO switches_meta (provider, external_id, kind, name) '
+                        'VALUES (?,?,?,?)',
+                        ('tuya', ext_id, 'plug', default_name)
+                    )
+                total_tiles += 1
+    return total_tiles
+
+
+def _tuya_poll_state() -> None:
+    """Refresh full dps dict for each cached Tuya device (updates per-outlet
+    state for multi-outlet strips). Blocking; runs in the poller thread."""
+    if not _tuya_devices:
+        return
+    for dev_id, info in list(_tuya_devices.items()):
+        if not info.get('ip'):
+            continue
+        try:
+            dev = _tuya_make_outlet(dev_id, info)
+            status = dev.status()
+            if isinstance(status, dict):
+                dps = status.get('dps') or {}
+                info['dp_state'] = dps
+                info['last_seen'] = time.time()
+                info['online'] = True
+        except Exception:
+            info['online'] = False
+
+
+# ── Abode alarm control (uses existing _abode_instance) ──────────────────────
+# Abode is already fully read-integrated (websocket listener + fetch_security).
+# This adds a single "Arm Home" action in the Home Control drawer — the
+# user's common bedtime use case. Disarm stays on the physical keypad /
+# Abode app (both enforce a real PIN). Away isn't surfaced.
+ABODE_MODE_DISPLAY = {'standby': 'Disarmed', 'home': 'Armed Home', 'away': 'Armed Away'}
+
+
+def _abode_seed_alarm_row() -> int:
+    """Idempotent upsert of the alarm row in switches_meta. Returns 1."""
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute(
+            'SELECT id FROM switches_meta WHERE provider=? AND external_id=?',
+            ('abode', 'alarm')
+        ).fetchone()
+        if row is None:
+            c.execute(
+                'INSERT INTO switches_meta (provider, external_id, kind, name) '
+                'VALUES (?,?,?,?)',
+                ('abode', 'alarm', 'alarm', 'Security')
+            )
+    return 1
+
+
+def abode_arm_home() -> str:
+    """Arm the Abode system to Home mode. Refreshes _security immediately so
+    the next /api/switches reflects the change."""
+    global _security, _security_ts
+    if _abode_instance is None:
+        raise RuntimeError('Abode not connected')
+    alarm = _abode_instance.get_alarm()
+    if alarm is None:
+        raise RuntimeError('Abode alarm device not available')
+    alarm.set_mode('home')
+    _security = {
+        **(_security or {}),
+        'mode':         'home',
+        'mode_display': ABODE_MODE_DISPLAY['home'],
+    }
+    _security_ts = time.time()
+    return 'home'
+
+
+def tuya_set(ext_id: str, on: bool) -> bool:
+    """Toggle a single Tuya outlet (identified by 'dev_id:dp_idx' external_id)."""
+    dev_id, dp_idx = _parse_tuya_ext_id(ext_id)
+    info = _tuya_devices.get(dev_id)
+    if not info:
+        raise ValueError(f'Unknown Tuya device: {dev_id}')
+    if not info.get('ip'):
+        raise RuntimeError(f'Tuya {dev_id} has no LAN IP (may be offline)')
+    dev = _tuya_make_outlet(dev_id, info)
+    # set_value takes the DP index (int). For single-outlet devices with the
+    # master switch on DP 1, dev.turn_on()/turn_off() also works — but
+    # set_value handles all cases including USB ports on strips.
+    try:
+        dp_as_int = int(dp_idx)
+    except ValueError:
+        dp_as_int = dp_idx  # some devices use string codes
+    result = dev.set_value(dp_as_int, bool(on))
+    if isinstance(result, dict) and result.get('Error'):
+        raise RuntimeError(f'Tuya error: {result.get("Error")}')
+    # Update local cache so /api/switches reflects immediately.
+    dp_state = info.setdefault('dp_state', {})
+    dp_state[dp_idx] = bool(on)
+    info['last_seen'] = time.time()
+    return bool(on)
+
+
+# ── Switches (unified dispatch across providers) ─────────────────────────────
+def _switches_rediscover_all() -> dict:
+    """Run discovery across every enabled provider.  Returns per-provider counts."""
+    counts = {'kasa': 0, 'alexa': 0, 'pool': 0, 'nest_thermostat': 0, 'tuya': 0}
+    if get_setting_bool('kasa_enabled', False):
+        counts['kasa'] = _kasa_refresh_devices()
+    if get_setting_bool('alexa_enabled', False):
+        counts['alexa'] = _alexa_refresh_devices()
+    if get_setting_bool('pool_enabled', True):
+        counts['pool'] = _pool_discover_circuits()
+    # Nest: refresh all devices (cameras + doorbells + thermostats). The
+    # camera cache is the pre-existing behavior; thermostats are new.
+    if get_setting_bool('nest_enabled', False):
+        token = _nest_ensure_token()
+        if token:
+            _nest_refresh_devices(token)
+            counts['nest_thermostat'] = len(_nest_thermostats)
+    if get_setting_bool('tuya_enabled', False):
+        counts['tuya'] = _tuya_refresh_devices()
+    if get_setting_bool('abode_enabled', True):
+        counts['abode'] = _abode_seed_alarm_row()
+    return counts
+
+
+def _get_all_switches() -> list:
+    """Return merged switch list with DB metadata + live state per provider."""
+    out = []
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute(
+            'SELECT id, provider, external_id, kind, name, room, sort_order, hidden '
+            'FROM switches_meta ORDER BY room, sort_order, name'
+        ).fetchall()
+    for rid, provider, ext_id, kind, name, room, sort_order, hidden in rows:
+        state     = None
+        detail    = {}
+        reachable = True
+        if provider == 'kasa':
+            info = _kasa_devices.get(ext_id)
+            if info is None:
+                reachable = False
+            else:
+                state  = info.get('on')
+                detail = {
+                    'ip':         info.get('ip'),
+                    'model':      info.get('model'),
+                    'dimmable':   bool(info.get('dimmable')),
+                    'brightness': info.get('brightness'),
+                }
+        elif provider == 'alexa':
+            if not get_setting_bool('alexa_enabled', False):
+                reachable = False
+            elif kind == 'routine':
+                # Routines are stateless; reachable iff we have it in cache
+                reachable = ext_id in _alexa_routines
+                state     = None
+                detail    = {'type': 'routine'}
+            else:
+                info = _alexa_devices.get(ext_id)
+                if info is None:
+                    reachable = False
+                else:
+                    state  = info.get('on')
+                    detail = {}
+        elif provider == 'pool':
+            if not get_setting_bool('pool_enabled', True):
+                reachable = False
+            else:
+                field = POOL_EXT_TO_FIELD.get(ext_id)
+                val = _pool.get(field) if field else None
+                if val is None:
+                    # _pool cache not populated yet, or field unknown
+                    reachable = bool(_pool)
+                    state = None
+                else:
+                    state = bool(val)
+                detail = {'circuit_id': ext_id}
+        elif provider == 'abode':
+            if not get_setting_bool('abode_enabled', True):
+                reachable = False
+            else:
+                mode = (_security.get('mode') or 'standby').lower()
+                state = (mode != 'standby')
+                detail = {
+                    'mode':         mode,
+                    'mode_display': ABODE_MODE_DISPLAY.get(mode, mode),
+                    'connected':    _security.get('connected', False),
+                }
+                reachable = bool(_abode_instance is not None)
+        elif provider == 'tuya':
+            if not get_setting_bool('tuya_enabled', False):
+                reachable = False
+            else:
+                dev_id, dp_idx = _parse_tuya_ext_id(ext_id)
+                info = _tuya_devices.get(dev_id)
+                if info is None or not info.get('ip'):
+                    reachable = False
+                    state = None
+                else:
+                    dps = info.get('dp_state') or {}
+                    val = dps.get(dp_idx)
+                    state = bool(val) if isinstance(val, bool) else None
+                    detail = {
+                        'ip':       info.get('ip'),
+                        'category': info.get('category'),
+                        'online':   info.get('online', True),
+                        'dp':       dp_idx,
+                    }
+        elif provider == 'nest':
+            if kind == 'thermostat':
+                info = _nest_thermostats.get(ext_id)
+                if info is None:
+                    reachable = False
+                else:
+                    mode = (info.get('mode') or 'OFF').upper()
+                    state = mode != 'OFF'
+                    detail = {
+                        'mode':            mode,
+                        'available_modes': info.get('available_modes', []),
+                        'ambient_f':       _c_to_f(info.get('ambient_c')),
+                        'humidity':        info.get('humidity'),
+                        'setpoint_heat_f': _c_to_f(info.get('setpoint_heat_c')),
+                        'setpoint_cool_f': _c_to_f(info.get('setpoint_cool_c')),
+                        'hvac_status':     info.get('hvac_status'),
+                        'eco_mode':        info.get('eco_mode'),
+                    }
+            else:
+                reachable = False
+        out.append({
+            'id':         rid,
+            'provider':   provider,
+            'external_id': ext_id,
+            'kind':       kind,
+            'name':       name,
+            'room':       room or '',
+            'sort_order': sort_order,
+            'hidden':     bool(hidden),
+            'state':      state,
+            'reachable':  reachable,
+            'detail':     detail,
+        })
+    return out
+
+
+def _switches_lookup(row_id: int):
+    with sqlite3.connect(DB_PATH) as c:
+        row = c.execute(
+            'SELECT id, provider, external_id, kind, name FROM switches_meta WHERE id=?',
+            (row_id,)
+        ).fetchone()
+    return row  # (id, provider, external_id, kind, name) or None
+
+
+def _switches_log_event(system: str, event_type: str, title: str, detail: str = None,
+                        result: str = 'ok') -> None:
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute(
+                'INSERT INTO event_log (ts, system, event_type, title, detail, result, source) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (int(time.time()), system, event_type, title, detail, result, 'ui')
+            )
+    except Exception as exc:
+        print(f'Switch event log error: {exc}')
+
+
+def switch_set_state(row_id: int, on: bool) -> dict:
+    """Dispatch set-state to the right provider.  Returns result dict."""
+    row = _switches_lookup(row_id)
+    if row is None:
+        return {'error': 'not found', 'code': 404}
+    _, provider, ext_id, kind, name = row
+    try:
+        if provider == 'kasa':
+            new_state = kasa_set(ext_id, on)
+            _switches_log_event(
+                'kasa',
+                'plug_turned_on' if new_state else 'plug_turned_off',
+                name
+            )
+            return {'ok': True, 'state': new_state}
+        if provider == 'alexa':
+            if kind == 'routine':
+                alexa_run_routine(ext_id)
+                _switches_log_event('alexa', 'routine_triggered', name)
+                return {'ok': True, 'state': None}
+            return {'error': 'alexa plug control not implemented — use routines',
+                    'code': 501}
+        if provider == 'abode':
+            return {'error': 'use /api/switches/alarm/arm-home for abode',
+                    'code': 400}
+        if provider == 'tuya':
+            new_state = tuya_set(ext_id, on)
+            _switches_log_event(
+                'tuya',
+                'plug_turned_on' if new_state else 'plug_turned_off',
+                name
+            )
+            return {'ok': True, 'state': new_state}
+        if provider == 'pool':
+            pool_set_circuit(ext_id, on)
+            _switches_log_event(
+                'pool',
+                'circuit_on' if on else 'circuit_off',
+                name
+            )
+            return {'ok': True, 'state': on}
+        if provider == 'nest':
+            return {'error': 'use /api/switches/thermostat for nest', 'code': 400}
+        return {'error': f'unknown provider: {provider}', 'code': 400}
+    except Exception as exc:
+        _switches_log_event(provider, 'error', f'{name}: set-state failed',
+                            str(exc), 'failed')
+        return {'error': str(exc), 'code': 500}
+
+
+def switch_toggle(row_id: int) -> dict:
+    """Flip the current state of a plug/circuit, or fire a routine."""
+    row = _switches_lookup(row_id)
+    if row is None:
+        return {'error': 'not found', 'code': 404}
+    _, provider, ext_id, kind, _ = row
+    # Routines are stateless — tap = fire. Value of `on` is ignored downstream.
+    if kind == 'routine':
+        return switch_set_state(row_id, True)
+    # Alarm uses its own endpoint — reject plain toggle so the frontend
+    # explicitly calls /api/switches/alarm/arm-home.
+    if kind == 'alarm':
+        return {'error': 'use /api/switches/alarm/arm-home for abode alarm',
+                'code': 400}
+    current = None
+    if provider == 'kasa':
+        current = (_kasa_devices.get(ext_id) or {}).get('on')
+    elif provider == 'alexa':
+        current = (_alexa_devices.get(ext_id) or {}).get('on')
+    elif provider == 'pool':
+        field = POOL_EXT_TO_FIELD.get(ext_id)
+        current = _pool.get(field) if field else None
+    elif provider == 'tuya':
+        dev_id, dp_idx = _parse_tuya_ext_id(ext_id)
+        info = _tuya_devices.get(dev_id) or {}
+        val = (info.get('dp_state') or {}).get(dp_idx)
+        current = bool(val) if isinstance(val, bool) else None
+    # nest toggle semantics: Phase 4 (use /api/switches/thermostat instead)
+    if current is None:
+        return {'error': 'current state unknown', 'code': 409}
+    return switch_set_state(row_id, not current)
+
+
+def switch_set_thermostat(row_id: int, **fields) -> dict:
+    """Dispatch thermostat command to SDM API. fields: mode / setpoint_f /
+    setpoint_heat_f / setpoint_cool_f. Any combination is allowed; order is
+    mode first, then setpoints."""
+    row = _switches_lookup(row_id)
+    if row is None:
+        return {'error': 'not found', 'code': 404}
+    _, provider, ext_id, kind, name = row
+    if provider != 'nest' or kind != 'thermostat':
+        return {'error': 'not a nest thermostat', 'code': 400}
+    try:
+        result = nest_set_thermostat(ext_id, **fields)
+        changes = []
+        if 'mode' in fields:
+            changes.append(f'mode={fields["mode"]}')
+        if fields.get('setpoint_f') is not None:
+            changes.append(f'setpoint={fields["setpoint_f"]}°F')
+        if fields.get('setpoint_heat_f') is not None:
+            changes.append(f'heat={fields["setpoint_heat_f"]}°F')
+        if fields.get('setpoint_cool_f') is not None:
+            changes.append(f'cool={fields["setpoint_cool_f"]}°F')
+        event_type = ('thermostat_mode_changed' if 'mode' in fields
+                      else 'thermostat_setpoint_changed')
+        _switches_log_event('nest', event_type, name, detail=', '.join(changes))
+        return {'ok': True, **result}
+    except Exception as exc:
+        _switches_log_event('nest', 'error', f'{name}: thermostat set failed',
+                            str(exc), 'failed')
+        return {'error': str(exc), 'code': 500}
+
+
+def switch_set_brightness(row_id: int, brightness: int) -> dict:
+    """Dispatch brightness change to the right provider."""
+    row = _switches_lookup(row_id)
+    if row is None:
+        return {'error': 'not found', 'code': 404}
+    _, provider, ext_id, kind, name = row
+    if kind != 'dimmer':
+        return {'error': 'not a dimmer', 'code': 400}
+    try:
+        if provider == 'kasa':
+            result = kasa_set_brightness(ext_id, brightness)
+            _switches_log_event(
+                'kasa', 'brightness_changed', name,
+                detail=f'brightness={result["brightness"]}%'
+            )
+            return {'ok': True, **result}
+        return {'error': f'brightness not supported for {provider}', 'code': 501}
+    except Exception as exc:
+        _switches_log_event(provider, 'error', f'{name}: brightness failed',
+                            str(exc), 'failed')
+        return {'error': str(exc), 'code': 500}
+
+
+def switch_update_meta(row_id: int, fields: dict) -> dict:
+    allowed = {'name', 'room', 'sort_order', 'hidden'}
+    updates = {k: v for k, v in fields.items() if k in allowed}
+    if not updates:
+        return {'error': 'no valid fields', 'code': 400}
+    if 'hidden' in updates:
+        updates['hidden'] = 1 if updates['hidden'] else 0
+    if 'sort_order' in updates:
+        try:
+            updates['sort_order'] = int(updates['sort_order'])
+        except (TypeError, ValueError):
+            return {'error': 'sort_order must be int', 'code': 400}
+    sets = ', '.join(f'{k}=?' for k in updates)
+    vals = list(updates.values()) + [row_id]
+    with sqlite3.connect(DB_PATH) as c:
+        cur = c.execute(f'UPDATE switches_meta SET {sets} WHERE id=?', vals)
+        if cur.rowcount == 0:
+            return {'error': 'not found', 'code': 404}
+    return {'ok': True}
 
 
 # ── Rules helpers ────────────────────────────────────────────────────────────
@@ -2337,8 +3671,12 @@ def _load_all_rules(c):
 
 
 def _rule_fires_at(rule, d):
-    if d.weekday() not in set(rule['days']):
-        return None
+    weekday = d.weekday()
+    days_set = set(rule['days'])
+    if weekday not in days_set:
+        # On holidays, fire if rule includes any weekend day (Sat=5 or Sun=6)
+        if not (is_sdge_holiday(d) and days_set & {5, 6}):
+            return None
     if d.month not in set(rule['months']):
         return None
     return datetime(d.year, d.month, d.day, rule['hour'], rule['minute'])
@@ -2351,27 +3689,20 @@ def _upcoming_firings(rules, hours=48):
     tou = _load_tou_periods()
     for delta_days in (0, 1, 2):
         d = now.date() + timedelta(days=delta_days)
-        # Synthetic holiday entry — notify user of automatic battery hold
+        # Informational holiday entry — weekend rules apply on holidays
         if is_sdge_holiday(d):
             fire_dt = datetime(d.year, d.month, d.day, 0, 0)
             if fire_dt <= cutoff:
-                name = holiday_name(d)
-                # Derive end hour from TOU periods setting
-                p = tou or {}
-                sop_ranges = p.get('weekend_holiday', {}).get('super_off_peak', [[0, 14]])
-                end_hour = max(e for _, e in sop_ranges)
-                end_12 = end_hour % 12 or 12
-                ampm = 'AM' if end_hour < 12 else 'PM'
                 events.append({
-                    'fire_time':        fire_dt.strftime('%Y-%m-%dT%H:%M:%S'),
-                    'source':           'powerwall',
-                    'name':             f'Holiday: {name} — battery hold until {end_12} {ampm}',
-                    'holiday_override':  True,
-                    'mode':             None,
-                    'reserve':          100,
-                    'grid_charging':    None,
-                    'grid_export':      'pv_only',
-                    'conditions':       [],
+                    'fire_time':     fire_dt.strftime('%Y-%m-%dT%H:%M:%S'),
+                    'source':        'powerwall',
+                    'name':          f'Holiday: {holiday_name(d)} — weekend rules apply',
+                    'holiday_info':  True,
+                    'mode':          None,
+                    'reserve':       None,
+                    'grid_charging': None,
+                    'grid_export':   None,
+                    'conditions':    [],
                 })
         for rule in rules:
             if not rule['enabled']:
@@ -2695,14 +4026,14 @@ def _analyze_rules(rules, rates, holidays, tou_periods=None):
         day_name = hd.strftime('%A')
         insights.append({
             'severity':     'info',
-            'title':        f'{name} ({hd.strftime("%b %d")}) — automatic battery hold',
+            'title':        f'{name} ({hd.strftime("%b %d")}) — weekend rules apply',
             'detail': (
                 f'{name} falls on a {day_name} and uses the holiday TOU schedule: '
                 f'super off-peak midnight\u2013{_hol_sop_end}, on-peak {_hol_on_start}\u2013{_hol_on_end}. '
-                f'The system will automatically set reserve to 100% '
-                f'and export to PV-only during super off-peak to hold the battery for on-peak.'
+                f'Weekend rules will fire automatically on this day. '
+                f'Use a holiday condition to create holiday-specific rules (e.g. battery hold).'
             ),
-            'action': 'No action needed — holiday override is automatic.',
+            'action': 'Review your weekend rules to ensure they cover holiday behavior.',
             'holiday_date': hd.isoformat(),
         })
 
@@ -2713,7 +4044,8 @@ def _analyze_rules(rules, rates, holidays, tou_periods=None):
             'title':  'No holiday dates configured',
             'detail': (
                 f'SDG&E holidays use a different TOU schedule (super off-peak midnight\u2013{_hol_sop_end}). '
-                'Without holiday dates, the automatic battery hold cannot activate.'
+                'Without holiday dates, weekend rules cannot activate on holidays and '
+                'holiday conditions will not work.'
             ),
             'action': 'Refresh holiday dates via Settings.',
         })
@@ -2805,12 +4137,22 @@ You are an energy optimization advisor for a specific home in San Diego, CA.
   and longer afternoon export windows
 
 ## Data conventions — read carefully
-- battery_w: positive = charging, negative = discharging
-- grid_w: positive = importing from grid, negative = exporting to grid
-- on_peak_cost / off_peak_cost / super_off_peak_cost: signed net values —
-  negative = net credit earned
-- rule_based_insights: deterministic gaps already identified by a separate analysis
+- Battery (W): positive = charging, negative = discharging
+- Grid (W): positive = importing from grid, negative = exporting to grid
+- On-Peak Net / Off-Peak Net / Super Off-Peak Net (kWh): signed net values —
+  negative = net export credit earned during that period
+- **CRITICAL — projection Net column sign convention:**
+  - POSITIVE Net = deficit (homeowner OWES SDG&E this amount)
+  - NEGATIVE Net = credit (SDG&E OWES the homeowner this amount)
+  - Example: Net = -$328.15 means a CREDIT of $328.15 (good outcome, within $100-$500 target)
+  - Example: Net = +$328.15 means a DEFICIT of $328.15 (bad outcome, need more exports)
+  - Never describe a negative number as a "deficit" — a negative Net is ALWAYS a credit
+  - Always check the sign before labeling the outcome
+- Rule-Based Findings: deterministic gaps already identified by a separate analysis
   engine — do NOT repeat these findings, go deeper or synthesize across them
+- Rule names are DESCRIPTIVE, not authoritative. If a rule's name disagrees with
+  its actual values, the values are what the system executes — but flag the
+  disagreement as a likely bug for the user to review.
 
 ## Rate structure
 Use the exact summer_on_peak, summer_off_peak, summer_super_off_peak, winter_on_peak,
@@ -2820,7 +4162,7 @@ Key EV-TOU-2 nuances:
 - On-peak ({on_start}–{on_end}) applies EVERY day including weekends and holidays — no exemptions
 - Super off-peak bonus window: {mar_apr_start}–{mar_apr_end} weekdays in March and April only
 - Holidays follow weekend schedule: super off-peak midnight–{hol_sop_end}, on-peak {hol_on_start}–{hol_on_end}, off-peak fills the remaining hours
-- November is WINTER season despite being adjacent to summer export months
+- Summer rates apply June–October; winter rates apply November–May
 
 ## How to read the rules
 The rules array defines the automation schedule. Each rule fires at hour:minute on
@@ -2906,9 +4248,22 @@ Review the current rules against actual usage patterns. Focus on:
   would it cost in overnight charging to make up for earlier export?
 - Is the overnight grid charging window long enough to fully recharge the battery?
   If not, how much longer does it need to be?
-- Are there months where battery export rules are active but shouldn't be (like
-  November, which is actually a winter month)?
+- Check the Rules list to see which months each rule actually covers. Do not assume
+  rule coverage from the rule name — read the months list. Only flag month-mismatches
+  that are actually present in the data.
 - Are any days of the week missing from the export schedule?
+- **Check each rule for name-vs-value consistency.** The rule's name (the quoted string
+  at the start of each rule line) often describes intent, while the resolved values
+  after "|" show actual behavior. If a name says "export solar only" but the action
+  says "active battery export enabled", flag it. If a name mentions "7:55pm" but
+  the time shows "7:00 PM", flag it. Similar checks for reserve percentages, grid
+  charging on/off, and day ranges. These are often unintentional user errors.
+- **Trace rule firings in time order** for each day-type (weekday / Saturday / Sunday).
+  If a rule enables battery export ("active battery export enabled") and no later
+  rule on the same day-type switches to solar-only export before midnight, flag
+  it — battery will drain through off-peak hours at lower rates. Also flag cases
+  where two rules fire within 30 minutes and the later one contradicts the earlier
+  (the earlier rule has no lasting effect).
 For each suggestion, estimate the dollar impact per month using actual rates.
 
 **4. Credit maximization**
@@ -2938,35 +4293,15 @@ When data sources are estimated rather than measured, hedge your language accord
 Use markdown. Use the actual rate values and cost figures from the data — no generic estimates.
 Do not repeat findings already listed in rule_based_insights.
 
-NEVER use JSON field names from the data in your output. The data contains technical
-keys like on_peak_kwh, solar_w, grid_w, battery_pct, super_off_peak_kwh, import_kwh,
-export_kwh, battery_w, home_w, etc. These are for your analysis only — always translate
-to natural language in your response:
-  on_peak_kwh → "on-peak export" or "on-peak usage"
-  solar_w → "solar production"
-  grid_w → "grid import" or "grid export"
-  battery_w → "battery charging" or "battery discharging"
-  battery_pct → "battery level"
-  super_off_peak_kwh → "super off-peak usage"
-  import_kwh → "grid imports"
-  export_kwh → "grid exports"
-  grid_export → "battery export to grid"
-  self_consumption → "Self-Powered mode"
-  autonomous → "Time-Based Control mode"
-If the user sees a field name like `on_peak_kwh` or `solar_w` in your response, that
-is a failure. Every technical term must be translated to plain English.
-
 CRITICAL — Write for a homeowner, not an engineer:
-- Use natural language for days: "Monday through Friday" or "Weekdays" or "Every day" — never arrays like [0,1,2,3,4].
-- Use natural language for months: "June through October" — never arrays like [6,7,8,9,10].
+- Use plain English terms like "solar production", "grid imports", "battery level",
+  "on-peak credits" — NOT technical or code-like identifiers.
 - Use 12-hour time: "5:00 PM" — never "hour: 17" or "19:15".
-- Instead of "daily_costs" or "hourly_readings", say "your daily cost data"
-  or "your recent power readings".
 - For rule recommendations: explain WHY the change helps and the expected dollar impact.
   Do NOT walk the user through how to create or edit a rule — they know how.
   Example: "Starting battery export at 5 PM instead of 7:15 PM would capture 2 extra hours
   of on-peak rates, adding approximately $X per month in credits toward net-zero."
-- Never output JSON, arrays, code blocks, or raw data field names in recommendations.
+- Never output JSON, arrays, code blocks, underscore_identifiers, or field syntax in recommendations.
 - Use dollar amounts to justify every recommendation.
 
 Keep the total response focused — depth over breadth.
@@ -3491,10 +4826,12 @@ def _build_ai_context():
     for row in reading_rows:
         if row[0] - last_ts >= 10800:
             sampled.append({
-                'time': datetime.fromtimestamp(row[0]).strftime('%Y-%m-%d %H:%M'),
-                'solar_w': round(row[1] or 0), 'home_w': round(row[2] or 0),
-                'battery_w': round(row[3] or 0), 'grid_w': round(row[4] or 0),
-                'battery_pct': round(row[5] or 0, 1),
+                'Time': datetime.fromtimestamp(row[0]).strftime('%Y-%m-%d %H:%M'),
+                'Solar (W)': round(row[1] or 0),
+                'Home Load (W)': round(row[2] or 0),
+                'Battery (W)': round(row[3] or 0),
+                'Grid (W)': round(row[4] or 0),
+                'Battery Level (%)': round(row[5] or 0, 1),
             })
             last_ts = row[0]
 
@@ -3502,44 +4839,107 @@ def _build_ai_context():
     current_year_monthly = []
     for row in cy_monthly_rows:
         current_year_monthly.append({
-            'month': row[0],
-            'import_kwh': round(row[1] or 0, 1), 'export_kwh': round(row[2] or 0, 1),
-            'import_cost': round(row[3] or 0, 2), 'export_credit': round(row[4] or 0, 2),
-            'on_peak_kwh': round(row[5] or 0, 1), 'off_peak_kwh': round(row[6] or 0, 1),
-            'super_off_peak_kwh': round(row[7] or 0, 1),
+            'Month': row[0],
+            'Grid Import (kWh)': round(row[1] or 0, 1),
+            'Grid Export (kWh)': round(row[2] or 0, 1),
+            'Import Cost ($)': round(row[3] or 0, 2),
+            'Export Credit ($)': round(row[4] or 0, 2),
+            'On-Peak Net (kWh)': round(row[5] or 0, 1),
+            'Off-Peak Net (kWh)': round(row[6] or 0, 1),
+            'Super Off-Peak Net (kWh)': round(row[7] or 0, 1),
         })
 
     # Last 7 days of daily costs
     daily_costs_7d = []
     for row in cost_rows:
         daily_costs_7d.append({
-            'date': row[0],
-            'import_kwh': round(row[1] or 0, 2), 'export_kwh': round(row[2] or 0, 2),
-            'import_cost': round(row[3] or 0, 2), 'export_credit': round(row[4] or 0, 2),
-            'on_peak_kwh': round(row[5] or 0, 2), 'off_peak_kwh': round(row[6] or 0, 2),
-            'super_off_peak_kwh': round(row[7] or 0, 2),
+            'Date': row[0],
+            'Grid Import (kWh)': round(row[1] or 0, 2),
+            'Grid Export (kWh)': round(row[2] or 0, 2),
+            'Import Cost ($)': round(row[3] or 0, 2),
+            'Export Credit ($)': round(row[4] or 0, 2),
+            'On-Peak Net (kWh)': round(row[5] or 0, 2),
+            'Off-Peak Net (kWh)': round(row[6] or 0, 2),
+            'Super Off-Peak Net (kWh)': round(row[7] or 0, 2),
         })
 
-    # Rule summaries
-    rule_summaries = []
+    # Rules as natural-language strings (prevents JSON leakage in recommendations)
+    _DAY_NAMES = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    _MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    _MODE_LABELS = {
+        'self_consumption': 'Self-Powered mode',
+        'autonomous': 'Time-Based Control mode',
+        'backup': 'Backup mode',
+    }
+    _EXPORT_LABELS = {
+        'battery_ok': 'active battery export enabled',
+        'pv_only': 'battery export disabled (solar-only export)',
+    }
+
+    def _fmt_days(days):
+        if set(days) == {0, 1, 2, 3, 4, 5, 6}:
+            return 'Every day'
+        if set(days) == {0, 1, 2, 3, 4}:
+            return 'Weekdays'
+        if set(days) == {5, 6}:
+            return 'Weekends'
+        if set(days) == {0, 1, 2, 3, 4, 6}:
+            return 'Mon-Fri and Sun'
+        return ', '.join(_DAY_NAMES[d] for d in sorted(days))
+
+    def _fmt_months(months):
+        s = set(months)
+        if s == set(range(1, 13)):
+            return 'All year'
+        if s == {6, 7, 8, 9, 10}:
+            return 'June-October (summer)'
+        if s == {1, 2, 3, 4, 5, 11, 12}:
+            return 'November-May (winter)'
+        # Check for contiguous range
+        sorted_m = sorted(s)
+        if sorted_m == list(range(sorted_m[0], sorted_m[-1] + 1)):
+            return f'{_MONTH_NAMES[sorted_m[0]-1]}-{_MONTH_NAMES[sorted_m[-1]-1]}'
+        return ', '.join(_MONTH_NAMES[m-1] for m in sorted_m)
+
+    def _fmt_time(h, m):
+        period = 'AM' if h < 12 else 'PM'
+        display_h = h if h <= 12 else h - 12
+        if display_h == 0:
+            display_h = 12
+        return f'{display_h}:{m:02d} {period}'
+
+    rule_descriptions = []
     for r in rules:
-        rule_summaries.append({
-            'name': r['name'], 'enabled': r['enabled'],
-            'days': r['days'], 'months': r['months'],
-            'hour': r['hour'], 'minute': r['minute'],
-            'mode': r['mode'], 'reserve': r['reserve'],
-            'grid_charging': r['grid_charging'], 'grid_export': r['grid_export'],
-        })
+        parts = [f'"{r["name"]}"']
+        parts.append(f'{"ENABLED" if r["enabled"] else "DISABLED"}')
+        parts.append(f'{_fmt_days(r["days"])}, {_fmt_months(r["months"])} at {_fmt_time(r["hour"], r["minute"])}')
+        actions = []
+        if r.get('mode'):
+            actions.append(_MODE_LABELS.get(r['mode'], r['mode']))
+        if r.get('reserve') is not None:
+            actions.append(f'battery reserve {r["reserve"]}%')
+        if r.get('grid_charging') is True:
+            actions.append('grid charging ON')
+        elif r.get('grid_charging') is False:
+            actions.append('grid charging OFF')
+        if r.get('grid_export'):
+            actions.append(_EXPORT_LABELS.get(r['grid_export'], r['grid_export']))
+        if actions:
+            parts.append('→ ' + ', '.join(actions))
+        rule_descriptions.append(' | '.join(parts))
 
     # Prior year monthly summaries
     prior_year_monthly = []
     for row in py_rows:
         prior_year_monthly.append({
-            'month': row[0],
-            'import_kwh': round(row[1] or 0, 1), 'export_kwh': round(row[2] or 0, 1),
-            'import_cost': round(row[3] or 0, 2), 'export_credit': round(row[4] or 0, 2),
-            'on_peak_kwh': round(row[5] or 0, 1), 'off_peak_kwh': round(row[6] or 0, 1),
-            'super_off_peak_kwh': round(row[7] or 0, 1),
+            'Month': row[0],
+            'Grid Import (kWh)': round(row[1] or 0, 1),
+            'Grid Export (kWh)': round(row[2] or 0, 1),
+            'Import Cost ($)': round(row[3] or 0, 2),
+            'Export Credit ($)': round(row[4] or 0, 2),
+            'On-Peak Net (kWh)': round(row[5] or 0, 1),
+            'Off-Peak Net (kWh)': round(row[6] or 0, 1),
+            'Super Off-Peak Net (kWh)': round(row[7] or 0, 1),
         })
 
     # Rule-based insights for additional context
@@ -3553,37 +4953,37 @@ def _build_ai_context():
         live_snapshot = dict(_live)
 
     return json.dumps({
-        'current_date': today.isoformat(),
-        'current_season': 'summer' if is_summer else 'winter',
-        'next_season_change': 'June 1' if not is_summer else 'November 1',
-        'days_until_trueup': days_until_trueup,
-        'battery_capacity_kwh': 40.5,
-        'powerwall_count': 3,
-        'rates': {k: v for k, v in rates.items()},
-        'upcoming_holidays': holidays,
-        'rules': rule_summaries,
-        'rule_based_insights': [{'title': i['title'], 'action': i['action']} for i in rule_insights],
-        'trueup_projection_table': baseline_md,
-        'optimized_projection_table': optimized_md,
-        'prior_year_monthly': prior_year_monthly,
-        'prior_year_note': _build_prior_year_note(rules, prior_year, now.year),
-        'current_year_monthly': current_year_monthly,
-        'daily_costs_last_7d': daily_costs_7d,
-        'readings_last_7d': sampled,
-        'live_now': {
-            'battery_pct': round(live_snapshot.get('battery_pct', 0), 1),
-            'solar_w': round(live_snapshot.get('solar_w', 0)),
-            'home_w': round(live_snapshot.get('home_w', 0)),
-            'grid_w': round(live_snapshot.get('grid_w', 0)),
-            'mode': live_snapshot.get('mode', 'unknown'),
+        "Today's Date": today.isoformat(),
+        'Current Season': 'summer' if is_summer else 'winter',
+        'Next Season Change': 'June 1' if not is_summer else 'November 1',
+        'Days Until True-Up': days_until_trueup,
+        'Battery Capacity (kWh)': 40.5,
+        'Powerwall Count': 3,
+        'SDG&E Rates': {k: v for k, v in rates.items()},
+        'Upcoming Holidays': holidays,
+        'Rules': rule_descriptions,
+        'Rule-Based Findings': [{'Title': i['title'], 'Action': i['action']} for i in rule_insights],
+        'True-Up Projection Table': baseline_md,
+        'Optimized Projection Table': optimized_md,
+        'Prior Year Monthly Summary': prior_year_monthly,
+        'Prior Year Note': _build_prior_year_note(rules, prior_year, now.year),
+        'Current Year Monthly Summary': current_year_monthly,
+        'Daily Costs (Last 7 Days)': daily_costs_7d,
+        'Power Readings (Last 7 Days, 3-hourly samples)': sampled,
+        'Current State': {
+            'Battery Level (%)': round(live_snapshot.get('battery_pct', 0), 1),
+            'Solar (W)': round(live_snapshot.get('solar_w', 0)),
+            'Home Load (W)': round(live_snapshot.get('home_w', 0)),
+            'Grid (W)': round(live_snapshot.get('grid_w', 0)),
+            'Mode': _MODE_LABELS.get(live_snapshot.get('mode', ''), live_snapshot.get('mode', 'unknown')),
         },
-        'data_quality': projection_meta,
+        'Data Quality Notes': projection_meta,
     }, indent=None, default=str), baseline_md, optimized_md
 
 
 _ai_cache = {'text': None, 'model': None, 'ts': 0, 'table': None}
 
-_AI_CACHE_TTL = 300  # 5 minutes
+_AI_CACHE_TTL = 1800  # 30 minutes
 
 
 @app.route('/api/rules/ai-insights', methods=['POST'])
@@ -3606,7 +5006,11 @@ def api_rules_ai_insights():
         payload = {
             'system_instruction': {'parts': [{'text': system_prompt}]},
             'contents': [{'parts': [{'text': f'Here is the current home energy data:\n\n{context}'}]}],
-            'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 65536},
+            'generationConfig': {
+                'temperature': 0.2,
+                'maxOutputTokens': 65536,
+                'thinkingConfig': {'thinkingBudget': 0},
+            },
         }
         resp = _requests.post(url, json=payload, timeout=300)
         resp.raise_for_status()
@@ -3659,7 +5063,11 @@ def api_rules_ai_insights_debug():
     payload = {
         'system_instruction': {'parts': [{'text': system_prompt}]},
         'contents': [{'parts': [{'text': user_msg}]}],
-        'generationConfig': {'temperature': 0.2, 'maxOutputTokens': 65536},
+        'generationConfig': {
+            'temperature': 0.2,
+            'maxOutputTokens': 65536,
+            'thinkingConfig': {'thinkingBudget': 0},
+        },
     }
 
     try:
@@ -4023,6 +5431,7 @@ def api_debug_nest_devices():
             'type': d.get('type', ''),
             'name': d.get('name', ''),
             'customName': traits.get('sdm.devices.traits.Info', {}).get('customName', ''),
+            'parentRelations': d.get('parentRelations', []),
             'traits': list(traits.keys()),
             'has_clip_preview': 'sdm.devices.traits.CameraClipPreview' in traits,
             'has_event_image': 'sdm.devices.traits.CameraEventImage' in traits,
@@ -4032,6 +5441,8 @@ def api_debug_nest_devices():
     return jsonify({
         'devices': summary,
         'event_counters': _nest_event_counters,
+        'snapshot_stats': _nest_snapshot_stats,
+        'poll_stats': _nest_poll_stats,
     })
 
 
@@ -4098,6 +5509,249 @@ def api_debug_nest_media_stats():
 def api_nest_media(filename):
     """Serve Nest MP4 clips. Path: YYYY-MM-DD/file.mp4"""
     return send_from_directory(NEST_MEDIA_DIR, filename, mimetype='video/mp4')
+
+
+# ── Switches drawer endpoints ────────────────────────────────────────────────
+@app.route('/api/switches')
+def api_switches():
+    """Merged list of all switches across providers, with metadata + live state."""
+    return jsonify(_get_all_switches())
+
+
+@app.route('/api/switches/toggle', methods=['POST'])
+def api_switches_toggle():
+    data = request.get_json(silent=True) or {}
+    rid  = data.get('id')
+    if rid is None:
+        return jsonify({'error': 'id required'}), 400
+    res = switch_toggle(int(rid))
+    if 'error' in res:
+        return jsonify({'error': res['error']}), res.get('code', 500)
+    return jsonify(res)
+
+
+@app.route('/api/switches/set', methods=['POST'])
+def api_switches_set():
+    data = request.get_json(silent=True) or {}
+    rid  = data.get('id')
+    on   = data.get('on')
+    if rid is None or not isinstance(on, bool):
+        return jsonify({'error': 'id and on (bool) required'}), 400
+    res = switch_set_state(int(rid), on)
+    if 'error' in res:
+        return jsonify({'error': res['error']}), res.get('code', 500)
+    return jsonify(res)
+
+
+@app.route('/api/switches/thermostat', methods=['POST'])
+def api_switches_thermostat():
+    """Update thermostat mode and/or setpoint(s). Payload:
+       { id, mode?, setpoint_f?, setpoint_heat_f?, setpoint_cool_f? }"""
+    data = request.get_json(silent=True) or {}
+    rid  = data.get('id')
+    if rid is None:
+        return jsonify({'error': 'id required'}), 400
+    fields = {}
+    if 'mode' in data and data['mode'] is not None:
+        fields['mode'] = str(data['mode']).upper()
+    for k in ('setpoint_f', 'setpoint_heat_f', 'setpoint_cool_f'):
+        if k in data and data[k] is not None:
+            try:
+                fields[k] = float(data[k])
+            except (TypeError, ValueError):
+                return jsonify({'error': f'{k} must be numeric'}), 400
+    if not fields:
+        return jsonify({'error': 'no fields to set'}), 400
+    res = switch_set_thermostat(int(rid), **fields)
+    if 'error' in res:
+        return jsonify({'error': res['error']}), res.get('code', 500)
+    return jsonify(res)
+
+
+@app.route('/api/debug/nest/thermostats')
+def api_debug_nest_thermostats():
+    """Dump thermostat cache + raw SDM traits."""
+    if request.args.get('refresh') == '1':
+        token = _nest_ensure_token()
+        if token:
+            _nest_refresh_devices(token)
+    return jsonify({
+        'enabled':     get_setting_bool('nest_enabled', False),
+        'count':       len(_nest_thermostats),
+        'thermostats': _nest_thermostats,
+    })
+
+
+@app.route('/api/switches/brightness', methods=['POST'])
+def api_switches_brightness():
+    data = request.get_json(silent=True) or {}
+    rid = data.get('id')
+    b   = data.get('brightness')
+    if rid is None or b is None:
+        return jsonify({'error': 'id and brightness required'}), 400
+    try:
+        b = int(b)
+    except (TypeError, ValueError):
+        return jsonify({'error': 'brightness must be int'}), 400
+    res = switch_set_brightness(int(rid), b)
+    if 'error' in res:
+        return jsonify({'error': res['error']}), res.get('code', 500)
+    return jsonify(res)
+
+
+@app.route('/api/switches/<int:rid>', methods=['PUT'])
+def api_switches_update(rid):
+    data = request.get_json(silent=True) or {}
+    res  = switch_update_meta(rid, data)
+    if 'error' in res:
+        return jsonify({'error': res['error']}), res.get('code', 500)
+    return jsonify(res)
+
+
+@app.route('/api/switches/alarm/arm-home', methods=['POST'])
+def api_switches_alarm_arm_home():
+    """Arm Abode to Home mode. Body: {id} — id is the alarm row in switches_meta
+    (used to validate the row exists + fetch friendly name for the event log)."""
+    data = request.get_json(silent=True) or {}
+    rid  = data.get('id')
+    if rid is None:
+        return jsonify({'error': 'id required'}), 400
+    row = _switches_lookup(int(rid))
+    if row is None:
+        return jsonify({'error': 'not found'}), 404
+    _, provider, ext_id, kind, name = row
+    if provider != 'abode' or kind != 'alarm':
+        return jsonify({'error': 'not an abode alarm row'}), 400
+    try:
+        new_mode = abode_arm_home()
+        _switches_log_event('abode', 'alarm_armed', name,
+                            detail=f'mode={new_mode}')
+        return jsonify({'ok': True, 'mode': new_mode})
+    except Exception as exc:
+        _switches_log_event('abode', 'error', f'{name}: arm failed',
+                            str(exc), 'failed')
+        return jsonify({'error': str(exc)}), 500
+
+
+@app.route('/api/switches/rediscover', methods=['POST'])
+def api_switches_rediscover():
+    counts = _switches_rediscover_all()
+    return jsonify({'ok': True, 'counts': counts})
+
+
+@app.route('/alexa/auth', methods=['POST'])
+def api_alexa_auth():
+    """Start or resume Alexa login. Returns status + whether OTP is needed."""
+    try:
+        status = asyncio.run(_alexa_login_start_async())
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    # logged_in (via test_loggedin()) is authoritative — alexapy's status
+    # dict only sets login_successful in one specific code path.
+    success   = bool(status.get('logged_in') or status.get('login_successful'))
+    needs_otp = bool(status.get('securitycode_required'))
+    needs_cap = bool(status.get('captcha_required'))
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)',
+                  ('alexa_otp_pending', '1' if needs_otp else '0'))
+    resp = {
+        'ok':        success,
+        'needs_otp': needs_otp,
+        'status':    status,
+    }
+    if needs_cap:
+        resp['needs_captcha'] = True
+        resp['captcha_url']   = status.get('captcha_image_url')
+    if not success and not needs_otp and not needs_cap:
+        # Silent failure — include a hint for debugging
+        resp['hint'] = ('Login did not complete. Check server logs + '
+                        'alexa_state/*.html for what Amazon returned.')
+    return jsonify(resp)
+
+
+@app.route('/alexa/otp', methods=['POST'])
+def api_alexa_otp():
+    """Submit OTP to complete login."""
+    data = request.get_json(silent=True) or {}
+    otp  = (data.get('otp') or '').strip()
+    if not otp:
+        return jsonify({'error': 'otp required'}), 400
+    try:
+        status = asyncio.run(_alexa_login_submit_otp_async(otp))
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    success   = bool(status.get('logged_in') or status.get('login_successful'))
+    needs_otp = bool(status.get('securitycode_required'))
+    with sqlite3.connect(DB_PATH) as c:
+        c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)',
+                  ('alexa_otp_pending', '1' if needs_otp else '0'))
+    return jsonify({
+        'ok':        success,
+        'needs_otp': needs_otp,
+        'status':    status,
+    })
+
+
+@app.route('/api/debug/alexa')
+def api_debug_alexa():
+    """Dump Alexa state: login status, routine cache, any cached plugs."""
+    status = _alexa_status_dict(_alexa_login)
+    return jsonify({
+        'enabled':       get_setting_bool('alexa_enabled', False),
+        'logged_in':     bool(status.get('login_successful')),
+        'otp_pending':   bool(status.get('securitycode_required')),
+        'status':        status,
+        'routine_count': len(_alexa_routines),
+        'routines':      _alexa_routines,
+        'devices':       _alexa_devices,
+    })
+
+
+@app.route('/api/debug/tuya')
+def api_debug_tuya():
+    """Dump Tuya cache + indicate if devices.json was found.
+    Pass ?probe=1 to also call status() on each device and return raw DPs —
+    lets us see multi-outlet strips (DP 1/2/3/... each = one outlet)."""
+    have_file = os.path.exists(_TUYA_DEVICEFILE)
+    if request.args.get('refresh') == '1':
+        count = _tuya_refresh_devices()
+    else:
+        count = len(_tuya_devices)
+    probe = request.args.get('probe') == '1'
+    out = {}
+    for k, v in _tuya_devices.items():
+        entry = {**v, 'local_key': '***'}
+        if probe and v.get('ip'):
+            try:
+                dev = _tuya_make_outlet(k, v)
+                status = dev.status()
+                entry['probe'] = status.get('dps') if isinstance(status, dict) else status
+            except Exception as exc:
+                entry['probe_error'] = str(exc)
+        out[k] = entry
+    return jsonify({
+        'enabled':         get_setting_bool('tuya_enabled', False),
+        'has_devicefile':  have_file,
+        'devicefile_path': _TUYA_DEVICEFILE,
+        'count':           count,
+        'age_s':           int(time.time() - _tuya_ts) if _tuya_ts else None,
+        'devices':         out,
+    })
+
+
+@app.route('/api/debug/kasa')
+def api_debug_kasa():
+    """Dump current Kasa cache + optionally trigger a fresh discovery."""
+    if request.args.get('refresh') == '1':
+        n = _kasa_refresh_devices()
+    else:
+        n = len(_kasa_devices)
+    return jsonify({
+        'enabled': get_setting_bool('kasa_enabled', False),
+        'count':   n,
+        'age_s':   int(time.time() - _kasa_ts) if _kasa_ts else None,
+        'devices': _kasa_devices,
+    })
 
 
 # ── Event Log endpoint ────────────────────────────────────────────────────────
@@ -4235,6 +5889,43 @@ def api_settings():
             ],
         },
         {
+            'key': 'kasa',
+            'label': 'Kasa Smart Plugs (LAN)',
+            'type': 'continuous',
+            'enabled_key': 'kasa_enabled',
+            'intervals': [
+                {'key': 'kasa_poll_interval', 'label': 'State poll', 'unit': 's'},
+            ],
+        },
+        {
+            'key': 'nest_thermostat',
+            'label': 'Nest Thermostat (SDM)',
+            'type': 'on-demand',
+            'enabled_key': 'nest_thermostat_enabled',
+            'intervals': [],
+        },
+        {
+            'key': 'tuya',
+            'label': 'Tuya / Smart Life (LAN)',
+            'type': 'continuous',
+            'enabled_key': 'tuya_enabled',
+            'intervals': [
+                {'key': 'tuya_poll_interval', 'label': 'State poll', 'unit': 's'},
+            ],
+        },
+        {
+            'key': 'alexa',
+            'label': 'Alexa Routines',
+            'type': 'on-demand',
+            'enabled_key': 'alexa_enabled',
+            'intervals': [
+                {'key': 'alexa_email',         'label': 'Amazon email',    'unit': 'text'},
+                {'key': 'alexa_password',      'label': 'Amazon password', 'unit': 'password'},
+                {'key': 'alexa_url',           'label': 'Amazon URL',      'unit': 'text'},
+                {'key': 'alexa_poll_interval', 'label': 'Refresh poll',    'unit': 's'},
+            ],
+        },
+        {
             'key': 'maintenance',
             'label': 'Maintenance',
             'type': 'scheduled',
@@ -4260,7 +5951,8 @@ def api_settings():
             'type': 'configurable',
             'intervals': [
                 {'key': 'gemini_api_key', 'label': 'API Key', 'unit': 'text'},
-                {'key': 'gemini_model', 'label': 'Model', 'unit': 'text'},
+                {'key': 'gemini_model', 'label': 'Model', 'unit': 'select',
+                 'options': ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash']},
             ],
         },
         {
@@ -4332,6 +6024,19 @@ def _start():
     init_db()
     _backfill_rates_event_url()
     backfill_history()
+    # Seed switches_meta with known pool circuits on startup so tiles appear
+    # without requiring a manual rediscover. Kasa/Alexa discovery is driven
+    # by their enabled flag in the poller loop.
+    if get_setting_bool('pool_enabled', True):
+        try:
+            _pool_discover_circuits()
+        except Exception as exc:
+            print(f'Pool circuit seed error: {exc}')
+    if get_setting_bool('abode_enabled', True):
+        try:
+            _abode_seed_alarm_row()
+        except Exception as exc:
+            print(f'Abode alarm seed error: {exc}')
     threading.Thread(target=rebuild_daily_costs, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     start_abode_listener()

@@ -8,6 +8,7 @@ export type PageName = 'dashboard' | 'events' | 'rules' | 'costs' | 'settings';
 interface NavProps {
   activePage: PageName;
   onPageChange: (page: PageName) => void;
+  onOpenSwitches?: () => void;
 }
 
 const PAGES: { key: PageName; label: string; sparkle?: boolean }[] = [
@@ -49,7 +50,7 @@ function aqiColor(aqi: number): string {
   return '#e05252';
 }
 
-export default function Nav({ activePage, onPageChange }: NavProps) {
+export default function Nav({ activePage, onPageChange, onOpenSwitches }: NavProps) {
   const [isLight, setIsLight] = useState(false);
   const [clock, setClock] = useState('');
   const [wx, setWx] = useState<{ icon: string; temp: string; aqi: number | null }>({
@@ -132,6 +133,16 @@ export default function Nav({ activePage, onPageChange }: NavProps) {
           <span className="nav-aqi" style={{ color: aqiColor(wx.aqi) }}>
             AQI {wx.aqi}
           </span>
+        )}
+        {onOpenSwitches && (
+          <button
+            className="nav-switches-btn"
+            onClick={onOpenSwitches}
+            aria-label="Switches"
+            title="Switches"
+          >
+            &#x29BF;
+          </button>
         )}
         <button className="theme-btn" onClick={toggleTheme}>
           {isLight ? 'Dark' : 'Light'}

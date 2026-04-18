@@ -1,1 +1,4 @@
 .env
+devices.json
+tuya-raw.json
+alexa_state/

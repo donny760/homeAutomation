@@ -4,3 +4,6 @@ screenlogicpy
 pdfplumber
 requests
 python-dotenv
+python-kasa
+alexapy
+tinytuya

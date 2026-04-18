@@ -7,9 +7,11 @@ import EventLog from '@/components/EventLog';
 import Rules from '@/components/Rules';
 import EnergyCosts from '@/components/EnergyCosts';
 import Settings from '@/components/Settings';
+import SwitchesDrawer from '@/components/SwitchesDrawer';
 
 export default function Home() {
   const [activePage, setActivePage] = useState<PageName>('dashboard');
+  const [switchesOpen, setSwitchesOpen] = useState(false);
 
   useEffect(() => {
     // Restore page from URL hash on initial load
@@ -35,12 +37,17 @@ export default function Home() {
 
   return (
     <>
-      <Nav activePage={activePage} onPageChange={handlePageChange} />
+      <Nav
+        activePage={activePage}
+        onPageChange={handlePageChange}
+        onOpenSwitches={() => setSwitchesOpen(true)}
+      />
       {activePage === 'dashboard' && <Dashboard />}
       {activePage === 'events' && <EventLog isActive={activePage === 'events'} />}
       {activePage === 'rules' && <Rules isActive={activePage === 'rules'} />}
       {activePage === 'costs' && <EnergyCosts isActive={activePage === 'costs'} />}
       {activePage === 'settings' && <Settings isActive={activePage === 'settings'} />}
+      <SwitchesDrawer open={switchesOpen} onClose={() => setSwitchesOpen(false)} />
     </>
   );
 }

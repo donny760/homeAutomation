@@ -102212,3 +102212,8 @@ abodepy.exceptions.AbodeAuthenticationException: <html>
 2026-04-14 04:59:20  INFO      127.0.0.1 - - [14/Apr/2026 04:59:20] "GET /api/pool HTTP/1.1" 200 -
 2026-04-14 04:59:21  INFO      127.0.0.1 - - [14/Apr/2026 04:59:21] "GET /api/events?limit=50&offset=0&start=1775545200&end=1776236399 HTTP/1.1" 200 -
 2026-04-14 04:59:25  INFO      127.0.0.1 - - [14/Apr/2026 04:59:25] "GET /api/events?limit=50&offset=0&start=1775545200&end=1776236399&system=nest HTTP/1.1" 200 -
+2026-04-16 06:17:44  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-16 06:17:44  INFO      [33mPress CTRL+C to quit[0m
