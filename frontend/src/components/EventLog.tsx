@@ -33,11 +33,13 @@ const SYSTEM_META: Record<string, { icon: string; label: string; color: string }
   rates: { icon: '\ud83d\udcb2', label: 'Rates', color: 'var(--amber)' },
   holidays: { icon: '\ud83d\udcc5', label: 'Holidays', color: 'var(--amber)' },
   system: { icon: '\u2699\ufe0f', label: 'System', color: 'var(--gray)' },
+  home_control: { icon: '\ud83c\udfe0', label: 'Home Control', color: 'var(--purple)' },
 };
 
 const FILTERS: { key: string; label: string }[] = [
   { key: 'all', label: 'All' },
   { key: 'powerwall', label: '\u26a1 Powerwall' },
+  { key: 'home_control', label: '\ud83c\udfe0 Home Control' },
   { key: 'rachio', label: '\ud83c\udf3f Rachio/Sprinklers' },
   { key: 'abode', label: '\ud83d\udd12 Abode' },
   { key: 'pool', label: '\ud83c\udfca Pool' },

@@ -186,10 +186,43 @@ body {
 .auto-title   { font-size: 0.82rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.09em; }
 .auto-updated { font-size: 0.72rem; color: var(--very-dim); }
 .auto-list    { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; padding: 0 6px 12px 14px; }
-.auto-list::-webkit-scrollbar          { width: 10px; }
-.auto-list::-webkit-scrollbar-track    { background: transparent; }
-.auto-list::-webkit-scrollbar-thumb    { background: #4a4a50; border-radius: 5px; }
-.auto-list::-webkit-scrollbar-thumb:hover { background: var(--dim); }
+
+/* ── Shared elegant scrollbar ───────────────────────────────────────────────*/
+.auto-list::-webkit-scrollbar,
+.events-card::-webkit-scrollbar,
+.costs-scroll::-webkit-scrollbar,
+#page-settings::-webkit-scrollbar,
+.insights-scroll::-webkit-scrollbar,
+.rules-table-wrap::-webkit-scrollbar,
+.drawer-body::-webkit-scrollbar,
+.modal::-webkit-scrollbar { width: 10px; }
+
+.auto-list::-webkit-scrollbar-track,
+.events-card::-webkit-scrollbar-track,
+.costs-scroll::-webkit-scrollbar-track,
+#page-settings::-webkit-scrollbar-track,
+.insights-scroll::-webkit-scrollbar-track,
+.rules-table-wrap::-webkit-scrollbar-track,
+.drawer-body::-webkit-scrollbar-track,
+.modal::-webkit-scrollbar-track { background: transparent; }
+
+.auto-list::-webkit-scrollbar-thumb,
+.events-card::-webkit-scrollbar-thumb,
+.costs-scroll::-webkit-scrollbar-thumb,
+#page-settings::-webkit-scrollbar-thumb,
+.insights-scroll::-webkit-scrollbar-thumb,
+.rules-table-wrap::-webkit-scrollbar-thumb,
+.drawer-body::-webkit-scrollbar-thumb,
+.modal::-webkit-scrollbar-thumb { background: #4a4a50; border-radius: 5px; }
+
+.auto-list::-webkit-scrollbar-thumb:hover,
+.events-card::-webkit-scrollbar-thumb:hover,
+.costs-scroll::-webkit-scrollbar-thumb:hover,
+#page-settings::-webkit-scrollbar-thumb:hover,
+.insights-scroll::-webkit-scrollbar-thumb:hover,
+.rules-table-wrap::-webkit-scrollbar-thumb:hover,
+.drawer-body::-webkit-scrollbar-thumb:hover,
+.modal::-webkit-scrollbar-thumb:hover { background: var(--dim); }
 .auto-row {
   display: flex;
   flex-direction: column;

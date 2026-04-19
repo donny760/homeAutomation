@@ -63,6 +63,34 @@ function nextFireForRule(rule: Rule): string {
   return '\u2014';
 }
 
+function fmtTime12(hour: number, minute: number): string {
+  const ampm = hour >= 12 ? 'PM' : 'AM';
+  const h12 = hour % 12 || 12;
+  return `${h12}:${String(minute).padStart(2, '0')} ${ampm}`;
+}
+
+function describeRuleAction(rule: Rule): string {
+  const parts: string[] = [];
+  const mode = rule.mode;
+  if (mode) parts.push(modeLabel(mode) || mode);
+  if (rule.reserve != null) parts.push(`reserve ${rule.reserve}%`);
+  if (rule.grid_charging === true) parts.push('grid charge ON');
+  if (rule.grid_charging === false) parts.push('grid charge OFF');
+  if (rule.grid_export === 'battery_ok') parts.push('battery export');
+  if (rule.grid_export === 'pv_only') parts.push('solar-only export');
+  return parts.length ? parts.join(' · ') : '\u2014';
+}
+
+function todaysFiringRules(rules: Rule[]): Rule[] {
+  const now = new Date();
+  const weekday = (now.getDay() + 6) % 7;  // 0=Mon..6=Sun
+  const month = now.getMonth() + 1;
+  return rules
+    .filter((r) => r.enabled && r.days.includes(weekday) && r.months.includes(month))
+    .slice()
+    .sort((a, b) => (a.hour * 60 + a.minute) - (b.hour * 60 + b.minute));
+}
+
 // ── Thinking animation terms ──
 const THINKING_TERMS = [
   'Rules', 'Rate Schedule', 'Usage Patterns', 'Solar Production',
@@ -102,7 +130,7 @@ export default function Rules({ isActive }: RulesProps) {
   useEffect(() => {
     if (isActive) {
       refreshRules();
-      refreshRates(false);
+      loadRates();
     }
   }, [isActive]);
 
@@ -115,9 +143,8 @@ export default function Rules({ isActive }: RulesProps) {
     }
   }
 
-  async function refreshRates(force: boolean) {
+  async function loadRates() {
     try {
-      if (force) await fetch('/api/rates/refresh', { method: 'POST' });
       const r = await fetch('/api/rates').then((x) => x.json());
       setRates(r);
     } catch (e) { /* leave dashes */ }
@@ -338,9 +365,6 @@ export default function Rules({ isActive }: RulesProps) {
   const periodAccents: Record<string, string> = { on_peak: 'var(--amber)', off_peak: 'var(--green)', super_off_peak: 'var(--blue)' };
   const accentColor = periodAccents[period];
 
-  const rateUpdated = rates?.updated
-    ? 'updated ' + new Date(rates.updated).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
-    : '';
 
   function rateCellClass(cellPeriod: string, cellSeason: string): string {
     const classes: string[] = [];
@@ -370,59 +394,112 @@ export default function Rules({ isActive }: RulesProps) {
 
         {/* Rate card */}
         <div className="rate-card">
-          <div className="rate-card-header">
-            <span className="rate-card-title">SDG&amp;E EV-TOU-2</span>
-            <span className="rate-card-updated">{rateUpdated}</span>
-            <span className="rate-now-badge" style={{ color: accentColor }}>
-              NOW: {periodLabels[period] || '\u2014'}
-            </span>
-          </div>
-          <table className="rate-table">
-            <thead>
-              <tr>
-                <th>Period</th>
-                <th id="rate-th-summer" className={isSummer ? 'rate-season-active' : ''}>Summer</th>
-                <th id="rate-th-winter" className={!isSummer ? 'rate-season-active' : ''}>Winter</th>
-                <th></th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                id="rate-row-on-peak"
-                data-period="on_peak"
-                className={period === 'on_peak' ? 'rate-active' : ''}
-              >
-                <td>On-peak</td>
-                <td className={rateCellClass('on_peak', 'summer')}>{fmt3(rates?.summer_on_peak)}</td>
-                <td className={rateCellClass('on_peak', 'winter')}>{fmt3(rates?.winter_on_peak)}</td>
-                <td>4pm &ndash; 9pm daily</td>
-              </tr>
-              <tr
-                id="rate-row-off-peak"
-                data-period="off_peak"
-                className={period === 'off_peak' ? 'rate-active' : ''}
-              >
-                <td>Off-peak</td>
-                <td className={rateCellClass('off_peak', 'summer')}>{fmt3(rates?.summer_off_peak)}</td>
-                <td className={rateCellClass('off_peak', 'winter')}>{fmt3(rates?.winter_off_peak)}</td>
-                <td>6am &ndash; 4pm, 9pm &ndash; midnight</td>
-              </tr>
-              <tr
-                id="rate-row-super-off-peak"
-                data-period="super_off_peak"
-                className={period === 'super_off_peak' ? 'rate-active' : ''}
-              >
-                <td>Super off-peak</td>
-                <td className={rateCellClass('super_off_peak', 'summer')}>{fmt3(rates?.summer_super_off_peak)}</td>
-                <td className={rateCellClass('super_off_peak', 'winter')}>{fmt3(rates?.winter_super_off_peak)}</td>
-                <td>midnight &ndash; 6am + weekends</td>
-              </tr>
-            </tbody>
-          </table>
-          <div className="rate-card-footer">
-            <button className="rate-refresh-link" onClick={() => refreshRates(true)}>
-              Refresh rates
-            </button>
+          <div style={{ display: 'flex', gap: 16, alignItems: 'flex-start' }}>
+            <div style={{ flex: '1 1 0', minWidth: 0 }}>
+              <div className="rate-card-header">
+                <span className="rate-card-title">SDG&amp;E EV-TOU-2</span>
+                <span className="rate-now-badge" style={{ color: accentColor }}>
+                  NOW: {periodLabels[period] || '\u2014'}
+                </span>
+              </div>
+              <table className="rate-table">
+              <thead>
+                <tr>
+                  <th>Period</th>
+                  <th id="rate-th-summer" className={isSummer ? 'rate-season-active' : ''}>Summer</th>
+                  <th id="rate-th-winter" className={!isSummer ? 'rate-season-active' : ''}>Winter</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr
+                  id="rate-row-on-peak"
+                  data-period="on_peak"
+                  className={period === 'on_peak' ? 'rate-active' : ''}
+                >
+                  <td>On-peak</td>
+                  <td className={rateCellClass('on_peak', 'summer')}>{fmt3(rates?.summer_on_peak)}</td>
+                  <td className={rateCellClass('on_peak', 'winter')}>{fmt3(rates?.winter_on_peak)}</td>
+                  <td>4pm &ndash; 9pm daily</td>
+                </tr>
+                <tr
+                  id="rate-row-off-peak"
+                  data-period="off_peak"
+                  className={period === 'off_peak' ? 'rate-active' : ''}
+                >
+                  <td>Off-peak</td>
+                  <td className={rateCellClass('off_peak', 'summer')}>{fmt3(rates?.summer_off_peak)}</td>
+                  <td className={rateCellClass('off_peak', 'winter')}>{fmt3(rates?.winter_off_peak)}</td>
+                  <td>6am &ndash; 4pm, 9pm &ndash; midnight</td>
+                </tr>
+                <tr
+                  id="rate-row-super-off-peak"
+                  data-period="super_off_peak"
+                  className={period === 'super_off_peak' ? 'rate-active' : ''}
+                >
+                  <td>Super off-peak</td>
+                  <td className={rateCellClass('super_off_peak', 'summer')}>{fmt3(rates?.summer_super_off_peak)}</td>
+                  <td className={rateCellClass('super_off_peak', 'winter')}>{fmt3(rates?.winter_super_off_peak)}</td>
+                  <td>midnight &ndash; 6am + weekends</td>
+                </tr>
+              </tbody>
+            </table>
+            </div>
+
+            {/* Today's firing actions (embedded right side) */}
+            <div style={{ flex: '0 0 400px', borderLeft: '0.5px solid var(--border)', paddingLeft: 14 }}>
+              <div style={{ marginBottom: 4 }}>
+                <span style={{ color: 'var(--dim)', textTransform: 'uppercase', letterSpacing: '0.07em', fontSize: '0.75rem' }}>
+                  Today&apos;s Actions
+                </span>
+              </div>
+              {(() => {
+                const firing = todaysFiringRules(rules);
+                if (firing.length === 0) {
+                  return (
+                    <div style={{ color: 'var(--very-dim)', fontSize: '0.78rem', padding: '4px 0' }}>
+                      No rules fire today.
+                    </div>
+                  );
+                }
+                const now = new Date();
+                const nowMin = now.getHours() * 60 + now.getMinutes();
+                // Find index of the most recent rule whose time has already passed
+                let activeIdx = -1;
+                firing.forEach((r, i) => {
+                  if (r.hour * 60 + r.minute <= nowMin) activeIdx = i;
+                });
+                return (
+                  <table className="rate-table">
+                    <tbody>
+                      {firing.map((r, i) => {
+                        const isActive = i === activeIdx;
+                        return (
+                          <tr key={r.id}>
+                            <td style={{
+                              whiteSpace: 'nowrap',
+                              width: '70px',
+                              borderLeft: isActive ? '2px solid var(--purple, #A87CFF)' : undefined,
+                              color: isActive ? 'var(--text)' : undefined,
+                              fontWeight: isActive ? 600 : undefined,
+                            }}>
+                              {fmtTime12(r.hour, r.minute)}
+                            </td>
+                            <td style={{
+                              color: isActive ? 'var(--text)' : 'var(--dim)',
+                              fontSize: '0.78rem',
+                              fontWeight: isActive ? 600 : undefined,
+                            }}>
+                              {describeRuleAction(r)}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                );
+              })()}
+            </div>
           </div>
         </div>
 

@@ -3467,14 +3467,24 @@ def _switches_lookup(row_id: int):
     return row  # (id, provider, external_id, kind, name) or None
 
 
-def _switches_log_event(system: str, event_type: str, title: str, detail: str = None,
+def _switches_log_event(provider: str, event_type: str, title: str, detail: str = None,
                         result: str = 'ok') -> None:
+    """Log a drawer-initiated action. All entries go under system='home_control'
+    so the Event Log can filter them as one group. The provider (kasa / pool /
+    nest / abode / tuya) is preserved in the detail field so you still know
+    which integration drove the change."""
+    provider_label = (provider or '').strip()
+    prefixed_detail = detail
+    if provider_label:
+        tag = f'[{provider_label}]'
+        prefixed_detail = tag if not detail else f'{tag} {detail}'
     try:
         with sqlite3.connect(DB_PATH) as c:
             c.execute(
                 'INSERT INTO event_log (ts, system, event_type, title, detail, result, source) '
                 'VALUES (?,?,?,?,?,?,?)',
-                (int(time.time()), system, event_type, title, detail, result, 'ui')
+                (int(time.time()), 'home_control', event_type, title,
+                 prefixed_detail, result, 'ui')
             )
     except Exception as exc:
         print(f'Switch event log error: {exc}')
@@ -4121,20 +4131,19 @@ You are an energy optimization advisor for a specific home in San Diego, CA.
 
 ## System
 - 3× Tesla Powerwall 2 (40.5 kWh total usable capacity, ~90% round-trip efficiency)
-- Rooftop solar — production varies seasonally (San Diego: ~10–14 kWh/day winter,
-  ~22–30 kWh/day summer due to longer daylight hours June–October)
+- Rooftop solar — production varies seasonally (summer months have longer daylight
+  and higher production than winter months)
 - SDG&E EV-TOU-2 rate plan — use the EXACT rate values from the rates object in
   the provided data, never guess or use generic values
 - Annual true-up in January
-- IMPORTANT: SDG&E does NOT pay out excess true-up credits — they pay close to nothing.
-  The homeowner's goal is to land near net-zero with a small credit buffer ($100–$500).
-  Overproducing credits is wasted energy. The current rules were intentionally tuned to
-  be conservative on exports, but the additional grid import from overnight charging
-  wasn't fully accounted for, resulting in the current projected deficit.
-  Recommendations should close that gap without overshooting into excessive credits.
-- Location: San Diego — mild winters, long sunny summers. June–October daylight runs
-  ~13–14 hours vs ~10 hours in winter, meaning significantly more solar production
-  and longer afternoon export windows
+- IMPORTANT: SDG&E does NOT pay out excess true-up credits at a meaningful rate.
+  The homeowner's goal is to land in a small credit range ($100–$500 credit).
+  **Overproducing credits is wasted energy** — do not recommend maximizing exports.
+  The strategy is a balance: capture enough on-peak credit to offset winter imports,
+  while preserving battery for post-sunset self-consumption to avoid expensive
+  grid imports during the remaining evening hours.
+- Location: San Diego — mild winters, long sunny summers. Use actual rule times
+  and rate period boundaries from the data; do not hardcode specific times.
 
 ## Data conventions — read carefully
 - Battery (W): positive = charging, negative = discharging
@@ -4176,42 +4185,32 @@ IMPORTANT: grid_export = battery_ok means ACTIVE continuous battery discharge to
 at up to ~15 kW combined (3× Powerwall). At 1% reserve, nearly the full 40.5 kWh
 is available to export. This is NOT passive solar overflow.
 
-The design principles behind the rules (read the actual rules data for specific times):
+The rules are the homeowner's deliberate automation design. Your job is to understand
+what they do by reading the rules array — not to assume what they "should" do. Read
+rules in firing order (by hour/minute within each day-type) to understand daily behavior.
 
-- The system is tuned so the home NEVER buys expensive grid power. Every kWh comes
-  from either super off-peak grid (cheapest), solar (free), or battery (charged from
-  cheap sources).
-- Overnight: home runs on grid at super off-peak. There is NO solar before ~6:30 AM
-  in San Diego. Do NOT describe any pre-dawn hours as "solar time."
-- Daytime (Self-Powered mode): solar does the heavy lifting — powers home, charges
-  battery to 100%, exports excess. Grid is barely touched.
-- Battery export starts around sunset when solar drops off. Before sunset, solar is
-  still producing and covering everything for free.
-- Export stops before the battery is fully drained — enough reserve is kept to power
-  the home through to midnight, avoiding expensive grid imports. At midnight, grid
-  takes over again at super off-peak.
-- If the true-up shows a deficit, it means super off-peak imports exceed total exports.
-  The fix is to INCREASE EXPORTS, not decrease imports — imports are already at the
-  cheapest rates possible.
-- When evaluating export timing: once the battery reaches 100% and solar is still
-  producing, the battery is idle. Starting active battery export at that point would
-  not reduce solar benefit because solar is already covering the home. Analyze the
-  hourly readings to find when this window occurs and whether earlier export could
-  close the deficit gap. Show the tradeoff with actual numbers.
+INFER the homeowner's strategy from the rules — do not impose a strategy. Common
+patterns you may see:
+- Passive solar overflow during on-peak daytime hours (battery full, solar exporting
+  excess) — this already captures on-peak credit without draining the battery.
+- Active battery export scheduled for the window when solar is insufficient to cover
+  home load but on-peak rates still apply — preserves battery for part of the day.
+- Battery reserved for post-on-peak self-consumption to avoid evening grid imports.
+- Grid charging during super off-peak hours to replenish the battery.
 
-## Prior year data — critical for projections
-The `prior_year_monthly` array contains ACTUAL monthly performance from the previous
-year. This is real measured data from the same house, same solar panels, same location.
-It reflects real San Diego solar production, weather patterns, and consumption by month.
+These are all valid design choices. A battery sitting idle during on-peak hours is
+NOT automatically a problem — it may be intentional passive-export mode or reserved
+for later self-consumption. Verify the actual flow before suggesting otherwise.
 
-IMPORTANT: The prior year used a DIFFERENT automation strategy (Time-Based Control —
-Tesla's automatic algorithm). The current year uses custom rules that deliberately
-import more during super off-peak (grid charging) to build up battery for on-peak
-export. This means:
-- Winter months will show HIGHER imports in the current year (by design)
-- Summer months should show HIGHER export credits (the payoff)
-- Do NOT extrapolate from the most recent month to project summer — summer and
-  winter behave fundamentally differently in San Diego
+## Prior year data — context for projections
+The `Prior Year Monthly Summary` contains ACTUAL monthly performance from the previous
+year. Real measured data from the same house, same solar panels, same location.
+
+Prior year behavior reflects a DIFFERENT automation strategy (Tesla's Time-Based Control
+algorithm). Current year uses custom rules — the behavior may differ. Compare thoughtfully,
+but do not assume current-year patterns will match prior-year patterns for projected
+months. Summer and winter behave differently; do not extrapolate from the most recent
+month alone.
 
 ## Your analysis — cover all four areas:
 
@@ -4225,10 +4224,15 @@ DO NOT output a markdown table of the projection numbers.
 Instead, reference the numbers directly in your analysis (e.g., "June shows -$234 credit").
 
 Analyze:
-- Is the full-year net positive (owe SDG&E) or negative (credit)?
+- Report the full-year projected Net with correct sign interpretation (positive = deficit,
+  negative = credit).
+- **If Net is between -$500 and -$100 (projected credit in the $100-$500 target range),
+  explicitly state "the projection is within target" and do NOT frame this as a problem
+  requiring intervention.**
+- If Net is outside target (overshoot >$500 credit, undershoot <$100 credit, or deficit),
+  identify the main drivers.
 - Which months drive the most credit? Which are the biggest costs?
-- Is the current trajectory on track for net-zero or net-credit at true-up?
-- What is the biggest risk to the projection?
+- Flag real risks (data quality issues, unusual month patterns) — not hypothetical ones.
 
 The table MUST appear before any rule change recommendations.
 
@@ -4241,38 +4245,39 @@ Based on the current season and when the next season starts:
 - What rule changes should be made BEFORE the transition?
 - Address the battery export window timing given longer summer daylight hours
 
-**3. Rule optimization**
-Review the current rules against actual usage patterns. Focus on:
-- Is the battery sitting fully charged during the expensive on-peak hours ({on_start}-{on_end})
-  without actively exporting? How much money is being left on the table, and what
-  would it cost in overnight charging to make up for earlier export?
-- Is the overnight grid charging window long enough to fully recharge the battery?
-  If not, how much longer does it need to be?
-- Check the Rules list to see which months each rule actually covers. Do not assume
-  rule coverage from the rule name — read the months list. Only flag month-mismatches
-  that are actually present in the data.
-- Are any days of the week missing from the export schedule?
-- **Check each rule for name-vs-value consistency.** The rule's name (the quoted string
-  at the start of each rule line) often describes intent, while the resolved values
-  after "|" show actual behavior. If a name says "export solar only" but the action
-  says "active battery export enabled", flag it. If a name mentions "7:55pm" but
-  the time shows "7:00 PM", flag it. Similar checks for reserve percentages, grid
-  charging on/off, and day ranges. These are often unintentional user errors.
-- **Trace rule firings in time order** for each day-type (weekday / Saturday / Sunday).
-  If a rule enables battery export ("active battery export enabled") and no later
-  rule on the same day-type switches to solar-only export before midnight, flag
-  it — battery will drain through off-peak hours at lower rates. Also flag cases
-  where two rules fire within 30 minutes and the later one contradicts the earlier
-  (the earlier rule has no lasting effect).
-For each suggestion, estimate the dollar impact per month using actual rates.
+**3. Rule review (not "optimization" by default)**
+**ONLY suggest rule changes if you can point to a specific inconsistency or gap that
+the homeowner likely did not intend.** If the rules appear internally consistent and
+the projection is within target, say so — do not invent optimizations for their own sake.
 
-**4. Credit maximization**
-Looking at the daily cost data:
-- On days where little or no on-peak credit was earned, what likely went wrong?
-  (cloudy day? battery not full? no export rule active?)
-- Are there consistent patterns between high-credit days and low-credit days?
-- Given the 40.5 kWh battery capacity that can actively discharge to the grid,
-  where are the biggest untapped opportunities to earn more credits?
+Focus on these checks:
+- **Name-vs-value consistency.** The rule's quoted name describes intent; the resolved
+  values after "|" show actual behavior. If a name disagrees with its values (e.g., name
+  says "export solar only" but action says "active battery export enabled", or name
+  mentions a specific time but the resolved time differs), flag it as a likely bug.
+- **Rule sequencing.** Trace rule firings in time order per day-type (weekday / Saturday
+  / Sunday). Flag cases where (a) a rule enables battery export and no later rule on
+  the same day-type switches to solar-only export or changes mode away from active
+  discharge before the next day starts, OR (b) two rules fire within 30 minutes and
+  the later one contradicts the earlier (the earlier rule has no lasting effect).
+- **Month coverage.** Check that each rule's months list actually contains the months
+  the name implies. Do not invent month-coverage claims; verify them in the data.
+- **Day-type asymmetry (optional observation).** If one day-type has a "stop export"
+  rule but another doesn't, mention it as an observation — not a requirement — unless
+  it's creating a measurable problem.
+
+For any change you suggest, show the dollar impact per month using actual rates from
+the data. If the impact is under $20/month, note that the rule complexity may not be
+worth it. Alternative perspectives are welcome as observations, but not required.
+
+**4. Daily data observations**
+Looking at the daily cost data, comment ONLY if you notice:
+- Days with markedly lower credits than expected given the weather/solar context
+- Inconsistent patterns between day-types that may indicate a rule gap
+
+Do not push "untapped opportunities" unless the overall projection is undershooting
+the target credit range. Exporting more is only valuable if the projection is below
+target; overshooting wastes energy at SDG&E's poor surplus payout rate.
 
 ## Data quality awareness
 The `data_quality` object tells you how reliable each projection input is:
@@ -4299,8 +4304,7 @@ CRITICAL — Write for a homeowner, not an engineer:
 - Use 12-hour time: "5:00 PM" — never "hour: 17" or "19:15".
 - For rule recommendations: explain WHY the change helps and the expected dollar impact.
   Do NOT walk the user through how to create or edit a rule — they know how.
-  Example: "Starting battery export at 5 PM instead of 7:15 PM would capture 2 extra hours
-  of on-peak rates, adding approximately $X per month in credits toward net-zero."
+  Use actual times from the current rules and rate periods; never invent times.
 - Never output JSON, arrays, code blocks, underscore_identifiers, or field syntax in recommendations.
 - Use dollar amounts to justify every recommendation.
 
@@ -4308,16 +4312,22 @@ Keep the total response focused — depth over breadth.
 
 After all rule recommendations, end with:
 
-**5. Projected impact**
+**5. Projected impact (informational)**
 A pre-calculated "After Changes" projection table is displayed in the UI alongside
-the baseline. It models adding winter on-peak battery export for months that currently
-have no export rules. These numbers are computed server-side — DO NOT reproduce them.
+the baseline. It models adding battery export for months that currently have no
+export rules. These numbers are computed server-side — DO NOT reproduce them.
+
+**If the BASELINE projection Net is already within -$500 to -$100 (target credit
+range), explicitly state this. The optimized projection is informational only —
+not a recommendation to execute unless the baseline is outside target.**
 
 Analyze:
-- Does the optimized projection bring the full-year net into the $100–$500 credit range?
-- If it overshoots, suggest scaling back (fewer months, higher reserve)
-- If it falls short, suggest what additional changes could help
-- Compare the baseline total vs optimized total and state the improvement\
+- Is the baseline already within the $100-$500 target credit range? If so, note
+  that changes are optional.
+- If the baseline is outside target, does the optimized projection bring it in?
+  If it overshoots into >$500 credit, suggest scaling back (fewer months, higher
+  reserve). If it still falls short, note what additional changes might help.
+- Compare the baseline total vs optimized total and state the difference.\
 """
 
 
@@ -5913,18 +5923,10 @@ def api_settings():
                 {'key': 'tuya_poll_interval', 'label': 'State poll', 'unit': 's'},
             ],
         },
-        {
-            'key': 'alexa',
-            'label': 'Alexa Routines',
-            'type': 'on-demand',
-            'enabled_key': 'alexa_enabled',
-            'intervals': [
-                {'key': 'alexa_email',         'label': 'Amazon email',    'unit': 'text'},
-                {'key': 'alexa_password',      'label': 'Amazon password', 'unit': 'password'},
-                {'key': 'alexa_url',           'label': 'Amazon URL',      'unit': 'text'},
-                {'key': 'alexa_poll_interval', 'label': 'Refresh poll',    'unit': 's'},
-            ],
-        },
+        # Alexa integration shelved — alexapy fails silently against modern
+        # Amazon login. Settings card removed to prevent accidental
+        # "Authenticate" clicks. Backend code remains behind alexa_enabled=0
+        # in case we revisit with authcaptureproxy later.
         {
             'key': 'maintenance',
             'label': 'Maintenance',
