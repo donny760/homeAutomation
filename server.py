@@ -3467,23 +3467,39 @@ def _switches_lookup(row_id: int):
     return row  # (id, provider, external_id, kind, name) or None
 
 
+_HOME_CONTROL_TITLE_SUFFIX = {
+    'plug_turned_on':             'turned on',
+    'plug_turned_off':             'turned off',
+    'circuit_on':                  'turned on',
+    'circuit_off':                 'turned off',
+    'brightness_changed':          'brightness changed',
+    'routine_triggered':           'routine triggered',
+    'alarm_armed':                 'armed',
+    'thermostat_mode_changed':     'mode changed',
+    'thermostat_setpoint_changed': 'setpoint changed',
+}
+
+
 def _switches_log_event(provider: str, event_type: str, title: str, detail: str = None,
                         result: str = 'ok') -> None:
     """Log a drawer-initiated action. All entries go under system='home_control'
     so the Event Log can filter them as one group. The provider (kasa / pool /
     nest / abode / tuya) is preserved in the detail field so you still know
-    which integration drove the change."""
+    which integration drove the change. The title gets a human-readable action
+    suffix ('turned on', 'armed', etc.) so the event row is self-describing."""
     provider_label = (provider or '').strip()
     prefixed_detail = detail
     if provider_label:
         tag = f'[{provider_label}]'
         prefixed_detail = tag if not detail else f'{tag} {detail}'
+    suffix = _HOME_CONTROL_TITLE_SUFFIX.get(event_type)
+    composed_title = f'{title} {suffix}' if suffix else title
     try:
         with sqlite3.connect(DB_PATH) as c:
             c.execute(
                 'INSERT INTO event_log (ts, system, event_type, title, detail, result, source) '
                 'VALUES (?,?,?,?,?,?,?)',
-                (int(time.time()), 'home_control', event_type, title,
+                (int(time.time()), 'home_control', event_type, composed_title,
                  prefixed_detail, result, 'ui')
             )
     except Exception as exc:
