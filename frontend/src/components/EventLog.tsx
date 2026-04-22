@@ -34,12 +34,16 @@ const SYSTEM_META: Record<string, { icon: string; label: string; color: string }
   holidays: { icon: '\ud83d\udcc5', label: 'Holidays', color: 'var(--amber)' },
   system: { icon: '\u2699\ufe0f', label: 'System', color: 'var(--gray)' },
   home_control: { icon: '\ud83c\udfe0', label: 'Home Control', color: 'var(--purple)' },
+  kasa: { icon: '\ud83d\udd0c', label: 'Kasa', color: 'var(--blue)' },
+  tuya: { icon: '\ud83d\udd0c', label: 'Tuya', color: '#E5522E' },
 };
 
 const FILTERS: { key: string; label: string }[] = [
   { key: 'all', label: 'All' },
   { key: 'powerwall', label: '\u26a1 Powerwall' },
   { key: 'home_control', label: '\ud83c\udfe0 Home Control' },
+  { key: 'kasa', label: '\ud83d\udd0c Kasa' },
+  { key: 'tuya', label: '\ud83d\udd0c Tuya' },
   { key: 'rachio', label: '\ud83c\udf3f Rachio/Sprinklers' },
   { key: 'abode', label: '\ud83d\udd12 Abode' },
   { key: 'pool', label: '\ud83c\udfca Pool' },

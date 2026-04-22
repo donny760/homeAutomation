@@ -278,7 +278,21 @@ body {
   justify-content: space-between;
   flex-shrink: 0;
 }
+.chart-title-wrap { display: flex; align-items: center; gap: 10px; }
 .chart-title  { font-size: 0.82rem; color: var(--dim); text-transform: uppercase; letter-spacing: 0.09em; }
+.chart-nav    { display: flex; gap: 2px; }
+.chart-nav-btn {
+  background: none;
+  border: 0.5px solid var(--border);
+  color: var(--dim);
+  border-radius: 5px;
+  padding: 1px 7px;
+  font-size: 0.7rem;
+  cursor: pointer;
+  line-height: 1.2;
+}
+.chart-nav-btn:hover:not(:disabled) { color: var(--text); border-color: var(--dim); }
+.chart-nav-btn:disabled { opacity: 0.3; cursor: not-allowed; }
 .chart-legend { display: flex; gap: 14px; }
 .legend-item  { display: flex; align-items: center; gap: 5px; font-size: 0.82rem; color: var(--dim); cursor: pointer; user-select: none; }
 .legend-dot   { width: 8px; height: 8px; border-radius: 50%; }

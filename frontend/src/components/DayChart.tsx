@@ -7,6 +7,22 @@ import { fmtW } from '@/lib/format';
 
 Chart.register(...registerables);
 
+function isoDate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function dayLabel(viewedDate: Date): string {
+  const today = isoDate(new Date());
+  if (isoDate(viewedDate) === today) return 'Today';
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (isoDate(viewedDate) === isoDate(yesterday)) return 'Yesterday';
+  return viewedDate.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
 export default function DayChart() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const chartRef = useRef<Chart<'line'> | null>(null);
@@ -15,6 +31,13 @@ export default function DayChart() {
   const forecastRef = useRef<{ x: number; y: number }[]>([]);
   const visibilityRef = useRef([true, true, true]);
   const [visible, setVisible] = useState([true, true, true]);
+  const [viewedDate, setViewedDate] = useState<Date>(() => {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    return d;
+  });
+
+  const isToday = isoDate(viewedDate) === isoDate(new Date());
 
   const syncChartTheme = useCallback((light: boolean) => {
     const chart = chartRef.current;
@@ -48,6 +71,19 @@ export default function DayChart() {
       return next;
     });
   }, []);
+
+  function shiftDay(delta: number) {
+    setViewedDate((d) => {
+      const next = new Date(d);
+      next.setDate(next.getDate() + delta);
+      next.setHours(0, 0, 0, 0);
+      // Don't allow forward past today
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      if (next > today) return d;
+      return next;
+    });
+  }
 
   useEffect(() => {
     if (!canvasRef.current) return;
@@ -116,7 +152,8 @@ export default function DayChart() {
         plugins: {
           legend: { display: false },
           tooltip: {
-            mode: 'index',
+            mode: 'nearest',
+            axis: 'x',
             intersect: false,
             backgroundColor: '#222224',
             borderColor: '#333336',
@@ -125,6 +162,15 @@ export default function DayChart() {
             bodyColor: '#eeece8',
             filter: (item) => item.parsed.y != null && item.parsed.y > 0,
             callbacks: {
+              title: (items) => {
+                if (!items.length || items[0].parsed.x == null) return '';
+                const d = new Date(items[0].parsed.x);
+                return d.toLocaleString([], {
+                  month: 'short', day: 'numeric',
+                  hour: 'numeric', minute: '2-digit', second: '2-digit',
+                  hour12: true,
+                });
+              },
               label: (ctx) => ` ${ctx.dataset.label}: ${fmtW(ctx.parsed.y ?? 0)}`,
             },
           },
@@ -140,17 +186,30 @@ export default function DayChart() {
     };
     window.addEventListener('themechange', onTheme);
 
+    const wrap = canvasRef.current.parentElement;
+    let ro: ResizeObserver | null = null;
+    if (wrap && typeof ResizeObserver !== 'undefined') {
+      ro = new ResizeObserver(() => {
+        chart.resize();
+      });
+      ro.observe(wrap);
+    }
+
     return () => {
       window.removeEventListener('themechange', onTheme);
+      if (ro) ro.disconnect();
       chart.destroy();
     };
   }, [syncChartTheme]);
 
-  // Refresh actual Solar + Home data every 60s
+  // Fetch chart data when viewedDate changes; auto-refresh every 60s only when viewing today
   useEffect(() => {
+    let cancelled = false;
     async function refreshChart() {
       try {
-        const rows = await fetch('/api/today').then((r) => r.json());
+        const url = isToday ? '/api/today' : `/api/day?date=${isoDate(viewedDate)}`;
+        const rows = await fetch(url).then((r) => r.json());
+        if (cancelled) return;
         const chart = chartRef.current;
         if (!chart) return;
         solarDataRef.current = rows.filter((r: any) => r.solar_w > 0).map((r: any) => ({ x: r.ts * 1000, y: r.solar_w }));
@@ -164,36 +223,53 @@ export default function DayChart() {
     }
 
     refreshChart();
+    if (!isToday) return () => { cancelled = true; };
     const id = setInterval(refreshChart, 60_000);
-    return () => clearInterval(id);
-  }, []);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [viewedDate, isToday]);
 
-  // Refresh Solar Forecast every 60 min
+  // Solar Forecast — only meaningful for today; clear when navigating away
   useEffect(() => {
+    let cancelled = false;
+    const chart = chartRef.current;
+    if (!isToday) {
+      forecastRef.current = [];
+      if (chart) {
+        chart.data.datasets[2].data = [];
+        chart.update('none');
+      }
+      return;
+    }
     async function refreshForecast() {
       try {
         const points = await fetch('/api/solar-forecast').then((r) => r.json());
-        const chart = chartRef.current;
-        if (!chart) return;
+        if (cancelled) return;
+        const c = chartRef.current;
+        if (!c) return;
         forecastRef.current = points.map((p: any) => ({ x: p.ts * 1000, y: p.solar_w }));
         if (visibilityRef.current[2]) {
-          chart.data.datasets[2].data = forecastRef.current;
-          chart.update('none');
+          c.data.datasets[2].data = forecastRef.current;
+          c.update('none');
         }
       } catch (e) {
         console.warn('Solar forecast:', e);
       }
     }
-
     refreshForecast();
     const id = setInterval(refreshForecast, 3_600_000);
-    return () => clearInterval(id);
-  }, []);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [isToday]);
 
   return (
     <div className="card chart-card">
       <div className="chart-header">
-        <div className="chart-title">Solar vs Home Load &mdash; Today</div>
+        <div className="chart-title-wrap">
+          <div className="chart-title">Solar vs Home Load &mdash; {dayLabel(viewedDate)}</div>
+          <div className="chart-nav">
+            <button className="chart-nav-btn" onClick={() => shiftDay(-1)} aria-label="Previous day">&#9664;</button>
+            <button className="chart-nav-btn" onClick={() => shiftDay(1)} disabled={isToday} aria-label="Next day">&#9654;</button>
+          </div>
+        </div>
         <div className="chart-legend">
           <div
             className={`legend-item${visible[0] ? '' : ' legend-inactive'}`}
@@ -209,13 +285,15 @@ export default function DayChart() {
             <div className="legend-dot" style={{ background: '#378ADD' }} />
             Home
           </div>
-          <div
-            className={`legend-item${visible[2] ? '' : ' legend-inactive'}`}
-            onClick={() => toggleDataset(2)}
-          >
-            <div className="legend-dash" style={{ borderColor: 'rgba(239,159,39,0.45)' }} />
-            Forecast
-          </div>
+          {isToday && (
+            <div
+              className={`legend-item${visible[2] ? '' : ' legend-inactive'}`}
+              onClick={() => toggleDataset(2)}
+            >
+              <div className="legend-dash" style={{ borderColor: 'rgba(239,159,39,0.45)' }} />
+              Forecast
+            </div>
+          )}
         </div>
       </div>
       <div className="chart-wrap">

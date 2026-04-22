@@ -102217,3 +102217,401 @@ abodepy.exceptions.AbodeAuthenticationException: <html>
  * Running on http://127.0.0.1:5001
  * Running on http://10.0.0.163:5001
 2026-04-16 06:17:44  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 11:48:23  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-20 11:48:23  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 11:48:41  INFO      127.0.0.1 - - [20/Apr/2026 11:48:41] "[32mGET /nest/auth HTTP/1.1[0m" 302 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET / HTTP/1.1" 200 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET /_next/static/css/d1d564af8af3b159.css HTTP/1.1" 200 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1" 200 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-20 11:48:48  INFO      127.0.0.1 - - [20/Apr/2026 11:48:48] "GET /_next/static/chunks/app/page-6cb49c5948382c62.js HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-04-20 11:48:49  INFO      127.0.0.1 - - [20/Apr/2026 11:48:49] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:48:59  INFO      127.0.0.1 - - [20/Apr/2026 11:48:59] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:49:06  INFO      127.0.0.1 - - [20/Apr/2026 11:49:06] "[36mGET / HTTP/1.1[0m" 304 -
+2026-04-20 11:49:06  INFO      127.0.0.1 - - [20/Apr/2026 11:49:06] "[36mGET /_next/static/css/d1d564af8af3b159.css HTTP/1.1[0m" 304 -
+2026-04-20 11:49:06  INFO      127.0.0.1 - - [20/Apr/2026 11:49:06] "[36mGET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1[0m" 304 -
+2026-04-20 11:49:06  INFO      127.0.0.1 - - [20/Apr/2026 11:49:06] "[36mGET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1[0m" 304 -
+2026-04-20 11:49:06  INFO      127.0.0.1 - - [20/Apr/2026 11:49:06] "[36mGET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1[0m" 304 -
+2026-04-20 11:49:06  INFO      127.0.0.1 - - [20/Apr/2026 11:49:06] "[36mGET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1[0m" 304 -
+2026-04-20 11:49:06  INFO      127.0.0.1 - - [20/Apr/2026 11:49:06] "[36mGET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1[0m" 304 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "[36mGET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1[0m" 304 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "[36mGET /_next/static/chunks/app/page-6cb49c5948382c62.js HTTP/1.1[0m" 304 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:49:07  INFO      127.0.0.1 - - [20/Apr/2026 11:49:07] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:49:17  INFO      127.0.0.1 - - [20/Apr/2026 11:49:17] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:49:27  INFO      127.0.0.1 - - [20/Apr/2026 11:49:27] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:49:38  INFO      127.0.0.1 - - [20/Apr/2026 11:49:38] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:49:48  INFO      127.0.0.1 - - [20/Apr/2026 11:49:48] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:49:58  INFO      127.0.0.1 - - [20/Apr/2026 11:49:58] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:50:08  INFO      127.0.0.1 - - [20/Apr/2026 11:50:08] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:50:08  INFO      127.0.0.1 - - [20/Apr/2026 11:50:08] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:50:08  INFO      127.0.0.1 - - [20/Apr/2026 11:50:08] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:50:08  INFO      127.0.0.1 - - [20/Apr/2026 11:50:08] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:50:09  INFO      127.0.0.1 - - [20/Apr/2026 11:50:09] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:50:18  INFO      127.0.0.1 - - [20/Apr/2026 11:50:18] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:50:28  INFO      127.0.0.1 - - [20/Apr/2026 11:50:28] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:51:02  INFO      127.0.0.1 - - [20/Apr/2026 11:51:02] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:51:07  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-20 11:51:07  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 11:51:08  INFO      127.0.0.1 - - [20/Apr/2026 11:51:08] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:51:08  INFO      127.0.0.1 - - [20/Apr/2026 11:51:08] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:51:08  INFO      127.0.0.1 - - [20/Apr/2026 11:51:08] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:51:12  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-20 11:51:12  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 11:51:16  INFO      127.0.0.1 - - [20/Apr/2026 11:51:16] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET / HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET /_next/static/css/d1d564af8af3b159.css HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-20 11:51:17  INFO      127.0.0.1 - - [20/Apr/2026 11:51:17] "GET /_next/static/chunks/app/page-554a3630ae90de53.js HTTP/1.1" 200 -
+2026-04-20 11:51:18  INFO      127.0.0.1 - - [20/Apr/2026 11:51:18] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:51:18  INFO      127.0.0.1 - - [20/Apr/2026 11:51:18] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:51:18  INFO      127.0.0.1 - - [20/Apr/2026 11:51:18] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:51:18  INFO      127.0.0.1 - - [20/Apr/2026 11:51:18] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:51:18  INFO      127.0.0.1 - - [20/Apr/2026 11:51:18] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:51:18  INFO      127.0.0.1 - - [20/Apr/2026 11:51:18] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:51:18  INFO      127.0.0.1 - - [20/Apr/2026 11:51:18] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:51:19  INFO      127.0.0.1 - - [20/Apr/2026 11:51:19] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:51:19  INFO      127.0.0.1 - - [20/Apr/2026 11:51:19] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:51:20  INFO      127.0.0.1 - - [20/Apr/2026 11:51:20] "[36mGET / HTTP/1.1[0m" 304 -
+2026-04-20 11:51:20  INFO      127.0.0.1 - - [20/Apr/2026 11:51:20] "[36mGET /_next/static/css/d1d564af8af3b159.css HTTP/1.1[0m" 304 -
+2026-04-20 11:51:20  INFO      127.0.0.1 - - [20/Apr/2026 11:51:20] "[36mGET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:20  INFO      127.0.0.1 - - [20/Apr/2026 11:51:20] "[36mGET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:20  INFO      127.0.0.1 - - [20/Apr/2026 11:51:20] "[36mGET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:20  INFO      127.0.0.1 - - [20/Apr/2026 11:51:20] "[36mGET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:20  INFO      127.0.0.1 - - [20/Apr/2026 11:51:20] "[36mGET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:20  INFO      127.0.0.1 - - [20/Apr/2026 11:51:20] "[36mGET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "[36mGET /_next/static/chunks/app/page-554a3630ae90de53.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:51:21  INFO      127.0.0.1 - - [20/Apr/2026 11:51:21] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:51:33  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-20 11:51:33  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 11:51:33  INFO      127.0.0.1 - - [20/Apr/2026 11:51:33] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET / HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET /_next/static/css/d1d564af8af3b159.css HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET / HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET /_next/static/css/d1d564af8af3b159.css HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "[36mGET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1[0m" 304 -
+2026-04-20 11:51:36  INFO      127.0.0.1 - - [20/Apr/2026 11:51:36] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-20 11:51:37  INFO      127.0.0.1 - - [20/Apr/2026 11:51:37] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-20 11:51:37  INFO      127.0.0.1 - - [20/Apr/2026 11:51:37] "GET /_next/static/chunks/app/page-554a3630ae90de53.js HTTP/1.1" 200 -
+2026-04-20 11:51:37  INFO      127.0.0.1 - - [20/Apr/2026 11:51:37] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:51:37  INFO      127.0.0.1 - - [20/Apr/2026 11:51:37] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:51:37  INFO      127.0.0.1 - - [20/Apr/2026 11:51:37] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:51:37  INFO      127.0.0.1 - - [20/Apr/2026 11:51:37] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:51:38  INFO      127.0.0.1 - - [20/Apr/2026 11:51:38] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:51:38  INFO      127.0.0.1 - - [20/Apr/2026 11:51:38] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:51:38  INFO      127.0.0.1 - - [20/Apr/2026 11:51:38] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:51:39  INFO      127.0.0.1 - - [20/Apr/2026 11:51:39] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:51:39  INFO      127.0.0.1 - - [20/Apr/2026 11:51:39] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:51:47  INFO      127.0.0.1 - - [20/Apr/2026 11:51:47] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:51:57  INFO      127.0.0.1 - - [20/Apr/2026 11:51:57] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:52:08  INFO      127.0.0.1 - - [20/Apr/2026 11:52:08] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:52:18  INFO      127.0.0.1 - - [20/Apr/2026 11:52:18] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:52:28  INFO      127.0.0.1 - - [20/Apr/2026 11:52:28] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:52:38  INFO      127.0.0.1 - - [20/Apr/2026 11:52:38] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:52:38  INFO      127.0.0.1 - - [20/Apr/2026 11:52:38] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:52:38  INFO      127.0.0.1 - - [20/Apr/2026 11:52:38] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:52:38  INFO      127.0.0.1 - - [20/Apr/2026 11:52:38] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:52:38  INFO      127.0.0.1 - - [20/Apr/2026 11:52:38] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:52:48  INFO      127.0.0.1 - - [20/Apr/2026 11:52:48] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET / HTTP/1.1[0m" 304 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET /_next/static/css/d1d564af8af3b159.css HTTP/1.1[0m" 304 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1[0m" 304 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1[0m" 304 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1[0m" 304 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1[0m" 304 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1[0m" 304 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1[0m" 304 -
+2026-04-20 11:52:57  INFO      127.0.0.1 - - [20/Apr/2026 11:52:57] "[36mGET /_next/static/chunks/app/page-554a3630ae90de53.js HTTP/1.1[0m" 304 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:52:58  INFO      127.0.0.1 - - [20/Apr/2026 11:52:58] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:53:41  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-20 11:53:41  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET / HTTP/1.1" 200 -
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET /_next/static/css/d1d564af8af3b159.css HTTP/1.1" 200 -
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1" 200 -
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET /_next/static/chunks/app/page-ef51aa771482fe22.js HTTP/1.1" 200 -
+2026-04-20 11:53:47  INFO      127.0.0.1 - - [20/Apr/2026 11:53:47] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-20 11:53:48  INFO      127.0.0.1 - - [20/Apr/2026 11:53:48] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:53:48  INFO      127.0.0.1 - - [20/Apr/2026 11:53:48] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:53:48  INFO      127.0.0.1 - - [20/Apr/2026 11:53:48] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:53:48  INFO      127.0.0.1 - - [20/Apr/2026 11:53:48] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:53:48  INFO      127.0.0.1 - - [20/Apr/2026 11:53:48] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:53:48  INFO      127.0.0.1 - - [20/Apr/2026 11:53:48] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:53:49  INFO      127.0.0.1 - - [20/Apr/2026 11:53:49] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:53:49  INFO      127.0.0.1 - - [20/Apr/2026 11:53:49] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:53:49  INFO      127.0.0.1 - - [20/Apr/2026 11:53:49] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:53:58  INFO      127.0.0.1 - - [20/Apr/2026 11:53:58] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:54:08  INFO      127.0.0.1 - - [20/Apr/2026 11:54:08] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:54:18  INFO      127.0.0.1 - - [20/Apr/2026 11:54:18] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:54:28  INFO      127.0.0.1 - - [20/Apr/2026 11:54:28] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:54:38  INFO      127.0.0.1 - - [20/Apr/2026 11:54:38] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:54:47  INFO      127.0.0.1 - - [20/Apr/2026 11:54:47] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:54:48  INFO      127.0.0.1 - - [20/Apr/2026 11:54:48] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:54:48  INFO      127.0.0.1 - - [20/Apr/2026 11:54:48] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:54:48  INFO      127.0.0.1 - - [20/Apr/2026 11:54:48] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:54:48  INFO      127.0.0.1 - - [20/Apr/2026 11:54:48] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:54:58  INFO      127.0.0.1 - - [20/Apr/2026 11:54:58] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:55:08  INFO      127.0.0.1 - - [20/Apr/2026 11:55:08] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:55:18  INFO      127.0.0.1 - - [20/Apr/2026 11:55:18] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:55:28  INFO      127.0.0.1 - - [20/Apr/2026 11:55:28] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:55:38  INFO      127.0.0.1 - - [20/Apr/2026 11:55:38] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:55:48  INFO      127.0.0.1 - - [20/Apr/2026 11:55:48] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:55:48  INFO      127.0.0.1 - - [20/Apr/2026 11:55:48] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:55:48  INFO      127.0.0.1 - - [20/Apr/2026 11:55:48] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:55:48  INFO      127.0.0.1 - - [20/Apr/2026 11:55:48] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:55:48  INFO      127.0.0.1 - - [20/Apr/2026 11:55:48] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:55:54  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-20 11:55:54  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 11:55:55  INFO      127.0.0.1 - - [20/Apr/2026 11:55:55] "GET / HTTP/1.1" 200 -
+2026-04-20 11:55:55  INFO      127.0.0.1 - - [20/Apr/2026 11:55:55] "GET /_next/static/css/d1d564af8af3b159.css HTTP/1.1" 200 -
+2026-04-20 11:55:55  INFO      127.0.0.1 - - [20/Apr/2026 11:55:55] "GET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /_next/static/chunks/app/page-6961fda70dced0cc.js HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:55:56  INFO      127.0.0.1 - - [20/Apr/2026 11:55:56] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:55:57  INFO      127.0.0.1 - - [20/Apr/2026 11:55:57] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:55:57  INFO      127.0.0.1 - - [20/Apr/2026 11:55:57] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:55:57  INFO      127.0.0.1 - - [20/Apr/2026 11:55:57] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:55:57  INFO      127.0.0.1 - - [20/Apr/2026 11:55:57] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:55:58  INFO      127.0.0.1 - - [20/Apr/2026 11:55:58] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:55:58  INFO      127.0.0.1 - - [20/Apr/2026 11:55:58] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:56:06  INFO      127.0.0.1 - - [20/Apr/2026 11:56:06] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:56:16  INFO      127.0.0.1 - - [20/Apr/2026 11:56:16] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:56:27  INFO      127.0.0.1 - - [20/Apr/2026 11:56:27] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:56:37  INFO      127.0.0.1 - - [20/Apr/2026 11:56:37] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:58:01  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-20 11:58:01  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET / HTTP/1.1" 200 -
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET /_next/static/css/d1d564af8af3b159.css HTTP/1.1" 200 -
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1" 200 -
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET /_next/static/chunks/app/page-fb4c0f82b93f8c50.js HTTP/1.1" 200 -
+2026-04-20 11:58:04  INFO      127.0.0.1 - - [20/Apr/2026 11:58:04] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-20 11:58:05  INFO      127.0.0.1 - - [20/Apr/2026 11:58:05] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 11:58:05  INFO      127.0.0.1 - - [20/Apr/2026 11:58:05] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 11:58:05  INFO      127.0.0.1 - - [20/Apr/2026 11:58:05] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 11:58:05  INFO      127.0.0.1 - - [20/Apr/2026 11:58:05] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 11:58:05  INFO      127.0.0.1 - - [20/Apr/2026 11:58:05] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:58:05  INFO      127.0.0.1 - - [20/Apr/2026 11:58:05] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 11:58:06  INFO      127.0.0.1 - - [20/Apr/2026 11:58:06] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 11:58:06  INFO      127.0.0.1 - - [20/Apr/2026 11:58:06] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 11:58:06  INFO      127.0.0.1 - - [20/Apr/2026 11:58:06] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 11:58:15  INFO      127.0.0.1 - - [20/Apr/2026 11:58:15] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 11:58:25  INFO      127.0.0.1 - - [20/Apr/2026 11:58:25] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 12:34:15  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-20 12:34:15  INFO      [33mPress CTRL+C to quit[0m
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET / HTTP/1.1" 200 -
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET /_next/static/css/91f5cc662a9908a7.css HTTP/1.1" 200 -
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1" 200 -
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-20 12:34:26  INFO      127.0.0.1 - - [20/Apr/2026 12:34:26] "GET /_next/static/chunks/app/page-c66a1f66329e828c.js HTTP/1.1" 200 -
+2026-04-20 12:34:27  INFO      127.0.0.1 - - [20/Apr/2026 12:34:27] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 12:34:27  INFO      127.0.0.1 - - [20/Apr/2026 12:34:27] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-20 12:34:27  INFO      127.0.0.1 - - [20/Apr/2026 12:34:27] "GET /api/rates HTTP/1.1" 200 -
+2026-04-20 12:34:27  INFO      127.0.0.1 - - [20/Apr/2026 12:34:27] "GET /api/security HTTP/1.1" 200 -
+2026-04-20 12:34:27  INFO      127.0.0.1 - - [20/Apr/2026 12:34:27] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 12:34:27  INFO      127.0.0.1 - - [20/Apr/2026 12:34:27] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-20 12:34:27  INFO      127.0.0.1 - - [20/Apr/2026 12:34:27] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-04-20 12:34:28  INFO      127.0.0.1 - - [20/Apr/2026 12:34:28] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 12:34:28  INFO      127.0.0.1 - - [20/Apr/2026 12:34:28] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-04-20 12:34:28  INFO      127.0.0.1 - - [20/Apr/2026 12:34:28] "GET /api/weather HTTP/1.1" 200 -
+2026-04-20 12:34:29  INFO      127.0.0.1 - - [20/Apr/2026 12:34:29] "GET /api/pool HTTP/1.1" 200 -
+2026-04-20 12:34:32  INFO      127.0.0.1 - - [20/Apr/2026 12:34:32] "GET /api/day?date=2026-04-19 HTTP/1.1" 200 -
+2026-04-20 12:34:36  INFO      127.0.0.1 - - [20/Apr/2026 12:34:36] "GET /api/day?date=2026-04-18 HTTP/1.1" 200 -
+2026-04-20 12:34:37  INFO      127.0.0.1 - - [20/Apr/2026 12:34:37] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 12:34:38  INFO      127.0.0.1 - - [20/Apr/2026 12:34:38] "GET /api/day?date=2026-04-17 HTTP/1.1" 200 -
+2026-04-20 12:34:39  INFO      127.0.0.1 - - [20/Apr/2026 12:34:39] "GET /api/day?date=2026-04-16 HTTP/1.1" 200 -
+2026-04-20 12:34:41  INFO      127.0.0.1 - - [20/Apr/2026 12:34:41] "GET /api/day?date=2026-04-17 HTTP/1.1" 200 -
+2026-04-20 12:34:42  INFO      127.0.0.1 - - [20/Apr/2026 12:34:42] "GET /api/day?date=2026-04-18 HTTP/1.1" 200 -
+2026-04-20 12:34:43  INFO      127.0.0.1 - - [20/Apr/2026 12:34:43] "GET /api/day?date=2026-04-19 HTTP/1.1" 200 -
+2026-04-20 12:34:45  INFO      127.0.0.1 - - [20/Apr/2026 12:34:45] "GET /api/day?date=2026-04-18 HTTP/1.1" 200 -
+2026-04-20 12:34:45  INFO      127.0.0.1 - - [20/Apr/2026 12:34:45] "GET /api/day?date=2026-04-19 HTTP/1.1" 200 -
+2026-04-20 12:34:46  INFO      127.0.0.1 - - [20/Apr/2026 12:34:46] "GET /api/day?date=2026-04-18 HTTP/1.1" 200 -
+2026-04-20 12:34:47  INFO      127.0.0.1 - - [20/Apr/2026 12:34:47] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 12:34:47  INFO      127.0.0.1 - - [20/Apr/2026 12:34:47] "GET /api/day?date=2026-04-17 HTTP/1.1" 200 -
+2026-04-20 12:34:47  INFO      127.0.0.1 - - [20/Apr/2026 12:34:47] "GET /api/day?date=2026-04-16 HTTP/1.1" 200 -
+2026-04-20 12:34:48  INFO      127.0.0.1 - - [20/Apr/2026 12:34:48] "GET /api/day?date=2026-04-15 HTTP/1.1" 200 -
+2026-04-20 12:34:49  INFO      127.0.0.1 - - [20/Apr/2026 12:34:49] "GET /api/day?date=2026-04-14 HTTP/1.1" 200 -
+2026-04-20 12:34:50  INFO      127.0.0.1 - - [20/Apr/2026 12:34:50] "GET /api/day?date=2026-04-13 HTTP/1.1" 200 -
+2026-04-20 12:34:51  INFO      127.0.0.1 - - [20/Apr/2026 12:34:51] "GET /api/day?date=2026-04-14 HTTP/1.1" 200 -
+2026-04-20 12:34:51  INFO      127.0.0.1 - - [20/Apr/2026 12:34:51] "GET /api/day?date=2026-04-15 HTTP/1.1" 200 -
+2026-04-20 12:34:52  INFO      127.0.0.1 - - [20/Apr/2026 12:34:52] "GET /api/day?date=2026-04-16 HTTP/1.1" 200 -
+2026-04-20 12:34:52  INFO      127.0.0.1 - - [20/Apr/2026 12:34:52] "GET /api/day?date=2026-04-17 HTTP/1.1" 200 -
+2026-04-20 12:34:52  INFO      127.0.0.1 - - [20/Apr/2026 12:34:52] "GET /api/day?date=2026-04-18 HTTP/1.1" 200 -
+2026-04-20 12:34:52  INFO      127.0.0.1 - - [20/Apr/2026 12:34:52] "GET /api/day?date=2026-04-19 HTTP/1.1" 200 -
+2026-04-20 12:34:54  INFO      127.0.0.1 - - [20/Apr/2026 12:34:54] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 12:34:54  INFO      127.0.0.1 - - [20/Apr/2026 12:34:54] "GET /api/today HTTP/1.1" 200 -
+2026-04-20 12:34:55  INFO      127.0.0.1 - - [20/Apr/2026 12:34:55] "GET /api/day?date=2026-04-19 HTTP/1.1" 200 -
+2026-04-20 12:34:57  INFO      127.0.0.1 - - [20/Apr/2026 12:34:57] "GET /api/live HTTP/1.1" 200 -
+2026-04-20 12:34:57  INFO      127.0.0.1 - - [20/Apr/2026 12:34:57] "GET /api/day?date=2026-04-18 HTTP/1.1" 200 -
+2026-04-20 12:34:59  INFO      127.0.0.1 - - [20/Apr/2026 12:34:59] "GET /api/day?date=2026-04-19 HTTP/1.1" 200 -
+2026-04-20 12:35:00  INFO      127.0.0.1 - - [20/Apr/2026 12:35:00] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-20 12:35:00  INFO      127.0.0.1 - - [20/Apr/2026 12:35:00] "GET /api/today HTTP/1.1" 200 -
+2026-04-21 23:21:28  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-21 23:21:28  INFO      [33mPress CTRL+C to quit[0m
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET / HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /_next/static/css/91f5cc662a9908a7.css HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /_next/static/chunks/app/page-ad3ea31433c00d71.js HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /api/weather HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /api/today HTTP/1.1" 200 -
+2026-04-21 23:22:08  INFO      127.0.0.1 - - [21/Apr/2026 23:22:08] "GET /api/rates HTTP/1.1" 200 -
+2026-04-21 23:22:09  INFO      127.0.0.1 - - [21/Apr/2026 23:22:09] "GET /api/security HTTP/1.1" 200 -
+2026-04-21 23:22:09  INFO      127.0.0.1 - - [21/Apr/2026 23:22:09] "GET /api/pool HTTP/1.1" 200 -
+2026-04-21 23:22:09  INFO      127.0.0.1 - - [21/Apr/2026 23:22:09] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-04-21 23:22:09  INFO      127.0.0.1 - - [21/Apr/2026 23:22:09] "GET /api/live HTTP/1.1" 200 -
+2026-04-21 23:22:09  INFO      127.0.0.1 - - [21/Apr/2026 23:22:09] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-21 23:22:09  INFO      127.0.0.1 - - [21/Apr/2026 23:22:09] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
+2026-04-21 23:22:09  INFO      127.0.0.1 - - [21/Apr/2026 23:22:09] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-21 23:22:10  INFO      127.0.0.1 - - [21/Apr/2026 23:22:10] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599 HTTP/1.1" 200 -
+2026-04-21 23:22:13  INFO      127.0.0.1 - - [21/Apr/2026 23:22:13] "[36mGET / HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "[36mGET /_next/static/css/91f5cc662a9908a7.css HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "[36mGET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "[36mGET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "[36mGET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "[36mGET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "[36mGET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "[36mGET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "[36mGET /_next/static/chunks/app/page-ad3ea31433c00d71.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "GET /api/rates HTTP/1.1" 200 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "GET /api/weather HTTP/1.1" 200 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "GET /api/today HTTP/1.1" 200 -
+2026-04-21 23:22:14  INFO      127.0.0.1 - - [21/Apr/2026 23:22:14] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-21 23:22:15  INFO      127.0.0.1 - - [21/Apr/2026 23:22:15] "GET /api/security HTTP/1.1" 200 -
+2026-04-21 23:22:15  INFO      127.0.0.1 - - [21/Apr/2026 23:22:15] "GET /api/pool HTTP/1.1" 200 -
+2026-04-21 23:22:15  INFO      127.0.0.1 - - [21/Apr/2026 23:22:15] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599 HTTP/1.1" 200 -
+2026-04-21 23:22:15  INFO      127.0.0.1 - - [21/Apr/2026 23:22:15] "GET /api/live HTTP/1.1" 200 -
+2026-04-21 23:22:15  INFO      127.0.0.1 - - [21/Apr/2026 23:22:15] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=kasa HTTP/1.1" 200 -
+2026-04-21 23:22:22  INFO      127.0.0.1 - - [21/Apr/2026 23:22:22] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=errors HTTP/1.1" 200 -
+2026-04-21 23:22:24  INFO      127.0.0.1 - - [21/Apr/2026 23:22:24] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599 HTTP/1.1" 200 -
+2026-04-21 23:22:34  INFO      127.0.0.1 - - [21/Apr/2026 23:22:34] "[36mGET / HTTP/1.1[0m" 304 -
+2026-04-21 23:22:34  INFO      127.0.0.1 - - [21/Apr/2026 23:22:34] "[36mGET /_next/static/css/91f5cc662a9908a7.css HTTP/1.1[0m" 304 -
+2026-04-21 23:22:34  INFO      127.0.0.1 - - [21/Apr/2026 23:22:34] "[36mGET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:34  INFO      127.0.0.1 - - [21/Apr/2026 23:22:34] "[36mGET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:34  INFO      127.0.0.1 - - [21/Apr/2026 23:22:34] "[36mGET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:34  INFO      127.0.0.1 - - [21/Apr/2026 23:22:34] "[36mGET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:34  INFO      127.0.0.1 - - [21/Apr/2026 23:22:34] "[36mGET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:34  INFO      127.0.0.1 - - [21/Apr/2026 23:22:34] "[36mGET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "[36mGET /_next/static/chunks/app/page-ad3ea31433c00d71.js HTTP/1.1[0m" 304 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/weather HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/today HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/rates HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/pool HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/security HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599 HTTP/1.1" 200 -
+2026-04-21 23:22:35  INFO      127.0.0.1 - - [21/Apr/2026 23:22:35] "GET /api/live HTTP/1.1" 200 -
+2026-04-21 23:22:36  INFO      127.0.0.1 - - [21/Apr/2026 23:22:36] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=kasa HTTP/1.1" 200 -
+2026-04-21 23:22:37  INFO      127.0.0.1 - - [21/Apr/2026 23:22:37] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=rachio HTTP/1.1" 200 -
+2026-04-21 23:22:38  INFO      127.0.0.1 - - [21/Apr/2026 23:22:38] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=abode HTTP/1.1" 200 -
+2026-04-21 23:22:39  INFO      127.0.0.1 - - [21/Apr/2026 23:22:39] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=kasa HTTP/1.1" 200 -
+2026-04-21 23:22:40  INFO      127.0.0.1 - - [21/Apr/2026 23:22:40] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=home_control HTTP/1.1" 200 -
+2026-04-21 23:22:41  INFO      127.0.0.1 - - [21/Apr/2026 23:22:41] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=powerwall HTTP/1.1" 200 -
+2026-04-21 23:22:42  INFO      127.0.0.1 - - [21/Apr/2026 23:22:42] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599 HTTP/1.1" 200 -
+2026-04-21 23:22:57  INFO      127.0.0.1 - - [21/Apr/2026 23:22:57] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=home_control HTTP/1.1" 200 -
+2026-04-21 23:22:58  INFO      127.0.0.1 - - [21/Apr/2026 23:22:58] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=rachio HTTP/1.1" 200 -
+2026-04-21 23:23:00  INFO      127.0.0.1 - - [21/Apr/2026 23:23:00] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=abode HTTP/1.1" 200 -
+2026-04-21 23:23:00  INFO      127.0.0.1 - - [21/Apr/2026 23:23:00] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=pool HTTP/1.1" 200 -
+2026-04-21 23:23:01  INFO      127.0.0.1 - - [21/Apr/2026 23:23:01] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599&system=nest HTTP/1.1" 200 -
+2026-04-21 23:23:06  INFO      127.0.0.1 - - [21/Apr/2026 23:23:06] "GET /api/events?limit=50&offset=0&start=1776236400&end=1776927599 HTTP/1.1" 200 -

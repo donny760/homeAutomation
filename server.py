@@ -76,7 +76,21 @@ _alexa_ts: float        = 0.0
 _nest_thermostats: dict = {}   # device_name -> {...thermostat traits...}
 _tuya_devices: dict     = {}   # dev_id -> {name, ip, local_key, version, on, last_seen}
 _tuya_ts: float         = 0.0
+_tuya_connections: dict = {}   # dev_id -> OutletDevice (persistent socket)
+_tuya_failures: dict    = {}   # dev_id -> consecutive failure count
+_tuya_quarantine: dict  = {}   # dev_id -> unix ts at which quarantine ends
 _switches_lock          = threading.Lock()
+
+# Persistent asyncio loop for Kasa — needed so Device instances (which are
+# bound to the event loop that created them) survive across calls. Without
+# this, every call to asyncio.run() would create a new loop and drop any
+# cached connections, forcing a fresh KLAP handshake every time — which was
+# knocking some dimmers off WiFi.
+_kasa_loop: "asyncio.AbstractEventLoop | None" = None
+_kasa_loop_thread: "threading.Thread | None" = None
+_kasa_connections: dict = {}   # mac -> Device (alive on _kasa_loop)
+_kasa_failures: dict    = {}   # mac -> consecutive failure count
+_kasa_quarantine: dict  = {}   # mac -> unix ts at which quarantine ends
 
 
 
@@ -257,6 +271,11 @@ _SETTINGS_DEFAULTS = {
     # Gemini AI
     'gemini_api_key':              '',
     'gemini_model':                'gemini-2.0-flash',
+    # Azure OpenAI (fallback when Gemini fails)
+    'azure_openai_endpoint':       '',  # e.g., https://myresource.openai.azure.com
+    'azure_openai_api_key':        '',
+    'azure_openai_deployment':     '',  # deployment name, e.g. "gpt-4o-mini"
+    'azure_openai_api_version':    '2024-10-21',
     # Nest / Google SDM
     'nest_enabled':                '0',
     'nest_poll_interval':          '15',
@@ -271,6 +290,11 @@ _SETTINGS_DEFAULTS = {
     # Kasa (TP-Link smart plugs, LAN discovery)
     'kasa_enabled':                '0',
     'kasa_poll_interval':          '10',
+    # When '0', the periodic state poll is skipped — drawer tiles still
+    # appear (from last discovery) and toggling still works, but we stop
+    # hammering the devices every 10s. Useful as a diagnostic when Kasa
+    # schedules misbehave and we suspect connection churn is the cause.
+    'kasa_state_poll_enabled':     '1',
     # Alexa (plugs + routines via alexapy)
     'alexa_enabled':               '0',
     'alexa_poll_interval':         '60',
@@ -570,9 +594,24 @@ def _fetch_rows(since_ts: int) -> list:
         ).fetchall()
 
 
+def _fetch_rows_range(start_ts: int, end_ts: int) -> list:
+    with sqlite3.connect(DB_PATH) as c:
+        return c.execute(
+            'SELECT timestamp, solar_w, home_w, battery_w, grid_w '
+            'FROM readings WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp',
+            (start_ts, end_ts)
+        ).fetchall()
+
+
 def today_rows() -> list:
     start = int(datetime.combine(date.today(), datetime.min.time()).timestamp())
     return _fetch_rows(start)
+
+
+def day_rows(target: date) -> list:
+    start = int(datetime.combine(target, datetime.min.time()).timestamp())
+    end   = int(datetime.combine(target + timedelta(days=1), datetime.min.time()).timestamp())
+    return _fetch_rows_range(start, end)
 
 
 def month_rows() -> list:
@@ -879,7 +918,7 @@ def poller() -> None:
                         # First time after enable: discover; otherwise just poll state
                         if not _kasa_devices:
                             _kasa_refresh_devices()
-                        else:
+                        elif get_setting_bool('kasa_state_poll_enabled', True):
                             _kasa_poll_state()
                     except Exception as exc:
                         print(f'Kasa poll error: {exc}')
@@ -1463,9 +1502,7 @@ def api_live():
     })
 
 
-@app.route('/api/today')
-def api_today():
-    raw = today_rows()
+def _filter_chart_rows(raw: list) -> list:
     out = []
     for i, r in enumerate(raw):
         # Drop all-zero glitch readings
@@ -1478,7 +1515,22 @@ def api_today():
                 if abs(cur_h - prev_h) / prev_h > 0.5 and abs(cur_h - next_h) / next_h > 0.5:
                     continue
         out.append({'ts': r[0], 'solar_w': r[1], 'home_w': r[2]})
-    return jsonify(out)
+    return out
+
+
+@app.route('/api/today')
+def api_today():
+    return jsonify(_filter_chart_rows(today_rows()))
+
+
+@app.route('/api/day')
+def api_day():
+    date_str = request.args.get('date', '')
+    try:
+        target = datetime.strptime(date_str, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': 'invalid date, use YYYY-MM-DD'}), 400
+    return jsonify(_filter_chart_rows(day_rows(target)))
 
 
 @app.route('/api/weather')
@@ -2622,6 +2674,65 @@ def fetch_nest_events() -> int:
 
 
 # ── Kasa (TP-Link smart plugs + dimmers + bulbs, LAN discovery) ──────────────
+def _kasa_start_loop() -> None:
+    """Start a dedicated asyncio loop in a daemon thread if not already running.
+    All Kasa coroutines must be submitted to this loop (via _kasa_submit) so
+    persistent Device connections aren't tied to short-lived loops."""
+    global _kasa_loop, _kasa_loop_thread
+    if _kasa_loop is not None and _kasa_loop.is_running():
+        return
+    _kasa_loop = asyncio.new_event_loop()
+    def _run():
+        asyncio.set_event_loop(_kasa_loop)
+        try:
+            _kasa_loop.run_forever()
+        except Exception as exc:
+            print(f'Kasa loop crashed: {exc}')
+    _kasa_loop_thread = threading.Thread(
+        target=_run, daemon=True, name='kasa-asyncio-loop'
+    )
+    _kasa_loop_thread.start()
+
+
+def _kasa_submit(coro, timeout: float = 30.0):
+    """Run a coroutine on the persistent Kasa loop and wait for its result."""
+    if _kasa_loop is None or not _kasa_loop.is_running():
+        _kasa_start_loop()
+    fut = asyncio.run_coroutine_threadsafe(coro, _kasa_loop)
+    return fut.result(timeout=timeout)
+
+
+def _kasa_mark_failure(mac: str, name: str, reason: str) -> None:
+    """Track consecutive failures. After 3 in a row, put the device in a 5-min
+    quarantine so we stop hammering a stuck/offline plug."""
+    count = _kasa_failures.get(mac, 0) + 1
+    _kasa_failures[mac] = count
+    info = _kasa_devices.get(mac) or {}
+    if not info.get('was_offline'):
+        _log_kasa_reachability(name, 'offline', reason[:200])
+        info['was_offline'] = True
+    info['on'] = None
+    if count >= 3 and mac not in _kasa_quarantine:
+        _kasa_quarantine[mac] = time.time() + 300  # 5 min
+        _log_kasa_reachability(
+            name, 'quarantined',
+            f'{count} consecutive failures; backing off 5 min'
+        )
+
+
+async def _kasa_close_all_async() -> None:
+    """Close all persistent Device connections. Called on rediscover."""
+    for mac, dev in list(_kasa_connections.items()):
+        try:
+            # python-kasa's Device has a disconnect() in recent versions
+            if hasattr(dev, 'disconnect'):
+                await dev.disconnect()
+        except Exception as exc:
+            print(f'Kasa close failed for {mac}: {exc}')
+    _kasa_connections.clear()
+
+
+
 def _kasa_read_brightness(dev) -> int:
     """Return current brightness 0-100 or None if device is not dimmable."""
     # Path 1: features dict (python-kasa 0.7+)
@@ -2678,8 +2789,14 @@ async def _kasa_set_brightness_on_device(dev, brightness: int) -> None:
 
 
 async def _kasa_discover_async() -> dict:
-    """Run LAN discovery, return {mac: {alias, ip, on, model, dimmable, brightness}}."""
+    """Run LAN discovery, store Device instances in _kasa_connections for
+    persistent reuse across polls/toggles. Returns {mac: {alias, ip, on,
+    model, dimmable, brightness}}."""
     from kasa import Discover
+    # Close any stale connections from a prior run
+    await _kasa_close_all_async()
+    _kasa_failures.clear()
+    _kasa_quarantine.clear()
     try:
         discovered = await Discover.discover()
     except Exception as exc:
@@ -2704,6 +2821,9 @@ async def _kasa_discover_async() -> dict:
             'dimmable':   brightness is not None,
             'brightness': brightness,
         }
+        # Keep the Device alive for future poll/toggle — skips the handshake
+        # hit we saw knocking some dimmers off WiFi.
+        _kasa_connections[mac] = dev
     return out
 
 
@@ -2713,10 +2833,12 @@ def _kasa_refresh_devices() -> int:
     Upserts on (provider, external_id). Preserves user edits to name/room/
     sort_order/hidden.  Updates kind if dimmable flag changes between runs
     (e.g. new firmware reveals a feature, or a bulb replaces a plug).
+    Uses the persistent Kasa asyncio loop so the Device connections created
+    during discovery survive for later polls.
     """
     global _kasa_devices, _kasa_ts
     try:
-        devices = asyncio.run(_kasa_discover_async())
+        devices = _kasa_submit(_kasa_discover_async(), timeout=60)
     except Exception as exc:
         print(f'Kasa refresh error: {exc}')
         _log_system_error('kasa', 'Discovery failed', str(exc))
@@ -2743,25 +2865,140 @@ def _kasa_refresh_devices() -> int:
     return len(devices)
 
 
-async def _kasa_update_state_async() -> None:
-    """Re-query is_on + brightness for each cached Kasa device."""
+def _log_kasa_external_change(name: str, new_on: bool, detail: str = None) -> None:
+    """Log a Kasa state change detected by polling — meaning a physical
+    switch press, Kasa schedule fire, or Kasa-app toggle changed the state
+    without our UI being involved. Logged under system='kasa' with
+    source='live' to distinguish from home_control/ui actions."""
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute(
+                'INSERT INTO event_log '
+                '(ts, system, event_type, title, detail, result, source) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (int(time.time()), 'kasa',
+                 'plug_turned_on' if new_on else 'plug_turned_off',
+                 f'{name} turned {"on" if new_on else "off"}',
+                 detail or 'external (switch or schedule)', 'ok', 'live')
+            )
+    except Exception as exc:
+        print(f'Kasa external-change log error: {exc}')
+
+
+def _kasa_uptime_hint(dev) -> str:
+    """Return a short description of device uptime if available, else ''.
+
+    Kasa devices expose uptime via sys_info[on_time] (seconds since last
+    power-on). Very short uptime on an OFF event suggests the device just
+    rebooted (which defaults to OFF on most dimmer firmware)."""
+    try:
+        sys_info = getattr(dev, 'sys_info', None) or {}
+        # Different firmware versions nest this differently
+        on_time = sys_info.get('on_time')
+        if on_time is None and 'system' in sys_info:
+            on_time = (sys_info.get('system', {}).get('get_sysinfo', {})
+                       .get('on_time'))
+        if on_time is None:
+            return ''
+        on_time = int(on_time)
+        if on_time < 60:
+            return f'uptime {on_time}s (likely reboot)'
+        if on_time < 3600:
+            return f'uptime {on_time // 60}m'
+        return f'uptime {on_time // 3600}h{(on_time % 3600) // 60}m'
+    except Exception:
+        return ''
+
+
+def _log_kasa_reachability(name: str, event: str, detail: str = None) -> None:
+    """Log a Kasa device going offline or coming back online. System='kasa',
+    source='live'."""
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute(
+                'INSERT INTO event_log '
+                '(ts, system, event_type, title, detail, result, source) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (int(time.time()), 'kasa', event, f'{name} {event}',
+                 detail, 'ok', 'live')
+            )
+    except Exception as exc:
+        print(f'Kasa reachability log error: {exc}')
+
+
+async def _kasa_ensure_connection(mac: str, info: dict):
+    """Return the persistent Device for mac. Reconnects via Discover.discover_single
+    if we don't have a live connection yet (first poll after startup, or after
+    a previous failure)."""
     from kasa import Discover
+    dev = _kasa_connections.get(mac)
+    if dev is not None:
+        return dev
+    ip = info.get('ip')
+    if not ip:
+        raise RuntimeError(f'No IP for Kasa {mac}')
+    dev = await Discover.discover_single(ip)
+    await dev.update()
+    _kasa_connections[mac] = dev
+    return dev
+
+
+async def _kasa_update_state_async() -> None:
+    """Poll each cached Kasa device using its persistent connection. No
+    per-poll reconnects — this avoids the KLAP handshake churn that was
+    knocking sensitive dimmers off WiFi. Respects per-device quarantine
+    after 3 consecutive failures. Log:
+      - State changes vs. the LAST KNOWN state (survives poll failures)
+      - Offline/online + quarantine transitions"""
+    now = time.time()
     for mac, info in list(_kasa_devices.items()):
-        ip = info.get('ip')
-        if not ip:
+        if not info.get('ip'):
             continue
+        # Honor quarantine backoff
+        q = _kasa_quarantine.get(mac, 0)
+        if q and now < q:
+            continue
+        name = info.get('alias') or f'Kasa {mac[-5:]}'
         try:
-            dev = await Discover.discover_single(ip)
+            dev = await _kasa_ensure_connection(mac, info)
             await dev.update()
-            info['on']        = bool(getattr(dev, 'is_on', False))
-            info['last_seen'] = time.time()
+            new_on     = bool(getattr(dev, 'is_on', False))
+            last_known = info.get('last_known_on')
+            # Released from quarantine
+            if mac in _kasa_quarantine:
+                _kasa_quarantine.pop(mac, None)
+                _log_kasa_reachability(name, 'online',
+                                       'released from quarantine')
+            # Came back online after a gap
+            elif info.get('was_offline'):
+                _log_kasa_reachability(name, 'online',
+                                       f'state={"on" if new_on else "off"}')
+            info['was_offline'] = False
+            _kasa_failures.pop(mac, None)
+            # State change vs last known (bridges across poll failures)
+            if last_known is not None and new_on != last_known:
+                uptime_hint = _kasa_uptime_hint(dev)
+                detail = 'external (switch or schedule)'
+                if uptime_hint:
+                    detail = f'{detail} · {uptime_hint}'
+                _log_kasa_external_change(name, new_on, detail)
+            info['on']            = new_on
+            info['last_known_on'] = new_on
+            info['last_seen']     = time.time()
             if info.get('dimmable'):
                 b = _kasa_read_brightness(dev)
                 if b is not None:
                     info['brightness'] = b
         except Exception as exc:
-            info['on'] = None
-            print(f'Kasa state poll failed for {mac} ({ip}): {exc}')
+            # Lost connection — drop the stale Device so next cycle reconnects
+            old = _kasa_connections.pop(mac, None)
+            if old is not None:
+                try:
+                    if hasattr(old, 'disconnect'):
+                        await old.disconnect()
+                except Exception:
+                    pass
+            _kasa_mark_failure(mac, name, str(exc))
 
 
 def _kasa_poll_state() -> None:
@@ -2769,30 +3006,27 @@ def _kasa_poll_state() -> None:
     if not _kasa_devices:
         return
     try:
-        asyncio.run(_kasa_update_state_async())
+        _kasa_submit(_kasa_update_state_async(), timeout=60)
     except Exception as exc:
         print(f'Kasa poll error: {exc}')
 
 
 async def _kasa_set_async(mac: str, on: bool) -> bool:
-    """Set Kasa device on/off. Returns new is_on state. Raises on failure."""
-    from kasa import Discover
+    """Set Kasa device on/off via its persistent connection. Returns new is_on state."""
     info = _kasa_devices.get(mac)
     if not info:
         raise ValueError(f'Unknown Kasa MAC: {mac}')
-    ip = info.get('ip')
-    if not ip:
-        raise ValueError(f'No IP for Kasa {mac}')
-    dev = await Discover.discover_single(ip)
-    await dev.update()
+    dev = await _kasa_ensure_connection(mac, info)
     if on:
         await dev.turn_on()
     else:
         await dev.turn_off()
     await dev.update()
     new_state = bool(getattr(dev, 'is_on', False))
-    info['on'] = new_state
-    info['last_seen'] = time.time()
+    info['on']            = new_state
+    info['last_known_on'] = new_state
+    info['last_seen']     = time.time()
+    _kasa_failures.pop(mac, None)
     if info.get('dimmable'):
         b = _kasa_read_brightness(dev)
         if b is not None:
@@ -2801,20 +3035,15 @@ async def _kasa_set_async(mac: str, on: bool) -> bool:
 
 
 async def _kasa_set_brightness_async(mac: str, brightness: int) -> dict:
-    """Set brightness 0-100 on a Kasa dimmer.  Turns device on if b>0 and off,
-    turns off if b=0 and on.  Returns {on, brightness}."""
-    from kasa import Discover
+    """Set brightness 0-100 on a Kasa dimmer via its persistent connection.
+    Turns device on if b>0 and off, turns off if b=0 and on."""
     info = _kasa_devices.get(mac)
     if not info:
         raise ValueError(f'Unknown Kasa MAC: {mac}')
     if not info.get('dimmable'):
         raise ValueError(f'Kasa {mac} is not dimmable')
-    ip = info.get('ip')
-    if not ip:
-        raise ValueError(f'No IP for Kasa {mac}')
     b = max(0, min(100, int(brightness)))
-    dev = await Discover.discover_single(ip)
-    await dev.update()
+    dev = await _kasa_ensure_connection(mac, info)
     was_on = bool(getattr(dev, 'is_on', False))
     if b > 0:
         if not was_on:
@@ -2827,20 +3056,31 @@ async def _kasa_set_brightness_async(mac: str, brightness: int) -> dict:
     await dev.update()
     new_on = bool(getattr(dev, 'is_on', False))
     new_b  = _kasa_read_brightness(dev)
-    info['on']         = new_on
-    info['brightness'] = new_b if new_b is not None else b
-    info['last_seen']  = time.time()
+    info['on']            = new_on
+    info['last_known_on'] = new_on
+    info['brightness']    = new_b if new_b is not None else b
+    info['last_seen']     = time.time()
+    _kasa_failures.pop(mac, None)
     return {'on': new_on, 'brightness': info['brightness']}
 
 
 def kasa_set(mac: str, on: bool) -> bool:
     """Sync wrapper for Kasa on/off.  Returns new state."""
-    return asyncio.run(_kasa_set_async(mac, on))
+    try:
+        return _kasa_submit(_kasa_set_async(mac, on), timeout=20)
+    except Exception:
+        # Connection may have gone stale — drop it so next attempt reconnects
+        _kasa_connections.pop(mac, None)
+        raise
 
 
 def kasa_set_brightness(mac: str, brightness: int) -> dict:
     """Sync wrapper for Kasa dimmer brightness.  Returns {on, brightness}."""
-    return asyncio.run(_kasa_set_brightness_async(mac, brightness))
+    try:
+        return _kasa_submit(_kasa_set_brightness_async(mac, brightness), timeout=20)
+    except Exception:
+        _kasa_connections.pop(mac, None)
+        raise
 
 
 # ── Alexa (alexapy, routines-based control) ──────────────────────────────────
@@ -3091,7 +3331,10 @@ def _tuya_load_devicefile() -> list:
 
 
 def _tuya_make_outlet(dev_id: str, info: dict):
-    """Construct a tinytuya OutletDevice for a cached device."""
+    """Construct a tinytuya OutletDevice with a persistent socket. The socket
+    is kept open between calls so we don't pay the handshake cost on every
+    poll — same fix we did for Kasa, just simpler because tinytuya is sync
+    and exposes a `persist` flag directly."""
     import tinytuya
     ip = info.get('ip')
     if not ip:
@@ -3100,12 +3343,78 @@ def _tuya_make_outlet(dev_id: str, info: dict):
         version = float(info.get('version', '3.3'))
     except (TypeError, ValueError):
         version = 3.3
-    return tinytuya.OutletDevice(
+    dev = tinytuya.OutletDevice(
         dev_id=dev_id,
         address=ip,
         local_key=info.get('local_key', ''),
         version=version,
+        persist=True,
     )
+    dev.set_socketTimeout(5)
+    return dev
+
+
+def _tuya_get_or_connect(dev_id: str, info: dict):
+    """Return the cached persistent OutletDevice for dev_id, constructing it
+    on first use or after a prior failure."""
+    dev = _tuya_connections.get(dev_id)
+    if dev is not None:
+        return dev
+    dev = _tuya_make_outlet(dev_id, info)
+    _tuya_connections[dev_id] = dev
+    return dev
+
+
+def _tuya_close_connection(dev_id: str) -> None:
+    """Close + drop the persistent connection for dev_id (on error or
+    rediscover). Next access will reconnect."""
+    dev = _tuya_connections.pop(dev_id, None)
+    if dev is None:
+        return
+    try:
+        if hasattr(dev, 'close'):
+            dev.close()
+    except Exception:
+        pass
+
+
+def _tuya_close_all() -> None:
+    """Close every persistent Tuya connection (called on rediscover)."""
+    for dev_id in list(_tuya_connections.keys()):
+        _tuya_close_connection(dev_id)
+
+
+def _log_tuya_reachability(name: str, event: str, detail: str = None) -> None:
+    """Log a Tuya device going offline / online / into quarantine. Mirrors
+    the Kasa reachability logger. System='tuya', source='live'."""
+    try:
+        with sqlite3.connect(DB_PATH) as c:
+            c.execute(
+                'INSERT INTO event_log '
+                '(ts, system, event_type, title, detail, result, source) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (int(time.time()), 'tuya', event, f'{name} {event}',
+                 detail, 'ok', 'live')
+            )
+    except Exception as exc:
+        print(f'Tuya reachability log error: {exc}')
+
+
+def _tuya_mark_failure(dev_id: str, name: str, reason: str) -> None:
+    """Track consecutive failures; quarantine after 3 in a row."""
+    count = _tuya_failures.get(dev_id, 0) + 1
+    _tuya_failures[dev_id] = count
+    info = _tuya_devices.get(dev_id) or {}
+    if not info.get('was_offline'):
+        _log_tuya_reachability(name, 'offline', reason[:200])
+        info['was_offline'] = True
+    info['online'] = False
+    if count >= 3 and dev_id not in _tuya_quarantine:
+        _tuya_quarantine[dev_id] = time.time() + 300  # 5 min
+        _log_tuya_reachability(
+            name, 'quarantined',
+            f'{count} consecutive failures; backing off 5 min'
+        )
 
 
 def _parse_tuya_ext_id(ext_id: str):
@@ -3118,21 +3427,28 @@ def _parse_tuya_ext_id(ext_id: str):
 
 
 def _tuya_probe_dps(dev_id: str, info: dict) -> dict:
-    """Connect to a device and return its current dps dict, or {} on error."""
+    """Connect to a device and return its current dps dict, or {} on error.
+    Uses the persistent connection registry so we don't reconnect just to probe."""
     try:
-        dev = _tuya_make_outlet(dev_id, info)
+        dev = _tuya_get_or_connect(dev_id, info)
         status = dev.status()
         if isinstance(status, dict):
             return status.get('dps') or {}
     except Exception as exc:
+        _tuya_close_connection(dev_id)
         print(f'Tuya probe failed for {dev_id}: {exc}')
     return {}
 
 
 def _tuya_refresh_devices() -> int:
     """Load devices.json, scan LAN, probe each device for its switch DPs,
-    upsert one switches_meta row per outlet (multi-outlet strips split)."""
+    upsert one switches_meta row per outlet (multi-outlet strips split).
+    Closes any stale persistent connections first."""
     global _tuya_devices, _tuya_ts
+    # Tear down any existing persistent connections before rebuilding
+    _tuya_close_all()
+    _tuya_failures.clear()
+    _tuya_quarantine.clear()
     file_devs = _tuya_load_devicefile()
     if not file_devs:
         print('Tuya: no devices.json found. Run `python -m tinytuya wizard`.')
@@ -3227,23 +3543,44 @@ def _tuya_refresh_devices() -> int:
 
 
 def _tuya_poll_state() -> None:
-    """Refresh full dps dict for each cached Tuya device (updates per-outlet
-    state for multi-outlet strips). Blocking; runs in the poller thread."""
+    """Refresh full dps dict for each cached Tuya device using its persistent
+    socket. Blocking; runs in the poller thread. Honors per-device quarantine
+    after 3 consecutive failures, mirroring the Kasa refactor."""
     if not _tuya_devices:
         return
+    now = time.time()
     for dev_id, info in list(_tuya_devices.items()):
         if not info.get('ip'):
             continue
+        # Quarantine backoff
+        q = _tuya_quarantine.get(dev_id, 0)
+        if q and now < q:
+            continue
+        name = info.get('name') or f'Tuya {dev_id[-5:]}'
         try:
-            dev = _tuya_make_outlet(dev_id, info)
+            dev = _tuya_get_or_connect(dev_id, info)
             status = dev.status()
-            if isinstance(status, dict):
-                dps = status.get('dps') or {}
-                info['dp_state'] = dps
-                info['last_seen'] = time.time()
-                info['online'] = True
-        except Exception:
-            info['online'] = False
+            if not isinstance(status, dict) or 'Error' in status:
+                raise RuntimeError(
+                    status.get('Error') if isinstance(status, dict)
+                    else f'unexpected status: {status}'
+                )
+            dps = status.get('dps') or {}
+            # Released from quarantine
+            if dev_id in _tuya_quarantine:
+                _tuya_quarantine.pop(dev_id, None)
+                _log_tuya_reachability(name, 'online',
+                                       'released from quarantine')
+            elif info.get('was_offline'):
+                _log_tuya_reachability(name, 'online', 'reconnected')
+            info['was_offline'] = False
+            info['dp_state']    = dps
+            info['last_seen']   = time.time()
+            info['online']      = True
+            _tuya_failures.pop(dev_id, None)
+        except Exception as exc:
+            _tuya_close_connection(dev_id)
+            _tuya_mark_failure(dev_id, name, str(exc))
 
 
 # ── Abode alarm control (uses existing _abode_instance) ──────────────────────
@@ -3290,28 +3627,32 @@ def abode_arm_home() -> str:
 
 
 def tuya_set(ext_id: str, on: bool) -> bool:
-    """Toggle a single Tuya outlet (identified by 'dev_id:dp_idx' external_id)."""
+    """Toggle a single Tuya outlet (identified by 'dev_id:dp_idx' external_id).
+    Uses the persistent connection; drops + reconnects on failure."""
     dev_id, dp_idx = _parse_tuya_ext_id(ext_id)
     info = _tuya_devices.get(dev_id)
     if not info:
         raise ValueError(f'Unknown Tuya device: {dev_id}')
     if not info.get('ip'):
         raise RuntimeError(f'Tuya {dev_id} has no LAN IP (may be offline)')
-    dev = _tuya_make_outlet(dev_id, info)
-    # set_value takes the DP index (int). For single-outlet devices with the
-    # master switch on DP 1, dev.turn_on()/turn_off() also works — but
-    # set_value handles all cases including USB ports on strips.
     try:
         dp_as_int = int(dp_idx)
     except ValueError:
         dp_as_int = dp_idx  # some devices use string codes
-    result = dev.set_value(dp_as_int, bool(on))
-    if isinstance(result, dict) and result.get('Error'):
-        raise RuntimeError(f'Tuya error: {result.get("Error")}')
-    # Update local cache so /api/switches reflects immediately.
+    try:
+        dev = _tuya_get_or_connect(dev_id, info)
+        # set_value handles plugs, wall switches, USB ports, multi-gang strips.
+        result = dev.set_value(dp_as_int, bool(on))
+        if isinstance(result, dict) and result.get('Error'):
+            raise RuntimeError(f'Tuya error: {result.get("Error")}')
+    except Exception:
+        # Drop the socket so the next op reconnects cleanly.
+        _tuya_close_connection(dev_id)
+        raise
     dp_state = info.setdefault('dp_state', {})
     dp_state[dp_idx] = bool(on)
     info['last_seen'] = time.time()
+    _tuya_failures.pop(dev_id, None)
     return bool(on)
 
 
@@ -5009,82 +5350,22 @@ def _build_ai_context():
 
 _ai_cache = {'text': None, 'model': None, 'ts': 0, 'table': None}
 
-_AI_CACHE_TTL = 1800  # 30 minutes
+# Cache never auto-expires. Invalidated only on:
+#   - rule create/update/delete (sets ts=0)
+#   - explicit refresh request (?refresh=1 query param)
+#   - server restart (in-memory only)
 
 
-@app.route('/api/rules/ai-insights', methods=['POST'])
-def api_rules_ai_insights():
-    # Return cached response if fresh
-    if _ai_cache['text'] and (time.time() - _ai_cache['ts']) < _AI_CACHE_TTL:
-        return jsonify({'ok': True, 'insights': _ai_cache['text'], 'model': _ai_cache['model'],
-                        'projection_table': _ai_cache['table'],
-                        'optimized_table': _ai_cache.get('optimized'), 'cached': True})
-
-    api_key = get_setting('gemini_api_key', '')
-    model   = get_setting('gemini_model', 'gemini-2.0-flash')
-    if not api_key:
-        return jsonify({'ok': False, 'error': 'Gemini API key not configured. Add it in Settings.'}), 400
-
-    try:
-        context, table_md, opt_md = _build_ai_context()
-        system_prompt = _gemini_system_prompt(_load_tou_periods())
-        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
-        payload = {
-            'system_instruction': {'parts': [{'text': system_prompt}]},
-            'contents': [{'parts': [{'text': f'Here is the current home energy data:\n\n{context}'}]}],
-            'generationConfig': {
-                'temperature': 0.2,
-                'maxOutputTokens': 65536,
-                'thinkingConfig': {'thinkingBudget': 0},
-            },
-        }
-        resp = _requests.post(url, json=payload, timeout=300)
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Extract text from Gemini response
-        text = ''
-        candidates = data.get('candidates', [])
-        if candidates:
-            parts = candidates[0].get('content', {}).get('parts', [])
-            text = '\n'.join(p.get('text', '') for p in parts)
-
-        if not text:
-            return jsonify({'ok': False, 'error': 'Gemini returned an empty response.'}), 502
-
-        _ai_cache['text'] = text
-        _ai_cache['model'] = model
-        _ai_cache['table'] = table_md
-        _ai_cache['optimized'] = opt_md
-        _ai_cache['ts'] = time.time()
-        return jsonify({'ok': True, 'insights': text, 'model': model,
-                        'projection_table': table_md, 'optimized_table': opt_md})
-
-    except _requests.exceptions.Timeout:
-        return jsonify({'ok': False, 'error': 'Gemini API timed out. Try again.'}), 504
-    except _requests.exceptions.HTTPError as exc:
-        status = exc.response.status_code if exc.response else 500
-        body = ''
-        try:
-            body = exc.response.json().get('error', {}).get('message', str(exc))
-        except Exception:
-            body = str(exc)
-        return jsonify({'ok': False, 'error': f'Gemini API error ({status}): {body}'}), 502
-    except Exception as exc:
-        return jsonify({'ok': False, 'error': str(exc)}), 500
+class _ProviderError(Exception):
+    """Raised by provider call helpers. Carries transient/permanent flag."""
+    def __init__(self, message, status=None, transient=False):
+        super().__init__(message)
+        self.status = status
+        self.transient = transient
 
 
-@app.route('/api/rules/ai-insights/debug')
-def api_rules_ai_insights_debug():
-    """Debug endpoint — returns full prompt, context, raw Gemini response, and token usage."""
-    api_key = get_setting('gemini_api_key', '')
-    model   = get_setting('gemini_model', 'gemini-2.0-flash')
-    if not api_key:
-        return jsonify({'ok': False, 'error': 'No API key'}), 400
-
-    context, _, _ = _build_ai_context()
-    system_prompt = _gemini_system_prompt(_load_tou_periods())
-    user_msg = f'Here is the current home energy data:\n\n{context}'
+def _call_gemini(system_prompt: str, user_msg: str, model: str, api_key: str) -> str:
+    """Call Gemini once. Returns response text or raises _ProviderError."""
     url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
     payload = {
         'system_instruction': {'parts': [{'text': system_prompt}]},
@@ -5095,40 +5376,272 @@ def api_rules_ai_insights_debug():
             'thinkingConfig': {'thinkingBudget': 0},
         },
     }
-
     try:
         resp = _requests.post(url, json=payload, timeout=300)
-        raw = resp.json()
-    except Exception as exc:
-        return jsonify({'ok': False, 'error': str(exc)}), 500
+    except _requests.exceptions.Timeout:
+        raise _ProviderError('Timeout', status=504, transient=True)
+    except _requests.exceptions.ConnectionError as exc:
+        raise _ProviderError(f'Connection error: {exc}', status=None, transient=True)
 
-    # Extract parts
+    if resp.status_code == 429 or resp.status_code >= 500:
+        try:
+            msg = resp.json().get('error', {}).get('message', resp.text[:200])
+        except Exception:
+            msg = resp.text[:200]
+        raise _ProviderError(msg, status=resp.status_code, transient=True)
+    if resp.status_code >= 400:
+        try:
+            msg = resp.json().get('error', {}).get('message', resp.text[:200])
+        except Exception:
+            msg = resp.text[:200]
+        raise _ProviderError(msg, status=resp.status_code, transient=False)
+
+    data = resp.json()
     text = ''
-    candidates = raw.get('candidates', [])
-    finish_reason = None
+    candidates = data.get('candidates', [])
     if candidates:
         parts = candidates[0].get('content', {}).get('parts', [])
         text = '\n'.join(p.get('text', '') for p in parts)
-        finish_reason = candidates[0].get('finishReason')
+    if not text:
+        raise _ProviderError('Empty response', status=200, transient=True)
+    return text
 
-    usage = raw.get('usageMetadata', {})
 
-    return jsonify({
-        'ok': resp.status_code == 200,
-        'model': model,
+def _call_azure_openai(system_prompt: str, user_msg: str,
+                       endpoint: str, deployment: str, api_key: str,
+                       api_version: str) -> str:
+    """Call Azure OpenAI chat/completions once. Returns response text or raises _ProviderError."""
+    endpoint = endpoint.rstrip('/')
+    url = f'{endpoint}/openai/deployments/{deployment}/chat/completions?api-version={api_version}'
+    payload = {
+        'messages': [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': user_msg},
+        ],
+        'temperature': 0.2,
+        'max_tokens': 4000,
+    }
+    headers = {'api-key': api_key, 'Content-Type': 'application/json'}
+    try:
+        resp = _requests.post(url, json=payload, headers=headers, timeout=300)
+    except _requests.exceptions.Timeout:
+        raise _ProviderError('Timeout', status=504, transient=True)
+    except _requests.exceptions.ConnectionError as exc:
+        raise _ProviderError(f'Connection error: {exc}', status=None, transient=True)
+
+    if resp.status_code >= 400:
+        try:
+            msg = resp.json().get('error', {}).get('message', resp.text[:200])
+        except Exception:
+            msg = resp.text[:200]
+        transient = resp.status_code == 429 or resp.status_code >= 500
+        raise _ProviderError(msg, status=resp.status_code, transient=transient)
+
+    data = resp.json()
+    choices = data.get('choices', [])
+    if not choices:
+        raise _ProviderError('Empty response', status=200, transient=True)
+    text = choices[0].get('message', {}).get('content', '')
+    if not text:
+        raise _ProviderError('Empty content', status=200, transient=True)
+    return text
+
+
+def _azure_configured() -> bool:
+    return bool(
+        get_setting('azure_openai_endpoint', '') and
+        get_setting('azure_openai_api_key', '') and
+        get_setting('azure_openai_deployment', '')
+    )
+
+
+@app.route('/api/rules/ai-insights', methods=['POST'])
+def api_rules_ai_insights():
+    # Respect explicit refresh request (bypasses cache)
+    force_refresh = request.args.get('refresh') == '1'
+
+    # Return cached response if available and not invalidated (ts > 0)
+    if not force_refresh and _ai_cache['text'] and _ai_cache['ts'] > 0:
+        return jsonify({'ok': True, 'insights': _ai_cache['text'], 'model': _ai_cache['model'],
+                        'projection_table': _ai_cache['table'],
+                        'optimized_table': _ai_cache.get('optimized'), 'cached': True,
+                        'provider': _ai_cache.get('provider', 'gemini')})
+
+    gemini_key = get_setting('gemini_api_key', '')
+    gemini_model = get_setting('gemini_model', 'gemini-2.0-flash')
+    if not gemini_key and not _azure_configured():
+        return jsonify({'ok': False, 'error': 'No AI provider configured. Add a Gemini or Azure OpenAI key in Settings.'}), 400
+
+    context, table_md, opt_md = _build_ai_context()
+    system_prompt = _gemini_system_prompt(_load_tou_periods())
+    user_msg = f'Here is the current home energy data:\n\n{context}'
+
+    last_err = None
+    last_status = None
+
+    # Phase 1: Gemini with retries (2s, 4s backoff)
+    if gemini_key:
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(2 ** attempt)
+            try:
+                text = _call_gemini(system_prompt, user_msg, gemini_model, gemini_key)
+                _ai_cache['text'] = text
+                _ai_cache['model'] = gemini_model
+                _ai_cache['table'] = table_md
+                _ai_cache['optimized'] = opt_md
+                _ai_cache['provider'] = 'gemini'
+                _ai_cache['ts'] = time.time()
+                return jsonify({'ok': True, 'insights': text, 'model': gemini_model,
+                                'projection_table': table_md, 'optimized_table': opt_md,
+                                'provider': 'gemini'})
+            except _ProviderError as exc:
+                last_err = str(exc)
+                last_status = exc.status
+                print(f'Gemini attempt {attempt + 1}/3 failed ({exc.status}): {exc}')
+                if not exc.transient:
+                    break  # don't retry permanent errors like 401, 400
+            except Exception as exc:
+                last_err = str(exc)
+                last_status = 500
+                print(f'Gemini attempt {attempt + 1}/3 unexpected error: {exc}')
+
+    gemini_err = f'Gemini: {last_err} (status {last_status})' if last_err else 'Gemini: not configured'
+
+    # Phase 2: Azure OpenAI fallback (single attempt)
+    if _azure_configured():
+        endpoint = get_setting('azure_openai_endpoint', '')
+        deployment = get_setting('azure_openai_deployment', '')
+        azure_key = get_setting('azure_openai_api_key', '')
+        api_version = get_setting('azure_openai_api_version', '2024-10-21')
+        try:
+            text = _call_azure_openai(system_prompt, user_msg, endpoint, deployment, azure_key, api_version)
+            _ai_cache['text'] = text
+            _ai_cache['model'] = f'azure:{deployment}'
+            _ai_cache['table'] = table_md
+            _ai_cache['optimized'] = opt_md
+            _ai_cache['provider'] = 'azure_openai'
+            _ai_cache['ts'] = time.time()
+            print(f'Gemini failed, Azure OpenAI ({deployment}) succeeded as fallback')
+            return jsonify({'ok': True, 'insights': text, 'model': f'azure:{deployment}',
+                            'projection_table': table_md, 'optimized_table': opt_md,
+                            'provider': 'azure_openai'})
+        except _ProviderError as exc:
+            azure_err = f'Azure: {exc} (status {exc.status})'
+            print(f'Azure OpenAI fallback also failed: {exc}')
+            last_err = f'{gemini_err}; {azure_err}'
+        except Exception as exc:
+            print(f'Azure OpenAI fallback unexpected error: {exc}')
+            last_err = f'{gemini_err}; Azure: {exc}'
+    else:
+        last_err = f'{gemini_err}; Azure not configured'
+
+    # Phase 3: Stale cache fallback
+    if _ai_cache['text']:
+        age_min = int((time.time() - _ai_cache['ts']) / 60)
+        return jsonify({
+            'ok': True,
+            'insights': _ai_cache['text'],
+            'model': _ai_cache['model'],
+            'projection_table': _ai_cache['table'],
+            'optimized_table': _ai_cache.get('optimized'),
+            'cached': True,
+            'stale': True,
+            'stale_age_min': age_min,
+            'provider': _ai_cache.get('provider', 'gemini'),
+            'stale_reason': f'All providers unavailable. Showing cached response from {age_min} min ago. Last error: {last_err}',
+        })
+
+    # Phase 4: Hard error
+    return jsonify({'ok': False, 'error': f'AI providers unavailable. {last_err}'}), 502
+
+
+@app.route('/api/rules/ai-insights/debug')
+def api_rules_ai_insights_debug():
+    """Debug endpoint — returns full prompt, context, raw response, and token usage.
+    Uses the same Gemini-then-Azure fallback logic as the main endpoint."""
+    gemini_key = get_setting('gemini_api_key', '')
+    gemini_model = get_setting('gemini_model', 'gemini-2.0-flash')
+
+    context, _, _ = _build_ai_context()
+    system_prompt = _gemini_system_prompt(_load_tou_periods())
+    user_msg = f'Here is the current home energy data:\n\n{context}'
+
+    result = {
         'system_prompt_chars': len(system_prompt),
         'context_chars': len(context),
-        'finish_reason': finish_reason,
-        'usage': {
-            'prompt_tokens': usage.get('promptTokenCount'),
-            'output_tokens': usage.get('candidatesTokenCount'),
-            'thinking_tokens': usage.get('thoughtsTokenCount'),
-            'total_tokens': usage.get('totalTokenCount'),
-        },
-        'response_chars': len(text),
-        'response_text': text,
         'system_prompt': system_prompt,
-    })
+    }
+
+    # Try Gemini first (single attempt — debug doesn't retry)
+    if gemini_key:
+        try:
+            url = f'https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}'
+            payload = {
+                'system_instruction': {'parts': [{'text': system_prompt}]},
+                'contents': [{'parts': [{'text': user_msg}]}],
+                'generationConfig': {
+                    'temperature': 0.2,
+                    'maxOutputTokens': 65536,
+                    'thinkingConfig': {'thinkingBudget': 0},
+                },
+            }
+            resp = _requests.post(url, json=payload, timeout=300)
+            raw = resp.json()
+
+            if resp.status_code == 200:
+                text = ''
+                candidates = raw.get('candidates', [])
+                finish_reason = None
+                if candidates:
+                    parts = candidates[0].get('content', {}).get('parts', [])
+                    text = '\n'.join(p.get('text', '') for p in parts)
+                    finish_reason = candidates[0].get('finishReason')
+                usage = raw.get('usageMetadata', {})
+                result.update({
+                    'ok': True,
+                    'provider': 'gemini',
+                    'model': gemini_model,
+                    'finish_reason': finish_reason,
+                    'usage': {
+                        'prompt_tokens': usage.get('promptTokenCount'),
+                        'output_tokens': usage.get('candidatesTokenCount'),
+                        'thinking_tokens': usage.get('thoughtsTokenCount'),
+                        'total_tokens': usage.get('totalTokenCount'),
+                    },
+                    'response_chars': len(text),
+                    'response_text': text,
+                })
+                return jsonify(result)
+            else:
+                result['gemini_error'] = f'{resp.status_code}: {raw.get("error", {}).get("message", resp.text[:200])}'
+        except Exception as exc:
+            result['gemini_error'] = str(exc)
+
+    # Fallback to Azure
+    if _azure_configured():
+        endpoint = get_setting('azure_openai_endpoint', '')
+        deployment = get_setting('azure_openai_deployment', '')
+        azure_key = get_setting('azure_openai_api_key', '')
+        api_version = get_setting('azure_openai_api_version', '2024-10-21')
+        try:
+            text = _call_azure_openai(system_prompt, user_msg, endpoint, deployment, azure_key, api_version)
+            result.update({
+                'ok': True,
+                'provider': 'azure_openai',
+                'model': f'azure:{deployment}',
+                'response_chars': len(text),
+                'response_text': text,
+            })
+            return jsonify(result)
+        except Exception as exc:
+            result['azure_error'] = str(exc)
+
+    result['ok'] = False
+    result['error'] = 'All providers failed. ' + \
+        f'Gemini: {result.get("gemini_error", "not configured")}. ' + \
+        f'Azure: {result.get("azure_error", "not configured")}.'
+    return jsonify(result), 502
 
 
 # ── Costs + Rates endpoints ──────────────────────────────────────────────────
@@ -5920,7 +6433,9 @@ def api_settings():
             'type': 'continuous',
             'enabled_key': 'kasa_enabled',
             'intervals': [
-                {'key': 'kasa_poll_interval', 'label': 'State poll', 'unit': 's'},
+                {'key': 'kasa_poll_interval',     'label': 'State poll', 'unit': 's'},
+                {'key': 'kasa_state_poll_enabled', 'label': 'Poll device state',
+                 'unit': 'select', 'options': ['0', '1']},
             ],
         },
         {
@@ -5965,12 +6480,23 @@ def api_settings():
         },
         {
             'key': 'gemini',
-            'label': 'Gemini AI',
+            'label': 'Gemini AI (primary)',
             'type': 'configurable',
             'intervals': [
                 {'key': 'gemini_api_key', 'label': 'API Key', 'unit': 'text'},
                 {'key': 'gemini_model', 'label': 'Model', 'unit': 'select',
                  'options': ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.0-flash']},
+            ],
+        },
+        {
+            'key': 'azure_openai',
+            'label': 'Azure OpenAI (fallback)',
+            'type': 'configurable',
+            'intervals': [
+                {'key': 'azure_openai_endpoint', 'label': 'Endpoint', 'unit': 'url'},
+                {'key': 'azure_openai_api_key', 'label': 'API Key', 'unit': 'text'},
+                {'key': 'azure_openai_deployment', 'label': 'Deployment', 'unit': 'text'},
+                {'key': 'azure_openai_api_version', 'label': 'API Version', 'unit': 'text'},
             ],
         },
         {
@@ -6055,6 +6581,12 @@ def _start():
             _abode_seed_alarm_row()
         except Exception as exc:
             print(f'Abode alarm seed error: {exc}')
+    # Start the persistent Kasa asyncio loop so Device connections survive.
+    if get_setting_bool('kasa_enabled', False):
+        try:
+            _kasa_start_loop()
+        except Exception as exc:
+            print(f'Kasa loop start error: {exc}')
     threading.Thread(target=rebuild_daily_costs, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     start_abode_listener()

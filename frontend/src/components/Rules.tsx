@@ -101,8 +101,6 @@ const THINKING_TERMS = [
   'Battery Reserve', 'Net Energy Balance', 'Daily Cycle', 'Weather Patterns',
 ];
 
-const SEVERITY_ICON: Record<string, string> = { warning: '\u26a0\ufe0f', suggestion: '\ud83d\udca1', info: '\u2139\ufe0f' };
-const SEVERITY_CLASS: Record<string, string> = { warning: 'severity-warning', suggestion: 'severity-suggestion', info: 'severity-info' };
 
 export default function Rules({ isActive }: RulesProps) {
   const [rules, setRules] = useState<Rule[]>([]);
@@ -283,68 +281,56 @@ export default function Rules({ isActive }: RulesProps) {
     setInsightsOpen(opening);
 
     if (opening && !insightsLoaded) {
-      setInsightsHtml('<div class="ai-loading-pulse" id="ai-thinking">Analyzing with Rules\u2026</div>');
-      setInsightsElapsed('');
-
-      let idx = 0;
-      thinkingRef.current = setInterval(() => {
-        idx = (idx + 1) % THINKING_TERMS.length;
-        const el = document.getElementById('ai-thinking');
-        if (el) el.textContent = 'Analyzing with ' + THINKING_TERMS[idx] + '\u2026';
-      }, 1800);
-
-      const t0 = Date.now();
-      try {
-        const res = await fetch('/api/rules/ai-insights', { method: 'POST' });
-        if (thinkingRef.current) clearInterval(thinkingRef.current);
-        const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
-        const data = await res.json();
-
-        if (data.ok) {
-          const now = new Date();
-          const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-          const cached = data.cached ? ' (cached)' : '';
-          setInsightsElapsed(elapsed + 's \u00b7 ' + timeStr + cached);
-          const tableHtml = data.projection_table
-            ? '<h3>True-up Projection</h3><div class="ai-content">' + mdToHtml(data.projection_table) + '</div><hr>'
-            : '';
-          const optHtml = data.optimized_table
-            ? '<h3>Projected True-Up After Changes</h3><div class="ai-content">' + mdToHtml(data.optimized_table) + '</div>'
-            : '';
-          setInsightsHtml(tableHtml + '<div class="ai-content">' + mdToHtml(data.insights) + '</div>' + optHtml);
-        } else {
-          const fallback = await fetch('/api/rules/insights').then((r) => r.json());
-          setInsightsHtml(
-            '<div class="ai-error">' + (data.error || 'Gemini error') + '</div>' +
-            renderFallback(fallback)
-          );
-        }
-        setInsightsLoaded(true);
-      } catch (e) {
-        if (thinkingRef.current) clearInterval(thinkingRef.current);
-        try {
-          const fallback = await fetch('/api/rules/insights').then((r) => r.json());
-          setInsightsHtml(
-            '<div class="ai-error">Could not reach Gemini API.</div>' + renderFallback(fallback)
-          );
-        } catch (e2) {
-          setInsightsHtml('<div class="ai-error">Failed to load insights.</div>');
-        }
-        setInsightsLoaded(true);
-      }
+      await fetchInsights();
     }
   }
 
-  function renderFallback(insights: any[]): string {
-    if (!insights.length) return '<div class="insights-empty">No insights \u2014 your rules look good!</div>';
-    return '<div class="ai-fallback-note">Gemini unavailable \u2014 showing rule-based analysis</div>' +
-      insights.map((i: any) => `
-        <div class="insight-card ${SEVERITY_CLASS[i.severity] || ''}">
-          <div class="insight-title">${SEVERITY_ICON[i.severity] || ''} ${i.title}</div>
-          <div class="insight-detail">${i.detail}</div>
-          <div class="insight-action">${i.action}</div>
-        </div>
-      `).join('');
+  async function fetchInsights(forceRefresh: boolean = false) {
+    setInsightsHtml('<div class="ai-loading-pulse" id="ai-thinking">Analyzing with Rules…</div>');
+    setInsightsElapsed('');
+
+    let idx = 0;
+    thinkingRef.current = setInterval(() => {
+      idx = (idx + 1) % THINKING_TERMS.length;
+      const el = document.getElementById('ai-thinking');
+      if (el) el.textContent = 'Analyzing with ' + THINKING_TERMS[idx] + '…';
+    }, 1800);
+
+    const t0 = Date.now();
+    try {
+      const res = await fetch('/api/rules/ai-insights' + (forceRefresh ? '?refresh=1' : ''), { method: 'POST' });
+      if (thinkingRef.current) clearInterval(thinkingRef.current);
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      const data = await res.json();
+
+      if (data.ok) {
+        const now = new Date();
+        const timeStr = now.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+        const cached = data.cached ? ' (cached)' : '';
+        const providerTag = data.provider === 'azure_openai' ? ' · via Azure' : '';
+        setInsightsElapsed(elapsed + 's · ' + timeStr + cached + providerTag);
+        const staleHtml = data.stale
+          ? '<div class="ai-error" style="margin-bottom:12px">⚠ AI providers unavailable — showing cached analysis from ' +
+            (data.stale_age_min || '?') + ' min ago.</div>'
+          : '';
+        const tableHtml = data.projection_table
+          ? '<h3>True-up Projection</h3><div class="ai-content">' + mdToHtml(data.projection_table) + '</div><hr>'
+          : '';
+        const optHtml = data.optimized_table
+          ? '<h3>Projected True-Up After Changes</h3><div class="ai-content">' + mdToHtml(data.optimized_table) + '</div>'
+          : '';
+        setInsightsHtml(staleHtml + tableHtml + '<div class="ai-content">' + mdToHtml(data.insights) + '</div>' + optHtml);
+      } else {
+        setInsightsHtml(
+          '<div class="ai-error">' + (data.error || 'AI error') + '</div>'
+        );
+      }
+      setInsightsLoaded(true);
+    } catch (e) {
+      if (thinkingRef.current) clearInterval(thinkingRef.current);
+      setInsightsHtml('<div class="ai-error">Could not reach Gemini API.</div>');
+      setInsightsLoaded(true);
+    }
   }
 
   // ── Rate card rendering ──
@@ -565,9 +551,19 @@ export default function Rules({ isActive }: RulesProps) {
             &#10022; Insights{' '}
             <span className="insights-elapsed">{insightsElapsed}</span>
           </span>
-          <button className="insights-close" onClick={() => setInsightsOpen(false)}>
-            &times;
-          </button>
+          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+            <button
+              className="insights-close"
+              onClick={() => fetchInsights(true)}
+              title="Refresh insights (calls Gemini)"
+              style={{ fontSize: '0.95rem', padding: '4px 10px', width: 'auto' }}
+            >
+              Refresh
+            </button>
+            <button className="insights-close" onClick={() => setInsightsOpen(false)}>
+              &times;
+            </button>
+          </div>
         </div>
         <div className="insights-scroll">
           <div
