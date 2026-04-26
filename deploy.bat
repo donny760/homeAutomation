@@ -71,6 +71,10 @@ if exist "%SERVER_PATH%\rules.log" (
     copy /Y "%SERVER_PATH%\rules.log" "%SERVER_PATH%\rules.log.pre-deploy" >nul
     echo       rules.log        -^> rules.log.pre-deploy
 )
+if exist "%SERVER_PATH%\network_devices.json" (
+    copy /Y "%SERVER_PATH%\network_devices.json" "%SERVER_PATH%\network_devices.json.pre-deploy" >nul
+    echo       network_devices.json -^> network_devices.json.pre-deploy
+)
 
 REM ----- Step 3/3: Copy files -----
 echo.
@@ -83,6 +87,7 @@ for %%f in (
     fetch_rates.py
     backfill.py
     abode_import.py
+    network_devices.py
     requirements.txt
 ) do (
     if exist "%LOCAL_ROOT%\%%f" (
@@ -122,8 +127,8 @@ echo       static\frontend\ mirrored OK - robocopy rc=!ROBO_RC!
 
 REM NOTE: .env is intentionally NOT overwritten - server keeps its own credentials.
 REM       If you need to update .env, copy it manually after verifying new fields.
-REM NOTE: powerwall.db, readings.db, abode.pickle, and rules.log are runtime state
-REM       on the server and are NOT overwritten.
+REM NOTE: powerwall.db, readings.db, abode.pickle, rules.log, and
+REM       network_devices.json are runtime state on the server and are NOT overwritten.
 
 echo.
 echo ============================================================
@@ -141,6 +146,7 @@ echo    Stop the service first, then:
 echo    copy /Y "%SERVER_PATH%\powerwall.db.pre-deploy"  "%SERVER_PATH%\powerwall.db"
 echo    copy /Y "%SERVER_PATH%\readings.db.pre-deploy"   "%SERVER_PATH%\readings.db"
 echo    copy /Y "%SERVER_PATH%\rules.log.pre-deploy"     "%SERVER_PATH%\rules.log"
+echo    copy /Y "%SERVER_PATH%\network_devices.json.pre-deploy" "%SERVER_PATH%\network_devices.json"
 echo    Restore Python files from git, then restart the service.
 echo.
 exit /b 0

@@ -194,6 +194,7 @@ body {
 #page-settings::-webkit-scrollbar,
 .insights-scroll::-webkit-scrollbar,
 .rules-table-wrap::-webkit-scrollbar,
+.net-table-wrap::-webkit-scrollbar,
 .drawer-body::-webkit-scrollbar,
 .modal::-webkit-scrollbar { width: 10px; }
 
@@ -203,6 +204,7 @@ body {
 #page-settings::-webkit-scrollbar-track,
 .insights-scroll::-webkit-scrollbar-track,
 .rules-table-wrap::-webkit-scrollbar-track,
+.net-table-wrap::-webkit-scrollbar-track,
 .drawer-body::-webkit-scrollbar-track,
 .modal::-webkit-scrollbar-track { background: transparent; }
 
@@ -212,6 +214,7 @@ body {
 #page-settings::-webkit-scrollbar-thumb,
 .insights-scroll::-webkit-scrollbar-thumb,
 .rules-table-wrap::-webkit-scrollbar-thumb,
+.net-table-wrap::-webkit-scrollbar-thumb,
 .drawer-body::-webkit-scrollbar-thumb,
 .modal::-webkit-scrollbar-thumb { background: #4a4a50; border-radius: 5px; }
 
@@ -221,6 +224,7 @@ body {
 #page-settings::-webkit-scrollbar-thumb:hover,
 .insights-scroll::-webkit-scrollbar-thumb:hover,
 .rules-table-wrap::-webkit-scrollbar-thumb:hover,
+.net-table-wrap::-webkit-scrollbar-thumb:hover,
 .drawer-body::-webkit-scrollbar-thumb:hover,
 .modal::-webkit-scrollbar-thumb:hover { background: var(--dim); }
 .auto-row {
@@ -262,6 +266,7 @@ body {
 .sched-badge.skip  { background: rgba(239,159,39,0.18); color: var(--amber); }
 .auto-row.rain-delay { opacity: 0.65; }
 .auto-row.rain-delay .auto-name { font-style: italic; }
+.skip-reason { color: var(--amber); margin-left: 6px; font-size: 0.85em; font-style: normal; }
 
 /* ── Chart card ──────────────────────────────────────────────────────────────*/
 .chart-card {
@@ -328,6 +333,48 @@ body {
   overflow: hidden;
 }
 #page-events.active { display: flex; }
+
+/* ── Page: Network Devices ───────────────────────────────────────────────────*/
+#page-network {
+  display: none;
+  flex-direction: column;
+  padding: 16px;
+  gap: 12px;
+  overflow: hidden;
+}
+#page-network.active { display: flex; }
+.net-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; flex-shrink: 0; }
+.net-table-wrap { flex: 1; overflow-y: auto; min-height: 0; }
+.net-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.net-table th { padding: 6px 8px; text-align: left; border-bottom: 1px solid var(--border, #333); }
+.net-table td { padding: 6px 8px; border-bottom: 1px solid var(--border-soft, #222); }
+/* Stale-row de-emphasis: fade based on how long since last_seen.
+   Hover restores full opacity so the row is still inspectable. */
+.net-table tr[data-stale="warm"] { opacity: 0.55; }
+.net-table tr[data-stale="cold"] { opacity: 0.4; }
+.net-table tr[data-stale="warm"]:hover,
+.net-table tr[data-stale="cold"]:hover { opacity: 1; }
+.net-remove-btn {
+  background: none;
+  border: 0.5px solid var(--border);
+  border-radius: 5px;
+  color: #c66;
+  cursor: pointer;
+  padding: 1px 7px;
+  font-size: 0.75rem;
+  margin-left: 6px;
+}
+.net-remove-btn:hover { background: rgba(220, 80, 80, 0.12); color: #e88; }
+.net-remove-confirm { display: inline-flex; gap: 4px; align-items: center; }
+.net-remove-confirm button {
+  font-size: 0.75rem;
+  padding: 1px 7px;
+  border-radius: 5px;
+  border: 0.5px solid var(--border);
+  cursor: pointer;
+}
+.net-remove-confirm .yes { background: #5a3a3a; color: #ffb0b0; border-color: #7a4444; }
+.net-remove-confirm .no  { background: var(--bg); color: var(--dim); }
 
 .events-toolbar {
   display: flex;
@@ -406,43 +453,6 @@ body {
 .event-row.linkable { cursor: pointer; }
 .event-row.linkable:hover { background: var(--bg); }
 .event-link-icon { font-size: 0.7rem; opacity: 0.55; margin-left: 6px; }
-
-.nest-video-modal {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.85);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-}
-.nest-video-modal-inner {
-  position: relative;
-  max-width: 80vw;
-  max-height: 80vh;
-}
-.nest-video-modal video,
-.nest-video-modal img {
-  display: block;
-  max-width: 80vw;
-  max-height: 80vh;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: #000;
-}
-.nest-video-close {
-  position: absolute;
-  top: -36px;
-  right: 0;
-  background: transparent;
-  border: none;
-  color: var(--text);
-  font-size: 1.8rem;
-  cursor: pointer;
-  padding: 0 8px;
-  line-height: 1;
-}
-.nest-video-close:hover { color: var(--nest); }
 
 .event-date-divider {
   display: flex;
@@ -734,15 +744,53 @@ body {
   font-size: 0.85rem;
   text-align: right;
 }
+/* Text-shaped inputs need to flex into the card width and read left-to-right.
+   Override the right-aligned numeric default. min-width:0 lets flex shrink
+   the input so long values don't blow the card width out. */
+.settings-interval input[type="text"],
+.settings-interval input[type="url"],
+.settings-interval input[type="password"],
 .settings-interval input[type="date"] {
-  width: 140px;
+  flex: 1 1 0;
+  min-width: 0;
+  width: auto;
+  text-align: left;
+}
+.settings-interval textarea {
+  flex: 1 1 0;
+  min-width: 0;
   background: var(--bg);
   border: 0.5px solid var(--border);
   border-radius: 6px;
   color: var(--text);
   padding: 4px 8px;
-  font-size: 0.85rem;
+  font-size: 0.78rem;
+  font-family: inherit;
+  resize: vertical;
+  min-height: 56px;
+  line-height: 1.3;
 }
+.settings-interval textarea:focus { outline: none; border-color: var(--amber); }
+.settings-secret-row { display: flex; flex: 1 1 0; min-width: 0; gap: 4px; }
+.settings-secret-toggle {
+  background: none;
+  border: 0.5px solid var(--border);
+  border-radius: 5px;
+  color: var(--dim);
+  padding: 0 8px;
+  font-size: 0.72rem;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.settings-secret-toggle:hover { color: var(--text); }
+/* Stack label above the input on rows with text-shaped values so long
+   labels and long values both fit cleanly inside narrow cards. */
+.settings-interval.text-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+.settings-interval.text-row label { min-width: 0; }
 .settings-interval input:focus { outline: none; border-color: var(--amber); }
 .settings-interval .settings-unit { color: var(--very-dim); font-size: 0.78rem; }
 .settings-unit-select {

@@ -7,6 +7,7 @@ import EventLog from '@/components/EventLog';
 import Rules from '@/components/Rules';
 import EnergyCosts from '@/components/EnergyCosts';
 import Settings from '@/components/Settings';
+import NetworkDevices from '@/components/NetworkDevices';
 import SwitchesDrawer from '@/components/SwitchesDrawer';
 
 export default function Home() {
@@ -16,7 +17,7 @@ export default function Home() {
   useEffect(() => {
     // Restore page from URL hash on initial load
     const hash = location.hash.replace('#', '') as PageName;
-    if (hash && ['dashboard', 'events', 'rules', 'costs', 'settings'].includes(hash)) {
+    if (hash && ['dashboard', 'events', 'rules', 'costs', 'network', 'settings'].includes(hash)) {
       setActivePage(hash);
     } else {
       history.replaceState({ page: 'dashboard' }, '', '#dashboard');
@@ -46,6 +47,7 @@ export default function Home() {
       {activePage === 'events' && <EventLog isActive={activePage === 'events'} />}
       {activePage === 'rules' && <Rules isActive={activePage === 'rules'} />}
       {activePage === 'costs' && <EnergyCosts isActive={activePage === 'costs'} />}
+      {activePage === 'network' && <NetworkDevices isActive={activePage === 'network'} />}
       {activePage === 'settings' && <Settings isActive={activePage === 'settings'} />}
       <SwitchesDrawer open={switchesOpen} onClose={() => setSwitchesOpen(false)} />
     </>

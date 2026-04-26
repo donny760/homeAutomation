@@ -278,7 +278,7 @@ _SETTINGS_DEFAULTS = {
     'azure_openai_api_version':    '2024-10-21',
     # Nest / Google SDM
     'nest_enabled':                '0',
-    'nest_poll_interval':          '15',
+    'nest_poll_interval':          '60',
     'nest_client_id':              os.environ.get('NEST_CLIENT_ID', ''),
     'nest_client_secret':          os.environ.get('NEST_CLIENT_SECRET', ''),
     'nest_project_id':             os.environ.get('NEST_PROJECT_ID', ''),
@@ -307,6 +307,24 @@ _SETTINGS_DEFAULTS = {
     # Tuya (tinytuya, LAN control of Smart Life / Tuya-platform devices)
     'tuya_enabled':                '0',
     'tuya_poll_interval':          '15',
+    # Network devices (LRT224 router + DD-WRT APs, basic auth web scrape)
+    'network_enabled':             '0',
+    'network_poll_interval':       '60',
+    'network_router_url':          '',
+    'network_router_user':         '',
+    'network_router_pass':         '',
+    # SNMP path for the LRT224 (its web UI is JS-rendered, so SNMP is the
+    # only practical way to get its ARP table). Leave snmp_host blank to
+    # fall back to web scraping.
+    'network_router_snmp_host':      '',
+    'network_router_snmp_community': 'public',
+    'network_router_snmp_port':      '161',
+    # Local LAN scan (ping-sweep + arp -a from the dashboard host).
+    # The LRT224's web UI is JS-shell and its SNMP agent doesn't expose ARP,
+    # so this is how we get the full LAN device list.
+    'network_local_subnet':        '10.0.0.0/24',
+    # JSON list: [{"name":"Living Room","url":"http://192.168.1.2","user":"root","pass":"…"}, …]
+    'network_aps':                 '[]',
 }
 
 def _seed_settings(conn):
@@ -986,7 +1004,7 @@ def fetch_weather() -> dict:
         '&current_weather=true'
         '&daily=precipitation_sum,cloudcover_mean'
         f'&past_days={lookback}'
-        '&forecast_days=2&timezone=America%2FLos_Angeles'
+        '&forecast_days=3&timezone=America%2FLos_Angeles'
     )
     try:
         with urllib.request.urlopen(url, timeout=10) as r:
@@ -997,15 +1015,27 @@ def fetch_weather() -> dict:
         precip   = daily.get('precipitation_sum', [])
         clouds   = daily.get('cloudcover_mean', [])
 
-        # Tomorrow is the entry after today — last entry if forecast_days=2
-        clouds_tm = clouds[-1] if len(clouds) >= 2 else None
-        rain_tm   = precip[-1] if len(precip) >= 2 else None
+        # With past_days=lookback + forecast_days=3:
+        # indices [0 .. lookback-1] = past days
+        # indices [lookback .. lookback+2] = today, tomorrow, day-after
+        n = len(dates)
+        today_idx    = lookback if n > lookback else None
+        tomorrow_idx = lookback + 1 if n > lookback + 1 else None
 
-        # Rain history: past N days (exclude today and tomorrow forecast)
+        clouds_tm = clouds[tomorrow_idx] if tomorrow_idx is not None else None
+        rain_tm   = precip[tomorrow_idx] if tomorrow_idx is not None else None
+
+        # Rain history: past N days + today (saturation matters now); exclude future forecast
         rain_history = []
         for i, (d, mm) in enumerate(zip(dates, precip)):
-            if i < len(dates) - 2:           # skip today + tomorrow
+            if today_idx is not None and i <= today_idx:
                 rain_history.append({'date': d, 'mm': mm or 0})
+
+        # Forecast lookup by ISO date — covers today, tomorrow, day-after
+        rain_forecast = {}
+        if today_idx is not None:
+            for i in range(today_idx, n):
+                rain_forecast[dates[i]] = precip[i] or 0
 
         _wx_cache = {
             'temp_f':          round(cw.get('temperature', 0) * 9 / 5 + 32, 1),
@@ -1015,6 +1045,7 @@ def fetch_weather() -> dict:
             'tomorrow_rain':   rain_tm,
             'bad_forecast':    (clouds_tm or 0) > 60 or (rain_tm or 0) > 1,
             'rain_history':    rain_history,
+            'rain_forecast':   rain_forecast,
         }
 
         # Fetch AQI from Open-Meteo Air Quality API
@@ -1635,6 +1666,52 @@ def api_debug_rachio_events():
         return jsonify({'error': str(exc)}), 500
 
 
+@app.route('/api/debug/rachio/full')
+def api_debug_rachio_full():
+    """Dump everything we can pull from Rachio for each device — shows all available fields.
+    Tries documented + commonly-undocumented endpoints to find skip prediction data."""
+    def _try(path):
+        try:
+            return _rachio_get(path)
+        except Exception as exc:
+            return {'__error__': str(exc)}
+
+    try:
+        person_id = _rachio_get('/person/info')['id']
+        person    = _rachio_get(f'/person/{person_id}')
+        result = {
+            'person_info':     _try('/person/info'),
+            'person':          person,
+            'devices_full':    {},
+        }
+        for device in person.get('devices', []):
+            did = device['id']
+            zone_ids = [z.get('id') for z in (device.get('zones') or []) if z.get('id')]
+            schedule_ids = [r.get('id') for r in (device.get('scheduleRules') or []) if r.get('id')]
+            flex_ids = [r.get('id') for r in (device.get('flexScheduleRules') or []) if r.get('id')]
+
+            result['devices_full'][did] = {
+                'name':                       device.get('name'),
+                'device_keys':                sorted(device.keys()),
+                'rainDelayExpirationDate':    device.get('rainDelayExpirationDate'),
+                'rainDelayStartDate':         device.get('rainDelayStartDate'),
+                # Try various device sub-endpoints
+                'current_schedule':           _try(f'/device/{did}/current_schedule'),
+                'forecast':                   _try(f'/device/{did}/forecast'),
+                'forecast_summary':           _try(f'/device/{did}/forecast_summary'),
+                'state':                      _try(f'/device/{did}/state'),
+                # Per schedule rule (full detail)
+                'scheduleRule_detail':        {sid: _try(f'/schedulerule/{sid}') for sid in schedule_ids},
+                'scheduleRule_skip':          {sid: _try(f'/schedulerule/{sid}/skip') for sid in schedule_ids},
+                'flexScheduleRule_detail':    {fid: _try(f'/flexschedulerule/{fid}') for fid in flex_ids},
+                # Per zone
+                'zone_detail':                {zid: _try(f'/zone/{zid}') for zid in zone_ids[:3]},  # first 3 only
+            }
+        return jsonify(result)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+
 def _rachio_get(path: str) -> dict:
     req = urllib.request.Request(
         RACHIO_BASE + path,
@@ -1670,6 +1747,26 @@ def _rachio_next_run(start_h: int, start_m: int, rachio_days: set):
             if cdt > now:
                 return cdt
     return None
+
+
+def _rachio_runs_in_window(start_h: int, start_m: int, rachio_days: set,
+                           hours: int = 48, past_hours: int = 0):
+    """Return all local datetimes in [now - past_hours, now + hours] matching hour/minute and day set."""
+    from datetime import time as dt_time
+    run_t  = dt_time(hour=int(start_h), minute=int(start_m))
+    now    = datetime.now()
+    start  = now - timedelta(hours=past_hours)
+    cutoff = now + timedelta(hours=hours)
+    runs   = []
+    total_days = (hours + past_hours) // 24 + 2
+    for delta in range(-((past_hours // 24) + 1), total_days):
+        cdate      = (now + timedelta(days=delta)).date()
+        rachio_dow = (cdate.weekday() + 1) % 7
+        if rachio_dow in rachio_days:
+            cdt = datetime.combine(cdate, run_t)
+            if start <= cdt <= cutoff:
+                runs.append(cdt)
+    return runs
 
 
 def _rachio_days_from_job_types(job_types: list) -> set:
@@ -1825,6 +1922,25 @@ def evaluate_rain_skip() -> None:
                 print(f'Rain skip: {dname} — existing delay until {existing_dt} is longer, skipping')
                 continue
 
+            # Defer if Rachio's own forecast covers the next 24-48h —
+            # Rachio will WI-skip those runs itself; our role is post-rain saturation
+            try:
+                _, threshold_in = _rachio_wi_skip_info(did, lookback_hours=72)
+                forecast_by_date = _rachio_device_forecast(did)
+                today_d    = datetime.now().date()
+                tomorrow_d = today_d + timedelta(days=1)
+                today_in    = forecast_by_date.get(today_d.isoformat(), 0)
+                tomorrow_in = forecast_by_date.get(tomorrow_d.isoformat(), 0)
+                if today_in >= threshold_in or tomorrow_in >= threshold_in:
+                    print(f'Rain skip: {dname} — Rachio forecast covers next 48h '
+                          f'(today={today_in:.2f}", tomorrow={tomorrow_in:.2f}", '
+                          f'threshold={threshold_in:.2f}"), deferring')
+                    continue
+            except Exception as exc:
+                print(f'Rain skip forecast check error: {exc}')
+                # On error, fail safe by deferring (Rachio handles it)
+                continue
+
             # Apply our extended delay (duration from now)
             duration_secs = int(our_end_ts - now_ts)
             _rachio_put(f'/device/{did}/rain_delay', {'id': did, 'duration': duration_secs})
@@ -1860,6 +1976,98 @@ def evaluate_rain_skip() -> None:
         _log_system_error('rachio', 'Rain skip evaluation error', str(exc))
 
 
+def _rachio_device_forecast(device_id: str) -> dict:
+    """Return {ISO_date: calculated_precip_in} from Rachio's own forecast endpoint.
+
+    Same data source Rachio uses internally for Weather Intelligence decisions —
+    far more accurate for predicting skips than Open-Meteo.
+    """
+    forecast_by_date = {}
+    try:
+        data = _rachio_get(f'/device/{device_id}/forecast')
+        if not isinstance(data, dict):
+            return forecast_by_date
+        # Combine 'current' + 'forecast' entries
+        entries = []
+        cur = data.get('current')
+        if isinstance(cur, dict):
+            entries.append(cur)
+        fc = data.get('forecast')
+        if isinstance(fc, list):
+            entries.extend(fc)
+        for entry in entries:
+            ts_ms = entry.get('localizedTimeStamp') or (entry.get('time') and entry.get('time') * 1000)
+            if not ts_ms:
+                continue
+            d = datetime.fromtimestamp(ts_ms / 1000).date().isoformat()
+            precip_in = entry.get('calculatedPrecip')
+            if precip_in is None:
+                precip_in = entry.get('precipIntensity', 0)
+            forecast_by_date[d] = float(precip_in or 0)
+    except Exception as exc:
+        print(f'Rachio device forecast error: {exc}')
+    return forecast_by_date
+
+
+def _rachio_wi_skip_info(device_id: str, lookback_hours: int = 48):
+    """Fetch device events; return (skip_set, threshold_in).
+
+    skip_set: set of (scheduleId, run_dt_local) tuples for past WEATHER_INTELLIGENCE_SKIP events
+    threshold_in: most recent per-schedule rain threshold parsed from event summary (default 0.06)
+    """
+    import re
+    skip_set = set()
+    threshold_in = 0.06  # Rachio's default per-schedule WI threshold
+    try:
+        end_ms   = int(time.time() * 1000)
+        start_ms = end_ms - lookback_hours * 3600 * 1000
+        raw = _rachio_get(f'/device/{device_id}/event?startTime={start_ms}&endTime={end_ms}')
+        if not isinstance(raw, list):
+            return skip_set, threshold_in
+        for ev in raw:
+            if ev.get('subType') != 'WEATHER_INTELLIGENCE_SKIP':
+                continue
+            sched_id = ev.get('scheduleId') or ''
+            summary  = ev.get('summary') or ''
+
+            # Parse "scheduled for M/D at HH:MM AM/PM" from summary
+            m = re.search(r'scheduled for (\d+)/(\d+) at (\d+):(\d+)\s*([AP])M', summary)
+            run_dt = None
+            if m:
+                mo, dy, hh, mm, ap = m.groups()
+                hh = int(hh) % 12
+                if ap == 'P':
+                    hh += 12
+                # Year: assume current year; if month is in the future relative to today, assume previous year
+                year = datetime.now().year
+                try:
+                    candidate = datetime(year, int(mo), int(dy), hh, int(mm))
+                    if candidate > datetime.now() + timedelta(days=1):
+                        candidate = candidate.replace(year=year - 1)
+                    run_dt = candidate
+                except Exception:
+                    run_dt = None
+            # Fallback: use eventDate (within ~3 minutes of the actual run start)
+            if run_dt is None:
+                ed = ev.get('eventDate')
+                if isinstance(ed, (int, float)):
+                    run_dt = datetime.fromtimestamp(ed / 1000)
+
+            if run_dt is not None:
+                skip_set.add((sched_id, run_dt))
+
+            # Extract threshold ("threshold of 0.06 in")
+            tm = re.search(r'threshold of (\d+\.\d+)\s*in', summary)
+            if tm:
+                try:
+                    threshold_in = float(tm.group(1))
+                except Exception:
+                    pass
+    except Exception as exc:
+        print(f'Rachio WI skip fetch error: {exc}')
+    return skip_set, threshold_in
+
+
 def fetch_rachio_schedule() -> list:
     global _rachio_schedule, _rachio_ts
     if not get_setting_bool('rachio_enabled', True):
@@ -1870,71 +2078,71 @@ def fetch_rachio_schedule() -> list:
     try:
         person_id = _rachio_get('/person/info')['id']
         person    = _rachio_get(f'/person/{person_id}')
-        now_utc   = datetime.now(timezone.utc)
-        cutoff    = now_utc + timedelta(hours=48)
         events    = []
+        now_local = datetime.now()
+
         for device in person.get('devices', []):
             rules = device.get('scheduleRules', [])
             print(f'Rachio device {device.get("name","?")}: {len(rules)} schedule rules')
+
+            # Active rain delay window for this device (None if no delay)
+            rd_until = None
+            rd_exp = device.get('rainDelayExpirationDate')
+            if rd_exp and isinstance(rd_exp, (int, float)) and rd_exp > 0:
+                rd_dt = datetime.fromtimestamp(rd_exp / 1000, tz=timezone.utc).astimezone().replace(tzinfo=None)
+                if rd_dt > now_local:
+                    rd_until = rd_dt
+
+            # Rachio's per-schedule WI threshold (parsed from past skip summaries)
+            _wi_skip_set, threshold_in = _rachio_wi_skip_info(device['id'], lookback_hours=48)
+
+            # Rachio's own forecast — same source it uses for WI skip decisions
+            forecast_by_date = _rachio_device_forecast(device['id'])
 
             for rule in rules:
                 if not rule.get('enabled', True):
                     continue
                 try:
-                    run_dt = None
-
-                    # Try nextRunDate first (ms int or ISO string)
-                    next_run = rule.get('nextRunDate')
-                    if next_run:
-                        if isinstance(next_run, (int, float)):
-                            run_dt = datetime.fromtimestamp(next_run / 1000, tz=timezone.utc).astimezone().replace(tzinfo=None)
-                        else:
-                            run_dt = datetime.fromisoformat(str(next_run).replace('Z', '+00:00')).astimezone().replace(tzinfo=None)
-
-                    # Compute from startHour/startMinute + scheduleJobTypes
-                    if run_dt is None:
-                        h    = rule.get('startHour', 0)
-                        m    = rule.get('startMinute', 0)
-                        days = _rachio_days_from_job_types(rule.get('scheduleJobTypes', []))
-                        run_dt = _rachio_next_run(h, m, days)
-
-                    if run_dt is None:
-                        continue
-
-                    now_local    = datetime.now()
-                    cutoff_local = now_local + timedelta(hours=48)
-                    if not (now_local < run_dt <= cutoff_local):
-                        continue
-
+                    h    = rule.get('startHour', 0)
+                    m    = rule.get('startMinute', 0)
+                    days = _rachio_days_from_job_types(rule.get('scheduleJobTypes', []))
                     duration_min = round(rule.get('totalDuration', rule.get('duration', 0)) / 60)
-                    events.append({
-                        'fire_time':    run_dt.strftime('%Y-%m-%dT%H:%M:%S'),
-                        'name':         rule.get('name', rule.get('externalName', 'Irrigation')),
-                        'duration_min': duration_min,
-                        'source':       'rachio',
-                    })
+                    name         = rule.get('name', rule.get('externalName', 'Irrigation'))
+
+                    # Enumerate future runs only (past runs belong in Event Log)
+                    for run_dt in _rachio_runs_in_window(h, m, days, hours=48):
+                        evt = {
+                            'fire_time':    run_dt.strftime('%Y-%m-%dT%H:%M:%S'),
+                            'name':         name,
+                            'duration_min': duration_min,
+                            'source':       'rachio',
+                        }
+
+                        skip_reason = None
+
+                        # 1. Active rain delay (manual or smart skip)
+                        if rd_until is not None and run_dt <= rd_until:
+                            skip_reason = 'Skipped due to Rain'
+
+                        # 2. Future run with Rachio's own forecast above threshold
+                        if skip_reason is None:
+                            forecast_in = forecast_by_date.get(run_dt.date().isoformat(), 0)
+                            if forecast_in >= threshold_in:
+                                skip_reason = f'Likely skipped — {forecast_in:.2f}" forecast'
+
+                        if skip_reason:
+                            evt['skip']        = True
+                            evt['skip_reason'] = skip_reason
+                        events.append(evt)
                 except Exception as exc:
                     print(f'Rachio rule skip: {exc}')
                     continue
 
-            # Check for active rain delay on this device
-            rd_exp = device.get('rainDelayExpirationDate')
-            if rd_exp and isinstance(rd_exp, (int, float)) and rd_exp > 0:
-                rd_dt = datetime.fromtimestamp(rd_exp / 1000, tz=timezone.utc).astimezone().replace(tzinfo=None)
-                if rd_dt > datetime.now():
-                    rd_label = f'{rd_dt.month}/{rd_dt.day} {rd_dt.strftime("%I:%M%p").lstrip("0")}'
-                    events.append({
-                        'fire_time':    rd_dt.strftime('%Y-%m-%dT%H:%M:%S'),
-                        'name':         f'Rain Delay until {rd_label}',
-                        'duration_min': 0,
-                        'source':       'rachio',
-                        'skip':         True,
-                    })
-
         events.sort(key=lambda e: e['fire_time'])
         _rachio_schedule = events
         _rachio_ts = time.time()
-        print(f'Rachio: fetched {len(events)} upcoming events')
+        skipped_count = sum(1 for e in events if e.get('skip'))
+        print(f'Rachio: fetched {len(events)} upcoming events ({skipped_count} skipped)')
     except Exception as exc:
         print(f'Rachio error: {exc}')
     return _rachio_schedule
@@ -2190,9 +2398,7 @@ _nest_devices_raw: list = []    # last raw device list from SDM API (for debug)
 _nest_devices_ts: float = 0.0
 _NEST_DEVICE_CACHE_TTL = 3600   # 1 hour
 _nest_event_counters: dict = {} # running tally of event types seen over time
-_nest_snapshot_stats: dict = {'attempted': 0, 'success': 0, 'expired': 0, 'error': 0, 'skipped_no_trait': 0, 'skipped_no_eventid': 0, 'last_error': None}
 _nest_poll_stats: dict = {'calls': 0, 'last_call_ts': None, 'last_pull_count': None, 'last_error': None, 'pull_count_total': 0}
-NEST_MEDIA_DIR = os.path.join(BASE_DIR, 'nest_media')
 
 NEST_EVENT_TYPE_MAP = {
     'sdm.devices.events.CameraMotion.Motion':  'motion_detected',
@@ -2205,73 +2411,6 @@ NEST_EVENT_TITLE_MAP = {
     'person_detected': 'Person Detected',
     'doorbell_press':  'Doorbell Pressed',
 }
-
-
-def _nest_download_snapshot(device_path, inner_event_id, device_name, ts, token):
-    """Generate and download a JPEG snapshot for a camera event.
-
-    Uses CameraEventImage.GenerateImage — URL is valid for ~30s after the event fires,
-    so this must be called promptly. Returns relative path or None.
-    """
-    try:
-        if not device_path or not inner_event_id:
-            return None
-
-        date_folder = datetime.fromtimestamp(ts).strftime('%Y-%m-%d')
-        device_slug = ''.join(c if c.isalnum() else '_' for c in device_name) or 'unknown'
-        filename = f'{ts}_{device_slug}_{inner_event_id[:12]}.jpg'
-        rel_path = f'{date_folder}/{filename}'
-        abs_dir = os.path.join(NEST_MEDIA_DIR, date_folder)
-        abs_path = os.path.join(abs_dir, filename)
-
-        if os.path.exists(abs_path):
-            return rel_path
-
-        # Step 1: GenerateImage command returns {url, token}
-        _nest_snapshot_stats['attempted'] += 1
-        cmd_resp = _requests.post(
-            f'https://smartdevicemanagement.googleapis.com/v1/{device_path}:executeCommand',
-            headers={'Authorization': f'Bearer {token}'},
-            json={
-                'command': 'sdm.devices.commands.CameraEventImage.GenerateImage',
-                'params': {'eventId': inner_event_id},
-            },
-            timeout=15,
-        )
-        if cmd_resp.status_code != 200:
-            _nest_snapshot_stats['expired'] += 1
-            _nest_snapshot_stats['last_error'] = f'GenerateImage {cmd_resp.status_code}: {cmd_resp.text[:200]}'
-            print(f'Nest snapshot: GenerateImage returned {cmd_resp.status_code} for event {inner_event_id[:12]}')
-            return None
-        result = cmd_resp.json().get('results', {})
-        img_url = result.get('url')
-        img_token = result.get('token')
-        if not img_url or not img_token:
-            return None
-
-        # Step 2: Download the JPEG using the returned token as Basic auth
-        img_resp = _requests.get(
-            img_url,
-            headers={'Authorization': f'Basic {img_token}'},
-            timeout=15,
-            stream=True,
-        )
-        if img_resp.status_code != 200:
-            return None
-
-        os.makedirs(abs_dir, exist_ok=True)
-        with open(abs_path, 'wb') as f:
-            for chunk in img_resp.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-        _nest_snapshot_stats['success'] += 1
-        print(f'Nest snapshot saved: {rel_path}')
-        return rel_path
-    except Exception as exc:
-        _nest_snapshot_stats['error'] += 1
-        _nest_snapshot_stats['last_error'] = str(exc)
-        print(f'Nest snapshot error: {exc}')
-        return None
 
 
 def _nest_ensure_token() -> str | None:
@@ -2373,7 +2512,6 @@ def _nest_refresh_devices(token):
             display = custom or room_name or dev_type or 'Unknown'
             _nest_devices[name] = {
                 'name': display,
-                'has_event_image': 'sdm.devices.traits.CameraEventImage' in traits,
             }
             if dev_type_full == 'sdm.devices.types.THERMOSTAT':
                 tmode    = traits.get('sdm.devices.traits.ThermostatMode', {}) or {}
@@ -2530,12 +2668,6 @@ def _nest_get_device_name(device_path: str, token: str) -> str:
     return device_path.rsplit('/', 1)[-1][:6] if device_path else 'Unknown'
 
 
-def _nest_device_has_event_image(device_path: str) -> bool:
-    """Check if a device supports CameraEventImage (cached). Assumes cache already warm."""
-    info = _nest_devices.get(device_path)
-    return bool(info and info.get('has_event_image'))
-
-
 def fetch_nest_events() -> int:
     """Pull Nest camera/doorbell events from Pub/Sub and log new ones. Returns insert count."""
     import base64 as _b64
@@ -2601,7 +2733,6 @@ def fetch_nest_events() -> int:
 
                 outer_event_id = payload.get('eventId', '')
                 device_name = _nest_get_device_name(device_path, token)
-                supports_snapshot = _nest_device_has_event_image(device_path)
 
                 for sdm_event_key, edata in events.items():
                     # Running counter across all calls (for debugging)
@@ -2612,21 +2743,8 @@ def fetch_nest_events() -> int:
                         continue
 
                     session_id = edata.get('eventSessionId', '')
-                    inner_event_id = edata.get('eventId', '')
-
                     title = f'{device_name}: {NEST_EVENT_TITLE_MAP.get(event_type, event_type)}'
                     detail = f'device: {device_name}  eventId: {outer_event_id}  session: {session_id}'
-
-                    # Attempt snapshot capture for devices that support CameraEventImage
-                    if not supports_snapshot:
-                        _nest_snapshot_stats['skipped_no_trait'] += 1
-                    elif not inner_event_id:
-                        _nest_snapshot_stats['skipped_no_eventid'] += 1
-                    else:
-                        path = _nest_download_snapshot(device_path, inner_event_id, device_name, ts, token)
-                        if path:
-                            detail += f'  media: {path}'
-
                     rows.append((ts, 'nest', event_type, title, detail, 'info', 'live'))
 
             except Exception:
@@ -5980,7 +6098,6 @@ def api_debug_nest_devices():
     return jsonify({
         'devices': summary,
         'event_counters': _nest_event_counters,
-        'snapshot_stats': _nest_snapshot_stats,
         'poll_stats': _nest_poll_stats,
     })
 
@@ -6015,39 +6132,6 @@ def api_debug_nest_peek():
         return jsonify({'count': len(messages), 'messages': decoded})
     except Exception as exc:
         return jsonify({'error': str(exc)}), 500
-
-
-@app.route('/api/debug/nest/media-stats')
-def api_debug_nest_media_stats():
-    """Check nest_media folder contents and event_log for media links."""
-    stats = {'media_dir': NEST_MEDIA_DIR, 'exists': os.path.exists(NEST_MEDIA_DIR)}
-    if stats['exists']:
-        total_files = 0
-        total_bytes = 0
-        by_date = {}
-        for root, dirs, files in os.walk(NEST_MEDIA_DIR):
-            mp4s = [f for f in files if f.endswith('.mp4')]
-            if mp4s:
-                date = os.path.basename(root)
-                size = sum(os.path.getsize(os.path.join(root, f)) for f in mp4s)
-                by_date[date] = {'count': len(mp4s), 'bytes': size}
-                total_files += len(mp4s)
-                total_bytes += size
-        stats['total_files'] = total_files
-        stats['total_mb'] = round(total_bytes / 1024 / 1024, 2)
-        stats['by_date'] = by_date
-    with sqlite3.connect(DB_PATH) as c:
-        total_nest = c.execute("SELECT COUNT(*) FROM event_log WHERE system='nest'").fetchone()[0]
-        with_media = c.execute("SELECT COUNT(*) FROM event_log WHERE system='nest' AND detail LIKE '%media:%'").fetchone()[0]
-    stats['nest_events_total'] = total_nest
-    stats['nest_events_with_media'] = with_media
-    return jsonify(stats)
-
-
-@app.route('/api/nest/media/<path:filename>')
-def api_nest_media(filename):
-    """Serve Nest MP4 clips. Path: YYYY-MM-DD/file.mp4"""
-    return send_from_directory(NEST_MEDIA_DIR, filename, mimetype='video/mp4')
 
 
 # ── Switches drawer endpoints ────────────────────────────────────────────────
@@ -6293,6 +6377,510 @@ def api_debug_kasa():
     })
 
 
+# ── Network device debug endpoints (Phase A: read-only, no DB) ────────────────
+import network_devices as _netdev  # noqa: E402
+
+
+def _network_router_cfg() -> dict[str, str]:
+    return {
+        'url':            get_setting('network_router_url', ''),
+        'user':           get_setting('network_router_user', ''),
+        'pass':           get_setting('network_router_pass', ''),
+        'snmp_host':      get_setting('network_router_snmp_host', ''),
+        'snmp_community': get_setting('network_router_snmp_community', 'public'),
+        'snmp_port':      get_setting('network_router_snmp_port', '161'),
+    }
+
+
+def _network_ap_cfgs() -> list[dict[str, str]]:
+    return _netdev.load_ap_configs(get_setting('network_aps', '[]'))
+
+
+@app.route('/api/debug/network/lrt224')
+def api_debug_network_lrt224():
+    cfg = _network_router_cfg()
+    if not cfg['url']:
+        return jsonify({'error': 'network_router_url not set'}), 400
+    include_raw = request.args.get('raw') == '1'
+    res = _netdev.fetch_lrt224(cfg['url'], cfg['user'], cfg['pass'])
+    if not include_raw:
+        res = {**res, 'raw': {k: f'<{len(v)} chars; pass ?raw=1 to view>'
+                              for k, v in res.get('raw', {}).items()}}
+    return jsonify(res)
+
+
+@app.route('/api/debug/network/config')
+def api_debug_network_config():
+    """Show parsed config so we can spot password-mangling without exposing
+    secrets. Reveals length + character classes + the raw JSON setting so
+    we can see if special chars survived round-trip."""
+    raw = get_setting('network_aps', '[]')
+    aps = _netdev.load_ap_configs(raw)
+
+    def fingerprint(s: str) -> dict:
+        if s is None:
+            return {'len': 0, 'classes': []}
+        classes = set()
+        for ch in s:
+            if ch.isalpha(): classes.add('letter')
+            elif ch.isdigit(): classes.add('digit')
+            elif ch == ' ': classes.add('space')
+            elif ord(ch) < 32: classes.add(f'ctrl-0x{ord(ch):02x}')
+            else: classes.add(f'special-{ch!r}')
+        return {'len': len(s), 'classes': sorted(classes)}
+
+    return jsonify({
+        'aps_raw_json': raw,
+        'aps_parsed_count': len(aps),
+        'aps': [
+            {
+                'name': a.get('name'),
+                'url': a.get('url'),
+                'user': a.get('user'),
+                'pass_fingerprint': fingerprint(a.get('pass', '')),
+            }
+            for a in aps
+        ],
+        'router': {
+            'url': get_setting('network_router_url', ''),
+            'user': get_setting('network_router_user', ''),
+            'pass_fingerprint': fingerprint(get_setting('network_router_pass', '')),
+        },
+    })
+
+
+@app.route('/api/debug/network/local')
+def api_debug_network_local():
+    """Ping-sweep the LAN subnet from the dashboard host and dump the
+    resulting ARP cache. This is the master device list since the LRT224
+    won't share its ARP table."""
+    subnet = request.args.get('subnet') or get_setting('network_local_subnet',
+                                                       '10.0.0.0/24')
+    return jsonify(_netdev.fetch_local_arp(subnet))
+
+
+@app.route('/api/debug/network/lrt224/snmp')
+def api_debug_network_lrt224_snmp():
+    cfg = _network_router_cfg()
+    host = cfg.get('snmp_host') or (cfg.get('url') or '').replace('http://', '') \
+        .replace('https://', '').rstrip('/').split('/')[0].split(':')[0]
+    if not host:
+        return jsonify({'error': 'set network_router_snmp_host (or network_router_url)'}), 400
+    return jsonify(_netdev.fetch_lrt224_snmp(
+        host,
+        community=cfg.get('snmp_community', 'public'),
+        port=int(cfg.get('snmp_port', 161) or 161),
+    ))
+
+
+@app.route('/api/debug/network/lrt224/login_probe')
+def api_debug_network_lrt224_probe():
+    """Inspect the LRT224 login form so we can write the right login flow."""
+    cfg = _network_router_cfg()
+    if not cfg['url']:
+        return jsonify({'error': 'network_router_url not set'}), 400
+    return jsonify(_netdev.lrt224_probe_login(cfg['url']))
+
+
+@app.route('/api/debug/network/ap/<name>/probe')
+def api_debug_network_ap_probe(name):
+    """Try every common DD-WRT auth combo to find one that returns 200."""
+    aps = _network_ap_cfgs()
+    match = next((a for a in aps if a.get('name') == name), None)
+    if not match:
+        return jsonify({'error': f'AP {name!r} not in network_aps',
+                        'available': [a.get('name') for a in aps]}), 404
+    return jsonify(_netdev.ddwrt_probe(match['url'], match.get('user', ''),
+                                       match.get('pass', '')))
+
+
+@app.route('/api/debug/network/ap/<name>')
+def api_debug_network_ap(name):
+    aps = _network_ap_cfgs()
+    match = next((a for a in aps if a.get('name') == name), None)
+    if not match:
+        return jsonify({'error': f'AP {name!r} not in network_aps',
+                        'available': [a.get('name') for a in aps]}), 404
+    include_raw = request.args.get('raw') == '1'
+    res = _netdev.fetch_ddwrt_ap(match['url'], match.get('user', ''),
+                                 match.get('pass', ''), match.get('name', ''))
+    if not include_raw:
+        res = {**res, 'raw': {k: f'<{len(v)} chars; pass ?raw=1 to view>'
+                              for k, v in res.get('raw', {}).items()}}
+    return jsonify(res)
+
+
+@app.route('/api/debug/network/all')
+def api_debug_network_all():
+    res = _netdev.fetch_all(_network_router_cfg(), _network_ap_cfgs(),
+                            local_subnet=get_setting('network_local_subnet',
+                                                     '10.0.0.0/24'))
+    # Strip raw from per-source results unless ?raw=1.
+    if request.args.get('raw') != '1':
+        if res.get('router'):
+            res['router'] = {**res['router'],
+                             'raw': {k: f'<{len(v)} chars>'
+                                     for k, v in res['router'].get('raw', {}).items()}}
+        for ap in res.get('aps', []):
+            ap['raw'] = {k: f'<{len(v)} chars>' for k, v in ap.get('raw', {}).items()}
+    return jsonify(res)
+
+
+# ── Network device persistence + polling (Phase B) ────────────────────────────
+NETWORK_STATE_PATH = os.path.join(BASE_DIR, 'network_devices.json')
+
+# In-memory cache mirrored to disk. Reads from /api/network/devices serve
+# from this; the polling thread updates it then flushes to JSON.
+_network_state: dict[str, dict] = _netdev.load_state(NETWORK_STATE_PATH)
+_network_state_lock = threading.Lock()
+_network_last_poll_ts: float = 0
+_network_last_poll_result: dict = {}
+# Per-AP quarantine: name → unix-ts when we may retry.
+_network_ap_quarantine: dict[str, float] = {}
+_NETWORK_QUARANTINE_SECS = 300  # 5 min after consecutive failures
+
+
+def _network_poll_once() -> dict:
+    """Run one network scan, merge into state, write to JSON.
+    Honors per-AP quarantine to avoid wedging DD-WRT httpd."""
+    global _network_state, _network_last_poll_ts, _network_last_poll_result
+
+    # Filter out quarantined APs.
+    now = time.time()
+    all_aps = _network_ap_cfgs()
+    live_aps = [a for a in all_aps
+                if _network_ap_quarantine.get(a.get('name', ''), 0) <= now]
+
+    res = _netdev.fetch_all(
+        _network_router_cfg(), live_aps,
+        local_subnet=get_setting('network_local_subnet', '10.0.0.0/24'),
+    )
+
+    # Update quarantine based on per-AP error count.
+    for ap_res in res.get('aps', []):
+        name = ap_res.get('ap', '')
+        if not name:
+            continue
+        if ap_res.get('errors'):
+            # Any error → quarantine. Severity-blind on purpose: even a
+            # single ConnectionReset is a sign we're hitting the lockout.
+            _network_ap_quarantine[name] = now + _NETWORK_QUARANTINE_SECS
+        else:
+            _network_ap_quarantine.pop(name, None)
+
+    with _network_state_lock:
+        _netdev.merge_into_state(_network_state, res.get('merged', []),
+                                 now_ts=int(now))
+        try:
+            _netdev.save_state(NETWORK_STATE_PATH, _network_state)
+        except Exception as exc:
+            print(f'network state save error: {exc}')
+
+    _network_last_poll_ts = now
+    _network_last_poll_result = {
+        'devices_seen': len(res.get('merged', [])),
+        'aps_polled': len(res.get('aps', [])),
+        'aps_skipped_quarantined': len(all_aps) - len(live_aps),
+        'elapsed_ms': res.get('elapsed_ms', 0),
+        'errors': sum(len(a.get('errors', [])) for a in res.get('aps', [])),
+    }
+    return _network_last_poll_result
+
+
+def _network_poll_loop():
+    """Daemon thread: poll on `network_poll_interval`, gated by `network_enabled`."""
+    while True:
+        try:
+            interval = max(get_setting_int('network_poll_interval', 60), 30)
+            if get_setting_bool('network_enabled', False):
+                try:
+                    _network_poll_once()
+                except Exception as exc:
+                    print(f'network poll error: {exc}')
+        except Exception as exc:
+            print(f'network loop error: {exc}')
+            interval = 60
+        time.sleep(interval)
+
+
+def _network_state_to_list(state: dict) -> list[dict]:
+    """Project the state dict to a sorted list, with `online` derived from
+    last_seen vs now. Filtered to the configured LAN subnet — devices whose
+    last_ip falls outside the subnet (e.g. WAN-side stragglers, prior
+    subnet relics) are excluded. Devices with no IP at all are kept since
+    we may know them only via wireless association."""
+    import ipaddress
+    now = time.time()
+    online_window = max(get_setting_int('network_poll_interval', 60) * 2, 120)
+    try:
+        net = ipaddress.ip_network(get_setting('network_local_subnet',
+                                               '10.0.0.0/24'),
+                                   strict=False)
+    except ValueError:
+        net = None
+    out = []
+    for mac, d in state.items():
+        ip = d.get('last_ip')
+        if net is not None and ip:
+            try:
+                if ipaddress.ip_address(ip) not in net:
+                    continue
+            except ValueError:
+                continue
+        last_seen = d.get('last_seen') or 0
+        out.append({
+            'mac': mac,
+            'friendly_name': d.get('friendly_name') or '',
+            'notes': d.get('notes') or '',
+            'hidden': bool(d.get('hidden')),
+            'vendor': d.get('vendor'),
+            'last_ip': ip,
+            'last_hostname': d.get('last_hostname'),
+            'nbns_name': d.get('nbns_name'),
+            'last_ap': d.get('last_ap'),
+            'last_signal': d.get('last_signal'),
+            'last_iface': d.get('last_iface'),
+            'first_seen': d.get('first_seen'),
+            'last_seen': last_seen,
+            'online': bool(last_seen and (now - last_seen) <= online_window),
+            'seen_on': d.get('seen_on') or [],
+        })
+    # Numeric IP sort (so 10.0.0.5 comes before 10.0.0.50). Devices without
+    # an IP go to the end.
+    def _ip_key(d):
+        ip = d.get('last_ip') or ''
+        try:
+            return tuple(int(p) for p in ip.split('.'))
+        except (ValueError, AttributeError):
+            return (999, 0, 0, 0)
+    out.sort(key=_ip_key)
+    return out
+
+
+@app.route('/api/network/devices')
+def api_network_devices():
+    online_only = request.args.get('online') == '1'
+    ap_filter = request.args.get('ap')
+    unnamed_only = request.args.get('unnamed') == '1'
+    with _network_state_lock:
+        items = _network_state_to_list(_network_state)
+    if online_only:
+        items = [d for d in items if d['online']]
+    if ap_filter:
+        items = [d for d in items if d['last_ap'] == ap_filter]
+    if unnamed_only:
+        items = [d for d in items if not d['friendly_name']]
+    aps = sorted({d['last_ap'] for d in items if d['last_ap']})
+    return jsonify({
+        'devices': items,
+        'total': len(items),
+        'aps': aps,
+        'last_poll_ts': _network_last_poll_ts,
+        'last_poll': _network_last_poll_result,
+        'enabled': get_setting_bool('network_enabled', False),
+        'quarantined_aps': [
+            {'name': n, 'until': t}
+            for n, t in _network_ap_quarantine.items() if t > time.time()
+        ],
+    })
+
+
+@app.route('/api/network/devices/<mac>', methods=['PUT'])
+def api_network_device_update(mac):
+    mac = mac.lower()
+    body = request.get_json() or {}
+    with _network_state_lock:
+        cur = _network_state.get(mac)
+        if cur is None:
+            # Allow creating a stub for a MAC we haven't observed yet
+            # (e.g. user wants to label a device before it appears).
+            cur = {'first_seen': int(time.time())}
+            _network_state[mac] = cur
+        for field in ('friendly_name', 'notes'):
+            if field in body:
+                cur[field] = str(body[field])[:500]
+        if 'hidden' in body:
+            cur['hidden'] = bool(body['hidden'])
+        try:
+            _netdev.save_state(NETWORK_STATE_PATH, _network_state)
+        except Exception as exc:
+            return jsonify({'error': f'save failed: {exc}'}), 500
+    return jsonify({'ok': True, 'mac': mac, 'device': cur})
+
+
+_NETWORK_REMOVE_MIN_OFFLINE_DAYS = 90
+
+
+@app.route('/api/network/devices/<mac>', methods=['DELETE'])
+def api_network_device_remove(mac):
+    """Permanently remove a device entry from network_devices.json.
+
+    Server-enforced guard: the device must have been offline for at least
+    90 days (last_seen older than 90*86400 seconds ago). This stops a
+    misclicked or buggy client from blowing away a recently-active device.
+    Does NOT touch DD-WRT MAC filter lists — bans persist; clean those up
+    via the separate filter-audit workflow.
+    """
+    mac = mac.lower()
+    with _network_state_lock:
+        cur = _network_state.get(mac)
+        if cur is None:
+            return jsonify({'error': 'unknown mac'}), 404
+        last_seen = cur.get('last_seen') or 0
+        age_days = (time.time() - last_seen) / 86400 if last_seen else None
+        if last_seen and age_days < _NETWORK_REMOVE_MIN_OFFLINE_DAYS:
+            return jsonify({
+                'error': 'device too recent to remove',
+                'last_seen': last_seen,
+                'offline_days': age_days,
+                'min_offline_days': _NETWORK_REMOVE_MIN_OFFLINE_DAYS,
+            }), 400
+        _network_state.pop(mac, None)
+        try:
+            _netdev.save_state(NETWORK_STATE_PATH, _network_state)
+        except Exception as exc:
+            return jsonify({'error': f'save failed: {exc}'}), 500
+    return jsonify({'ok': True, 'mac': mac})
+
+
+@app.route('/api/network/rediscover', methods=['POST'])
+def api_network_rediscover():
+    try:
+        result = _network_poll_once()
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    return jsonify({'ok': True, 'result': result})
+
+
+@app.route('/api/network/ap_filters')
+def api_network_ap_filters():
+    """Surface current per-AP per-radio MAC filter mode + list. Powers the
+    Phase C pin-modal and filter-audit views."""
+    out = []
+    for ap in _network_ap_cfgs():
+        if not ap.get('url'):
+            continue
+        res = _netdev.fetch_ddwrt_ap(ap['url'], ap.get('user', ''),
+                                     ap.get('pass', ''),
+                                     ap.get('name', ap['url']))
+        out.append({
+            'ap': ap.get('name'),
+            'filters': res.get('filters', {}),  # {wl0: {mode,enabled,list}, wl1: {...}}
+            'errors': res.get('errors', []),
+        })
+    return jsonify({'aps': out})
+
+
+def _network_ap_by_name(name: str) -> dict[str, str] | None:
+    return next((a for a in _network_ap_cfgs() if a.get('name') == name), None)
+
+
+@app.route('/api/network/devices/<mac>/filters', methods=['PUT'])
+def api_network_device_filters(mac):
+    """Apply a per-AP per-radio ban map for one MAC. Body shape:
+        {"wl0": {"Master AP": true, "Kid's Room AP": false, ...},
+         "wl1": {...}}
+    `true` means the MAC should be in that AP×radio's deny list (banned),
+    `false` means it should be absent. Server diffs against current state
+    and writes only the APs that need changes.
+    """
+    mac = mac.lower()
+    body = request.get_json() or {}
+    desired: dict[str, dict[str, bool]] = {
+        'wl0': dict(body.get('wl0') or {}),
+        'wl1': dict(body.get('wl1') or {}),
+    }
+
+    aps = _network_ap_cfgs()
+    results = []
+    for ap in aps:
+        ap_name = ap.get('name', '')
+        ap_changed = False
+        for radio in ('wl0', 'wl1'):
+            if ap_name not in desired[radio]:
+                continue
+            want_banned = bool(desired[radio][ap_name])
+            # Read current list.
+            try:
+                read = _netdev.fetch_ddwrt_ap(ap['url'], ap['user'],
+                                              ap['pass'], ap_name)
+                current = list(read.get('filters', {})
+                                   .get(radio, {}).get('list', []))
+            except Exception as e:
+                results.append({'ap': ap_name, 'radio': radio,
+                                'ok': False, 'error': f'read: {e}'})
+                continue
+            current_l = [m.lower() for m in current]
+            if want_banned and mac not in current_l:
+                new_list = current + [mac]
+            elif not want_banned and mac in current_l:
+                new_list = [m for m in current if m.lower() != mac]
+            else:
+                results.append({'ap': ap_name, 'radio': radio,
+                                'ok': True, 'noop': True})
+                continue
+
+            wr = _netdev.ddwrt_set_mac_filter(ap['url'], ap['user'],
+                                              ap['pass'], radio, new_list)
+            ap_changed = ap_changed or wr.get('ok', False)
+            results.append({
+                'ap': ap_name, 'radio': radio,
+                'ok': wr.get('ok', False),
+                'before': len(wr.get('before', [])),
+                'after': len(wr.get('after', [])),
+                'errors': wr.get('errors', []),
+            })
+        if ap_changed:
+            # Drop our cached read of this AP next poll so the Network page
+            # re-renders from fresh data.
+            _network_ap_quarantine.pop(ap_name, None)
+
+    return jsonify({'mac': mac, 'results': results,
+                    'all_ok': all(r.get('ok', True) for r in results)})
+
+
+@app.route('/api/network/devices/<mac>/pin', methods=['POST'])
+def api_network_device_pin(mac):
+    """Pin a wireless device to one AP × band by banning the MAC on every
+    other AP × band combination. Body: {ap, radio} where radio is
+    'wl0' (2.4), 'wl1' (5), or 'either' (allow on both bands of that AP)."""
+    body = request.get_json() or {}
+    target_ap = body.get('ap', '')
+    target_radio = body.get('radio', 'either')
+    if not target_ap:
+        return jsonify({'error': 'ap is required'}), 400
+    if target_radio not in ('wl0', 'wl1', 'either'):
+        return jsonify({'error': 'radio must be wl0/wl1/either'}), 400
+
+    aps = [a.get('name') for a in _network_ap_cfgs() if a.get('name')]
+    if target_ap not in aps:
+        return jsonify({'error': f'unknown ap {target_ap!r}',
+                        'available': aps}), 400
+
+    desired = {'wl0': {}, 'wl1': {}}
+    for ap_name in aps:
+        for radio in ('wl0', 'wl1'):
+            if ap_name == target_ap and (target_radio == 'either'
+                                         or target_radio == radio):
+                desired[radio][ap_name] = False  # allow here
+            else:
+                desired[radio][ap_name] = True   # ban everywhere else
+
+    # Reuse the filters PUT logic.
+    request._cached_json = (True, desired)
+    return api_network_device_filters(mac)
+
+
+@app.route('/api/network/devices/<mac>/unpin', methods=['POST'])
+def api_network_device_unpin(mac):
+    """Remove this MAC from every AP × radio filter list (allow everywhere)."""
+    aps = [a.get('name') for a in _network_ap_cfgs() if a.get('name')]
+    desired = {'wl0': {n: False for n in aps},
+               'wl1': {n: False for n in aps}}
+    request._cached_json = (True, desired)
+    return api_network_device_filters(mac)
+
+
 # ── Event Log endpoint ────────────────────────────────────────────────────────
 @app.route('/api/events')
 def api_events():
@@ -6321,8 +6909,14 @@ def api_events():
     if system == 'errors':
         query += " AND (result = 'failed' OR event_type = 'error')"
     elif system != 'all':
-        query += ' AND system = ?'
-        params.append(system)
+        systems_list = [s.strip() for s in system.split(',') if s.strip()]
+        if len(systems_list) == 1:
+            query += ' AND system = ?'
+            params.append(systems_list[0])
+        elif systems_list:
+            placeholders = ','.join('?' * len(systems_list))
+            query += f' AND system IN ({placeholders})'
+            params.extend(systems_list)
     if etype:
         query += ' AND event_type = ?'
         params.append(etype)
@@ -6415,19 +7009,6 @@ def api_settings():
             'intervals': [],
         },
         {
-            'key': 'nest',
-            'label': 'Nest (Camera/Doorbell)',
-            'type': 'on-demand',
-            'enabled_key': 'nest_enabled',
-            'intervals': [
-                {'key': 'nest_poll_interval',       'label': 'Poll interval',        'unit': 's'},
-                {'key': 'nest_pubsub_subscription', 'label': 'Pub/Sub subscription', 'unit': 'text'},
-                {'key': 'nest_client_id',           'label': 'OAuth Client ID',      'unit': 'text'},
-                {'key': 'nest_client_secret',       'label': 'OAuth Client Secret',  'unit': 'text'},
-                {'key': 'nest_project_id',          'label': 'Device Access Project', 'unit': 'text'},
-            ],
-        },
-        {
             'key': 'kasa',
             'label': 'Kasa Smart Plugs (LAN)',
             'type': 'continuous',
@@ -6514,6 +7095,34 @@ def api_settings():
                 {'key': 'fe_events_interval', 'label': 'Event log', 'unit': 'ms'},
             ],
         },
+        # Long-form cards — kept at the bottom so the shorter ones tile cleanly up top.
+        {
+            'key': 'nest',
+            'label': 'Nest (Camera/Doorbell)',
+            'type': 'on-demand',
+            'enabled_key': 'nest_enabled',
+            'intervals': [
+                {'key': 'nest_poll_interval',       'label': 'Poll interval',        'unit': 's'},
+                {'key': 'nest_pubsub_subscription', 'label': 'Pub/Sub subscription', 'unit': 'text'},
+                {'key': 'nest_client_id',           'label': 'OAuth Client ID',      'unit': 'text'},
+                {'key': 'nest_client_secret',       'label': 'OAuth Client Secret',  'unit': 'text'},
+                {'key': 'nest_project_id',          'label': 'Device Access Project', 'unit': 'text'},
+            ],
+        },
+        {
+            'key': 'network',
+            'label': 'Network Devices (LRT224 + DD-WRT APs)',
+            'type': 'continuous',
+            'enabled_key': 'network_enabled',
+            'intervals': [
+                {'key': 'network_poll_interval', 'label': 'Poll interval', 'unit': 's'},
+                {'key': 'network_router_url',    'label': 'Router URL',    'unit': 'url'},
+                {'key': 'network_router_user',   'label': 'Router user',   'unit': 'text'},
+                {'key': 'network_router_pass',   'label': 'Router pass',   'unit': 'text'},
+                {'key': 'network_local_subnet',  'label': 'LAN subnet (ping-sweep)', 'unit': 'text'},
+                {'key': 'network_aps',           'label': 'APs (JSON)',    'unit': 'text'},
+            ],
+        },
     ]
     return jsonify({'settings': settings, 'connectors': connectors})
 
@@ -6564,7 +7173,6 @@ except ImportError:
 
 def _start():
     os.chdir(BASE_DIR)
-    os.makedirs(NEST_MEDIA_DIR, exist_ok=True)
     init_db()
     _backfill_rates_event_url()
     backfill_history()
@@ -6589,6 +7197,7 @@ def _start():
             print(f'Kasa loop start error: {exc}')
     threading.Thread(target=rebuild_daily_costs, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
+    threading.Thread(target=_network_poll_loop, daemon=True).start()
     start_abode_listener()
     print('Dashboard \u2192 http://localhost:5001')
     app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)

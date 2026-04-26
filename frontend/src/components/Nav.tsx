@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { MONTHS_LBL } from '@/lib/format';
 
-export type PageName = 'dashboard' | 'events' | 'rules' | 'costs' | 'settings';
+export type PageName = 'dashboard' | 'events' | 'rules' | 'costs' | 'network' | 'settings';
 
 interface NavProps {
   activePage: PageName;
@@ -16,6 +16,7 @@ const PAGES: { key: PageName; label: string; sparkle?: boolean }[] = [
   { key: 'events', label: 'Event Log' },
   { key: 'rules', label: 'Powerwall Rules', sparkle: true },
   { key: 'costs', label: 'Energy Breakdown' },
+  { key: 'network', label: 'Network' },
   { key: 'settings', label: 'Settings' },
 ];
 

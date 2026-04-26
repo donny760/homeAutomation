@@ -17,11 +17,8 @@ function extractUrl(detail?: string): string | null {
   return m ? m[0] : null;
 }
 
-function extractMedia(detail?: string): string | null {
-  if (!detail) return null;
-  const m = detail.match(/media:\s*(\S+)/);
-  return m ? m[1] : null;
-}
+const SMART_SWITCH = { icon: '\ud83d\udd0c', label: 'Smart Switch', color: 'var(--gray)' };
+const SDGE         = { icon: '\ud83d\udcb2', label: 'SDG&E',        color: 'var(--amber)' };
 
 const SYSTEM_META: Record<string, { icon: string; label: string; color: string }> = {
   powerwall: { icon: '\u26a1', label: 'Powerwall', color: 'var(--amber)' },
@@ -30,27 +27,25 @@ const SYSTEM_META: Record<string, { icon: string; label: string; color: string }
   pool: { icon: '\ud83c\udfca', label: 'Pool', color: 'var(--pool)' },
   myq: { icon: '\ud83d\ude97', label: 'MyQ', color: 'var(--gray)' },
   nest: { icon: '\ud83d\udcf7', label: 'Cameras', color: 'var(--nest)' },
-  rates: { icon: '\ud83d\udcb2', label: 'Rates', color: 'var(--amber)' },
-  holidays: { icon: '\ud83d\udcc5', label: 'Holidays', color: 'var(--amber)' },
   system: { icon: '\u2699\ufe0f', label: 'System', color: 'var(--gray)' },
   home_control: { icon: '\ud83c\udfe0', label: 'Home Control', color: 'var(--purple)' },
-  kasa: { icon: '\ud83d\udd0c', label: 'Kasa', color: 'var(--blue)' },
-  tuya: { icon: '\ud83d\udd0c', label: 'Tuya', color: '#E5522E' },
+  kasa: SMART_SWITCH,
+  tuya: SMART_SWITCH,
+  rates: SDGE,
+  holidays: SDGE,
 };
 
-const FILTERS: { key: string; label: string }[] = [
+const FILTERS: { key: string; label: string; systems?: string }[] = [
   { key: 'all', label: 'All' },
-  { key: 'powerwall', label: '\u26a1 Powerwall' },
-  { key: 'home_control', label: '\ud83c\udfe0 Home Control' },
-  { key: 'kasa', label: '\ud83d\udd0c Kasa' },
-  { key: 'tuya', label: '\ud83d\udd0c Tuya' },
-  { key: 'rachio', label: '\ud83c\udf3f Rachio/Sprinklers' },
-  { key: 'abode', label: '\ud83d\udd12 Abode' },
-  { key: 'pool', label: '\ud83c\udfca Pool' },
-  { key: 'nest', label: '\ud83d\udcf7 Cameras' },
-  { key: 'rates', label: '\ud83d\udcb2 Rates' },
-  { key: 'holidays', label: '\ud83d\udcc5 Holidays' },
-  { key: 'system', label: '\u2699\ufe0f System' },
+  { key: 'powerwall', label: '\u26a1 Powerwall', systems: 'powerwall' },
+  { key: 'home_control', label: '\ud83c\udfe0 Home Control', systems: 'home_control' },
+  { key: 'smart_switch', label: '\ud83d\udd0c Smart Switch', systems: 'kasa,tuya' },
+  { key: 'rachio', label: '\ud83c\udf3f Rachio/Sprinklers', systems: 'rachio' },
+  { key: 'abode', label: '\ud83d\udd12 Abode', systems: 'abode' },
+  { key: 'pool', label: '\ud83c\udfca Pool', systems: 'pool' },
+  { key: 'nest', label: '\ud83d\udcf7 Cameras', systems: 'nest' },
+  { key: 'sdge', label: '\ud83d\udcb2 SDG&E', systems: 'rates,holidays' },
+  { key: 'system', label: '\u2699\ufe0f System', systems: 'system' },
   { key: 'errors', label: 'Errors' },
 ];
 
@@ -85,22 +80,24 @@ export default function EventLog({ isActive }: EventLogProps) {
   const [hasMore, setHasMore] = useState(true);
   const [startDate, setStartDate] = useState(weekAgo);
   const [endDate, setEndDate] = useState(today);
-  const [videoSrc, setVideoSrc] = useState<string | null>(null);
 
   const offsetRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
   const fetchingRef = useRef(false);
 
   const buildUrl = useCallback(
-    (offset: number, system: string) => {
+    (offset: number, filterKey: string) => {
       const params = new URLSearchParams({
         limit: String(PAGE_SIZE),
         offset: String(offset),
         start: String(dateToUnix(startDate, false)),
         end: String(dateToUnix(endDate, true)),
       });
-      if (system !== 'all') {
-        params.set('system', system);
+      if (filterKey === 'errors') {
+        params.set('system', 'errors');
+      } else if (filterKey !== 'all') {
+        const f = FILTERS.find((x) => x.key === filterKey);
+        if (f?.systems) params.set('system', f.systems);
       }
       return `/api/events?${params}`;
     },
@@ -216,11 +213,8 @@ export default function EventLog({ isActive }: EventLogProps) {
               const timeStr = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
               const isErr = isErrorEvent(e);
               const url = extractUrl(e.detail);
-              const media = extractMedia(e.detail);
-              const rowClass = `event-row${isErr ? ' error' : ''}${url || media ? ' linkable' : ''}`;
-              const onRowClick = media
-                ? () => setVideoSrc(`/api/nest/media/${media}`)
-                : url
+              const rowClass = `event-row${isErr ? ' error' : ''}${url ? ' linkable' : ''}`;
+              const onRowClick = url
                 ? () => window.open(url, '_blank', 'noopener,noreferrer')
                 : undefined;
               return (
@@ -238,12 +232,7 @@ export default function EventLog({ isActive }: EventLogProps) {
                     </div>
                     <div className="event-title">
                       {e.title}
-                      {media && (
-                        <span className="event-link-icon">
-                          {media.match(/\.(jpg|jpeg|png)$/i) ? '\u{1F4F7}' : '\u25B6\uFE0F'}
-                        </span>
-                      )}
-                      {!media && url && <span className="event-link-icon">{'\u{1F517}'}</span>}
+                      {url && <span className="event-link-icon">{'\u{1F517}'}</span>}
                     </div>
                   </div>
                 </span>
@@ -258,18 +247,6 @@ export default function EventLog({ isActive }: EventLogProps) {
           </>
         )}
       </div>
-      {videoSrc && (
-        <div className="nest-video-modal" onClick={() => setVideoSrc(null)}>
-          <div className="nest-video-modal-inner" onClick={(e) => e.stopPropagation()}>
-            <button className="nest-video-close" onClick={() => setVideoSrc(null)}>&times;</button>
-            {videoSrc.match(/\.(jpg|jpeg|png)$/i) ? (
-              <img src={videoSrc} alt="Nest event snapshot" />
-            ) : (
-              <video controls autoPlay src={videoSrc} />
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 }

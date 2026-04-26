@@ -8,6 +8,7 @@ interface ScheduleEntry {
   name: string;
   source?: string;
   skip?: boolean;
+  skip_reason?: string;
   duration_min?: number;
   mode?: string | null;
   reserve?: number | null;
@@ -55,12 +56,16 @@ export default function AutomationsPanel() {
 
               let badges: { text: string; cls: string }[] = [];
               if (isSkip) {
-                badges = [{ text: 'Rain Delay', cls: 'skip' }];
+                // Skip annotation rendered inline with the name; no badge needed
               } else if (isRachio) {
                 if (e.duration_min) badges = [{ text: `${e.duration_min} min`, cls: 'rachio' }];
               } else {
                 badges = settingsBadges(e);
               }
+
+              const skipSuffix = isSkip
+                ? ` (${e.skip_reason || 'Skipped due to Rain'})`
+                : '';
 
               return (
                 <div key={i} className={`auto-row ${nextUp} ${racchioCls} ${skipCls}`.trim()}>
@@ -68,7 +73,10 @@ export default function AutomationsPanel() {
                     <div className="auto-time">{fmtFireTime(e.fire_time)}</div>
                     <div className="auto-source">{isRachio ? 'Rachio/Sprinklers' : 'Powerwall'}</div>
                   </div>
-                  <div className="auto-name">{e.name}</div>
+                  <div className="auto-name">
+                    {e.name}
+                    {skipSuffix && <span className="skip-reason">{skipSuffix}</span>}
+                  </div>
                   {badges.length > 0 && (
                     <div className="auto-badges">
                       {badges.map((b, j) => (

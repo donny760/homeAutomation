@@ -75,6 +75,86 @@ interface SettingsProps {
   isActive: boolean;
 }
 
+// Heuristic: any key that holds a password / API secret / community string
+// gets a password input + show/hide toggle. Catches future cases without
+// requiring a backend change.
+function isSecretKey(key: string): boolean {
+  return /(?:^|_)(password|pass|secret|api_key|client_secret|community)$/i.test(key);
+}
+
+// Long JSON values render better as a multi-line textarea than a 1-line input.
+function isMultilineKey(key: string): boolean {
+  return key === 'network_aps';
+}
+
+function SecretAwareTextarea({ iv, value }: {
+  iv: ConnectorInterval; value: string;
+}) {
+  // Hidden by default since multiline secrets (network_aps JSON contains
+  // AP passwords inline) shouldn't render in plaintext when the page loads.
+  const [reveal, setReveal] = useState(false);
+  return (
+    <div className="settings-interval text-row">
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <label>{iv.label}</label>
+        <button
+          type="button"
+          className="settings-secret-toggle"
+          onClick={() => setReveal((r) => !r)}
+          title={reveal ? 'Hide' : 'Show'}
+        >
+          {reveal ? 'Hide' : 'Show'}
+        </button>
+      </div>
+      <textarea
+        data-key={iv.key}
+        data-storage-unit={iv.unit}
+        defaultValue={value}
+        rows={4}
+        autoComplete="off"
+        spellCheck={false}
+        style={{
+          // CSS blur masks the rendered text without changing the underlying
+          // value, so saves still send the real content.
+          filter: reveal ? undefined : 'blur(5px)',
+          transition: 'filter 0.15s',
+        }}
+      />
+    </div>
+  );
+}
+
+function SecretAwareInput({ iv, value, secret }: {
+  iv: ConnectorInterval; value: string; secret: boolean;
+}) {
+  const [reveal, setReveal] = useState(false);
+  return (
+    <div className="settings-interval text-row">
+      <label>{iv.label}</label>
+      <div className="settings-secret-row">
+        <input
+          type={secret && !reveal ? 'password' : (iv.unit === 'url' ? 'url' : 'text')}
+          data-key={iv.key}
+          data-storage-unit={iv.unit}
+          defaultValue={value}
+          autoComplete={secret ? 'new-password' : 'off'}
+          spellCheck={false}
+        />
+        {secret && (
+          <button
+            type="button"
+            className="settings-secret-toggle"
+            onClick={() => setReveal((r) => !r)}
+            title={reveal ? 'Hide' : 'Show'}
+          >
+            {reveal ? 'Hide' : 'Show'}
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Settings({ isActive }: SettingsProps) {
   const [data, setData] = useState<SettingsData | null>(null);
   const [status, setStatus] = useState('');
@@ -114,11 +194,11 @@ export default function Settings({ isActive }: SettingsProps) {
   async function saveCard(connKey: string) {
     const card = document.querySelector(`[data-connector="${connKey}"]`);
     if (!card) return;
-    const inputs = card.querySelectorAll('input[data-key]:not([type="checkbox"])');
+    const inputs = card.querySelectorAll('input[data-key]:not([type="checkbox"]), textarea[data-key]');
     const selects = card.querySelectorAll('select[data-key]');
     const updates: Record<string, string> = {};
     inputs.forEach((inp) => {
-      const input = inp as HTMLInputElement;
+      const input = inp as HTMLInputElement | HTMLTextAreaElement;
       const key = input.dataset.key!;
       const storageUnit = input.dataset.storageUnit || 's';
       if (storageUnit === 'url' || storageUnit === 'text' || storageUnit === 'date' || storageUnit === 'password') {
@@ -219,18 +299,23 @@ export default function Settings({ isActive }: SettingsProps) {
                 }
 
                 if (iv.unit === 'url' || iv.unit === 'text' || iv.unit === 'password') {
-                  return (
-                    <div key={iv.key} className="settings-interval">
-                      <label>{iv.label}</label>
-                      <input
-                        type={iv.unit === 'password' ? 'password' : 'text'}
-                        data-key={iv.key}
-                        data-storage-unit={iv.unit}
-                        defaultValue={settings[iv.key] || ''}
-                        autoComplete={iv.unit === 'password' ? 'current-password' : 'off'}
-                        style={iv.unit === 'url' ? { flex: 1, width: 'auto' } : { width: '140px' }}
+                  if (isMultilineKey(iv.key)) {
+                    return (
+                      <SecretAwareTextarea
+                        key={iv.key}
+                        iv={iv}
+                        value={settings[iv.key] || ''}
                       />
-                    </div>
+                    );
+                  }
+                  const secret = iv.unit === 'password' || isSecretKey(iv.key);
+                  return (
+                    <SecretAwareInput
+                      key={iv.key}
+                      iv={iv}
+                      value={settings[iv.key] || ''}
+                      secret={secret}
+                    />
                   );
                 }
 
