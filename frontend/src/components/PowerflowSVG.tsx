@@ -144,12 +144,12 @@ export default function PowerflowSVG({ data }: PowerflowSVGProps) {
         <path className="base-path" d="M 210,185 C 210,280 350,295 450,295" />
 
         {/* Animated flow overlays */}
-        <path id="flow-solar-home" className="flow-path" stroke="#EF9F27" d="M 450,55 C 640,55 690,130 690,185" />
-        <path id="flow-solar-battery" className="flow-path" stroke="#EF9F27" d="M 450,55 C 260,55 210,130 210,185" />
-        <path id="flow-solar-grid" className="flow-path" stroke="#EF9F27" d="M 450,55 L 450,295" />
-        <path id="flow-battery-home" className="flow-path" stroke="#1D9E75" d="M 210,185 L 690,185" />
-        <path id="flow-grid-home" className="flow-path" stroke="#888780" d="M 450,295 C 640,295 690,250 690,185" />
-        <path id="flow-battery-grid" className="flow-path" stroke="#1D9E75" d="M 210,185 C 210,280 350,295 450,295" />
+        <path id="flow-solar-home" className="flow-path" stroke="#EF9F27" pathLength={1} d="M 450,55 C 640,55 690,130 690,185" />
+        <path id="flow-solar-battery" className="flow-path" stroke="#EF9F27" pathLength={1} d="M 450,55 C 260,55 210,130 210,185" />
+        <path id="flow-solar-grid" className="flow-path" stroke="#EF9F27" pathLength={1} d="M 450,55 L 450,295" />
+        <path id="flow-battery-home" className="flow-path" stroke="#1D9E75" pathLength={1} d="M 210,185 L 690,185" />
+        <path id="flow-grid-home" className="flow-path" stroke="#888780" pathLength={1} d="M 450,295 C 640,295 690,250 690,185" />
+        <path id="flow-battery-grid" className="flow-path" stroke="#1D9E75" pathLength={1} d="M 210,185 C 210,280 350,295 450,295" />
 
         {/* Solar node */}
         <circle cx="450" cy="55" r="36" className="node-ring" stroke="#EF9F27" />
