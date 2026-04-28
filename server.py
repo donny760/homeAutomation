@@ -41,8 +41,8 @@ POOL_POLL_INTERVAL  = 30           # seconds between pool polls
 RACHIO_API_KEY      = 'dc3c7132-00c1-45dc-910c-0d8f06738b92'
 RACHIO_BASE         = 'https://api.rach.io/1/public'
 RACHIO_TTL          = 300          # 5-minute cache for Rachio schedule
-ABODE_EMAIL         = 'don@nsdsolutions.com'
-ABODE_PASSWORD      = 'RKf3^KH^'
+ABODE_EMAIL         = os.environ.get('ABODE_EMAIL', '')
+ABODE_PASSWORD      = os.environ.get('ABODE_PASSWORD', '')
 
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # no browser caching of static files
@@ -2483,6 +2483,37 @@ NEST_EVENT_TITLE_MAP = {
 }
 
 
+NEST_OAUTH_TOKEN_URL = 'https://oauth2.googleapis.com/token'
+
+
+def _nest_oauth_exchange(extra: dict) -> dict:
+    """POST to Google's OAuth2 token endpoint with client credentials + the
+    caller-supplied grant fields (grant_type, refresh_token or code+redirect_uri).
+    Returns the parsed token response. Raises on HTTP/network error."""
+    client_id     = get_setting('nest_client_id', '')
+    client_secret = get_setting('nest_client_secret', '')
+    data = {'client_id': client_id, 'client_secret': client_secret, **extra}
+    resp = _requests.post(NEST_OAUTH_TOKEN_URL, data=data, timeout=15)
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _nest_save_tokens(tokens: dict, *, save_refresh: bool) -> None:
+    """Persist access_token + expiry (and refresh_token if requested) to settings."""
+    expires_in = tokens.get('expires_in', 3600)
+    rows = [
+        ('nest_access_token', tokens.get('access_token', '')),
+        ('nest_token_expiry', str(int(time.time()) + expires_in - 60)),
+    ]
+    if save_refresh:
+        rows.append(('nest_refresh_token', tokens.get('refresh_token', '')))
+    with sqlite3.connect(DB_PATH) as c:
+        c.executemany(
+            'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', rows
+        )
+        c.commit()
+
+
 def _nest_ensure_token() -> str | None:
     """Return a valid access token, refreshing if expired. Returns None on failure."""
     access_token = get_setting('nest_access_token', '')
@@ -2495,30 +2526,13 @@ def _nest_ensure_token() -> str | None:
     if not refresh_token:
         return None
 
-    client_id     = get_setting('nest_client_id', '')
-    client_secret = get_setting('nest_client_secret', '')
-
     try:
-        resp = _requests.post('https://oauth2.googleapis.com/token', data={
-            'client_id':     client_id,
-            'client_secret': client_secret,
+        tokens = _nest_oauth_exchange({
             'refresh_token': refresh_token,
             'grant_type':    'refresh_token',
-        }, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-
-        new_token  = data['access_token']
-        new_expiry = str(int(time.time()) + data.get('expires_in', 3600) - 60)
-
-        with sqlite3.connect(DB_PATH) as c:
-            c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
-                      ('nest_access_token', new_token))
-            c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
-                      ('nest_token_expiry', new_expiry))
-            c.commit()
-        return new_token
-
+        })
+        _nest_save_tokens(tokens, save_refresh=False)
+        return tokens.get('access_token')
     except Exception as exc:
         print(f'Nest token refresh error: {exc}')
         _log_system_error('nest', 'Token refresh failed', str(exc))
@@ -2649,11 +2663,7 @@ def _nest_thermostat_command(device_path: str, command: str, params: dict) -> di
         timeout=15,
     )
     if resp.status_code >= 400:
-        detail = ''
-        try:
-            detail = resp.json().get('error', {}).get('message', resp.text)
-        except Exception:
-            detail = resp.text
+        detail = _extract_api_error(resp, max_len=len(resp.text or ''))
         raise RuntimeError(f'SDM command {command} failed ({resp.status_code}): {detail}')
     return resp.json() if resp.content else {}
 
@@ -2890,22 +2900,34 @@ def _kasa_submit(coro, timeout: float = 30.0):
     return fut.result(timeout=timeout)
 
 
-def _kasa_mark_failure(mac: str, name: str, reason: str) -> None:
-    """Track consecutive failures. After 3 in a row, put the device in a 5-min
-    quarantine so we stop hammering a stuck/offline plug."""
-    count = _kasa_failures.get(mac, 0) + 1
-    _kasa_failures[mac] = count
-    info = _kasa_devices.get(mac) or {}
+def _device_mark_failure(*, key: str, name: str, reason: str,
+                         failures: dict, devices: dict, quarantine: dict,
+                         log_fn, offline_field: str, offline_value) -> None:
+    """Shared offline/quarantine tracking for Kasa & Tuya plugs.
+    After 3 consecutive failures, quarantines the device for 5 minutes so we
+    stop hammering a stuck/offline plug. `offline_field`/`offline_value` are
+    the per-driver flag set on the device info dict (e.g. 'on'=None for Kasa,
+    'online'=False for Tuya)."""
+    count = failures.get(key, 0) + 1
+    failures[key] = count
+    info = devices.get(key) or {}
     if not info.get('was_offline'):
-        _log_kasa_reachability(name, 'offline', reason[:200])
+        log_fn(name, 'offline', reason[:200])
         info['was_offline'] = True
-    info['on'] = None
-    if count >= 3 and mac not in _kasa_quarantine:
-        _kasa_quarantine[mac] = time.time() + 300  # 5 min
-        _log_kasa_reachability(
-            name, 'quarantined',
-            f'{count} consecutive failures; backing off 5 min'
-        )
+    info[offline_field] = offline_value
+    if count >= 3 and key not in quarantine:
+        quarantine[key] = time.time() + 300  # 5 min
+        log_fn(name, 'quarantined',
+               f'{count} consecutive failures; backing off 5 min')
+
+
+def _kasa_mark_failure(mac: str, name: str, reason: str) -> None:
+    _device_mark_failure(
+        key=mac, name=name, reason=reason,
+        failures=_kasa_failures, devices=_kasa_devices, quarantine=_kasa_quarantine,
+        log_fn=_log_kasa_reachability,
+        offline_field='on', offline_value=None,
+    )
 
 
 async def _kasa_close_all_async() -> None:
@@ -3589,20 +3611,12 @@ def _log_tuya_reachability(name: str, event: str, detail: str = None) -> None:
 
 
 def _tuya_mark_failure(dev_id: str, name: str, reason: str) -> None:
-    """Track consecutive failures; quarantine after 3 in a row."""
-    count = _tuya_failures.get(dev_id, 0) + 1
-    _tuya_failures[dev_id] = count
-    info = _tuya_devices.get(dev_id) or {}
-    if not info.get('was_offline'):
-        _log_tuya_reachability(name, 'offline', reason[:200])
-        info['was_offline'] = True
-    info['online'] = False
-    if count >= 3 and dev_id not in _tuya_quarantine:
-        _tuya_quarantine[dev_id] = time.time() + 300  # 5 min
-        _log_tuya_reachability(
-            name, 'quarantined',
-            f'{count} consecutive failures; backing off 5 min'
-        )
+    _device_mark_failure(
+        key=dev_id, name=name, reason=reason,
+        failures=_tuya_failures, devices=_tuya_devices, quarantine=_tuya_quarantine,
+        log_fn=_log_tuya_reachability,
+        offline_field='online', offline_value=False,
+    )
 
 
 def _parse_tuya_ext_id(ext_id: str):
@@ -5552,6 +5566,15 @@ class _ProviderError(Exception):
         self.transient = transient
 
 
+def _extract_api_error(resp, max_len: int = 200) -> str:
+    """Pull a human-readable error message out of a JSON API response.
+    Falls back to a truncated body when JSON parsing fails."""
+    try:
+        return resp.json().get('error', {}).get('message', resp.text[:max_len])
+    except Exception:
+        return resp.text[:max_len]
+
+
 def _call_gemini(system_prompt: str, user_msg: str, model: str, api_key: str) -> str:
     """Call Gemini once. Returns response text or raises _ProviderError."""
     url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
@@ -5572,17 +5595,9 @@ def _call_gemini(system_prompt: str, user_msg: str, model: str, api_key: str) ->
         raise _ProviderError(f'Connection error: {exc}', status=None, transient=True)
 
     if resp.status_code == 429 or resp.status_code >= 500:
-        try:
-            msg = resp.json().get('error', {}).get('message', resp.text[:200])
-        except Exception:
-            msg = resp.text[:200]
-        raise _ProviderError(msg, status=resp.status_code, transient=True)
+        raise _ProviderError(_extract_api_error(resp), status=resp.status_code, transient=True)
     if resp.status_code >= 400:
-        try:
-            msg = resp.json().get('error', {}).get('message', resp.text[:200])
-        except Exception:
-            msg = resp.text[:200]
-        raise _ProviderError(msg, status=resp.status_code, transient=False)
+        raise _ProviderError(_extract_api_error(resp), status=resp.status_code, transient=False)
 
     data = resp.json()
     text = ''
@@ -5618,12 +5633,8 @@ def _call_azure_openai(system_prompt: str, user_msg: str,
         raise _ProviderError(f'Connection error: {exc}', status=None, transient=True)
 
     if resp.status_code >= 400:
-        try:
-            msg = resp.json().get('error', {}).get('message', resp.text[:200])
-        except Exception:
-            msg = resp.text[:200]
         transient = resp.status_code == 429 or resp.status_code >= 500
-        raise _ProviderError(msg, status=resp.status_code, transient=transient)
+        raise _ProviderError(_extract_api_error(resp), status=resp.status_code, transient=transient)
 
     data = resp.json()
     choices = data.get('choices', [])
@@ -6093,35 +6104,18 @@ def nest_callback():
     if not code:
         return '<h2>Missing authorization code</h2>', 400
 
-    client_id     = get_setting('nest_client_id', '')
-    client_secret = get_setting('nest_client_secret', '')
-    redirect_uri  = request.url_root.rstrip('/') + '/nest/callback'
+    redirect_uri = request.url_root.rstrip('/') + '/nest/callback'
 
     try:
-        resp = _requests.post('https://oauth2.googleapis.com/token', data={
-            'client_id':     client_id,
-            'client_secret': client_secret,
-            'code':          code,
-            'grant_type':    'authorization_code',
-            'redirect_uri':  redirect_uri,
-        }, timeout=15)
-        resp.raise_for_status()
-        tokens = resp.json()
+        tokens = _nest_oauth_exchange({
+            'code':         code,
+            'grant_type':   'authorization_code',
+            'redirect_uri': redirect_uri,
+        })
     except Exception as exc:
         return f'<h2>Token exchange failed</h2><pre>{exc}</pre>', 500
 
-    refresh_token = tokens.get('refresh_token', '')
-    access_token  = tokens.get('access_token', '')
-    expires_in    = tokens.get('expires_in', 3600)
-
-    with sqlite3.connect(DB_PATH) as c:
-        for k, v in [
-            ('nest_refresh_token', refresh_token),
-            ('nest_access_token',  access_token),
-            ('nest_token_expiry',  str(int(time.time()) + expires_in - 60)),
-        ]:
-            c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (k, v))
-        c.commit()
+    _nest_save_tokens(tokens, save_refresh=True)
 
     return ('<h2>Nest connected successfully!</h2>'
             '<p>You can close this tab and return to the dashboard.</p>'

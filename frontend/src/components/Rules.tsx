@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { modeLabel, settingsBadges, DAYS_LBL } from '@/lib/format';
+import { modeLabel, settingsBadges, DAYS_LBL, fmtTime12 } from '@/lib/format';
 import { touPeriod } from '@/lib/tou';
 import { mdToHtml } from '@/lib/markdown';
 
@@ -54,19 +54,10 @@ function nextFireForRule(rule: Rule): string {
     const weekday = (d.getDay() + 6) % 7;
     if (d > now && days.has(weekday) && months.has(d.getMonth() + 1)) {
       const day = DAYS_LBL[d.getDay()].slice(0, 3);
-      const h = d.getHours(), m = d.getMinutes();
-      const ampm = h >= 12 ? 'PM' : 'AM';
-      const h12 = h % 12 || 12;
-      return `${day} ${h12}:${String(m).padStart(2, '0')} ${ampm}`;
+      return `${day} ${fmtTime12(d.getHours(), d.getMinutes())}`;
     }
   }
   return '\u2014';
-}
-
-function fmtTime12(hour: number, minute: number): string {
-  const ampm = hour >= 12 ? 'PM' : 'AM';
-  const h12 = hour % 12 || 12;
-  return `${h12}:${String(minute).padStart(2, '0')} ${ampm}`;
 }
 
 function describeRuleAction(rule: Rule): string {

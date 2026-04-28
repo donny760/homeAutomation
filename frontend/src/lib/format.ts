@@ -51,12 +51,14 @@ export function settingsBadges(e: {
 export const DAYS_LBL = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 export const MONTHS_LBL = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
+export function fmtTime12(hour: number, minute: number): string {
+  const ampm = hour >= 12 ? 'PM' : 'AM';
+  const h12 = hour % 12 || 12;
+  return `${h12}:${String(minute).padStart(2, '0')} ${ampm}`;
+}
+
 export function fmtFireTime(iso: string): string {
   const d = new Date(iso);
   const day = DAYS_LBL[d.getDay()].slice(0, 3);
-  const h = d.getHours(),
-    m = d.getMinutes();
-  const ampm = h >= 12 ? 'PM' : 'AM';
-  const h12 = h % 12 || 12;
-  return `${day} ${h12}:${String(m).padStart(2, '0')} ${ampm}`;
+  return `${day} ${fmtTime12(d.getHours(), d.getMinutes())}`;
 }

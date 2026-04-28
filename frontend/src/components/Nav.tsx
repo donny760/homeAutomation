@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { MONTHS_LBL } from '@/lib/format';
+import { MONTHS_LBL, fmtTime12 } from '@/lib/format';
 
 export type PageName = 'dashboard' | 'events' | 'rules' | 'costs' | 'network' | 'settings';
 
@@ -71,10 +71,7 @@ export default function Nav({ activePage, onPageChange, onOpenSwitches }: NavPro
   useEffect(() => {
     function tick() {
       const n = new Date();
-      const h = n.getHours(), m = n.getMinutes();
-      const ampm = h >= 12 ? 'PM' : 'AM';
-      const h12 = h % 12 || 12;
-      const time = `${h12}:${String(m).padStart(2, '0')} ${ampm}`;
+      const time = fmtTime12(n.getHours(), n.getMinutes());
       const date = `${MONTHS_LBL[n.getMonth()]} ${n.getDate()}`;
       setClock(`${time} \u00b7 ${date}`);
     }

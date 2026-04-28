@@ -361,7 +361,6 @@ D:\projects\homeAutomation\
   rules.py                <- rules engine (reads from SQLite, runs as service)
   fetch_rates.py          <- SDG&E holidays, TOU period, rate page scraper + PDF parser
   backfill.py             <- one-time historical import from Tesla cloud API
-  abode_import.py         <- one-time Abode CSV history importer
   powerwall.db            <- SQLite — readings, rules, daily_costs, event_log,
                               rate_history, settings
   rates.json              <- current SDG&E rates (written by fetch_rates.py, backward compat)
@@ -1175,82 +1174,6 @@ def on_abode_timeline_event(event_json):
 
 Start the abodepy websocket listener as a daemon thread in server.py
 on startup, alongside the existing Powerwall poller thread.
-
----
-
-### Abode historical import — abode_import.py (new script)
-
-One-time script to load Abode's 30-day CSV export into event_log.
-Run manually: `py abode_import.py abode_activity.csv`
-
-Abode's website activity log can be exported as CSV. The script needs
-to be written defensively since Abode's export format is undocumented
-— run it against the actual CSV first and log what columns come back.
-
-```python
-import csv, sqlite3, time, sys
-from datetime import datetime
-
-DB_PATH = 'powerwall.db'
-
-ABODE_TYPE_MAP = {
-    'Closed':     'door_closed',
-    'Open':       'door_open',
-    'LockClosed': 'lock_locked',
-    'LockOpen':   'lock_unlocked',
-    'Motion':     'motion',
-    'Alarm':      'alarm',
-    # add more as seen in actual export
-}
-
-def import_abode_csv(path):
-    inserted = skipped = 0
-    with open(path, newline='', encoding='utf-8-sig') as f:
-        # Print first row to confirm column names before committing anything
-        reader = csv.DictReader(f)
-        print("Columns found:", reader.fieldnames)
-
-        with sqlite3.connect(DB_PATH) as conn:
-            for row in reader:
-                try:
-                    # Adjust field names to match actual Abode CSV export
-                    # Common field names: 'Date', 'Time', 'Event', 'Device', 'User'
-                    # Run once with print(row) to confirm before writing
-                    date_str  = row.get('Date') or row.get('date', '')
-                    time_str  = row.get('Time') or row.get('time', '')
-                    event_str = row.get('Event') or row.get('event', '')
-                    device    = row.get('Device') or row.get('device', '')
-
-                    dt  = datetime.strptime(f"{date_str} {time_str}",
-                                            "%m/%d/%Y %I:%M %p")
-                    ts  = int(dt.timestamp())
-                    evt = ABODE_TYPE_MAP.get(event_str, 'unknown')
-                    title  = f"{device}: {event_str}" if device else event_str
-                    detail = f"imported from Abode activity export"
-
-                    # INSERT OR IGNORE prevents duplicates on re-run
-                    conn.execute(
-                        'INSERT OR IGNORE INTO event_log '
-                        '(ts, system, event_type, title, detail, result, source) '
-                        'VALUES (?,?,?,?,?,?,?)',
-                        (ts, 'abode', evt, title, detail, None, 'import')
-                    )
-                    inserted += 1
-                except Exception as e:
-                    print(f"Skip row: {e} — {row}")
-                    skipped += 1
-            conn.commit()
-
-    print(f"Import complete: {inserted} inserted, {skipped} skipped")
-
-if __name__ == '__main__':
-    import_abode_csv(sys.argv[1])
-```
-
-**Important:** run with `print(row)` on first few rows before writing
-anything — Abode's CSV column names are not publicly documented and
-may differ from what's shown above. Adjust field names to match actual
-export before committing.
 
 ---
 

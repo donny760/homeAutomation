@@ -86,7 +86,6 @@ for %%f in (
     rules.py
     fetch_rates.py
     backfill.py
-    abode_import.py
     network_devices.py
     requirements.txt
 ) do (
