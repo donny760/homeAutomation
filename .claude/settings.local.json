@@ -4,7 +4,14 @@
       "Bash(py -m pip install flask --quiet)",
       "Bash(py -c \"import flask; print\\(''flask'', flask.__version__\\)\")",
       "Bash(py -c \"import pypowerwall; print\\(''pypowerwall ok''\\)\")",
-      "WebSearch"
+      "WebSearch",
+      "Bash(git pull *)",
+      "Bash(git fetch *)",
+      "Bash(npm run *)",
+      "Bash(npm install *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)"
     ]
   }
 }
