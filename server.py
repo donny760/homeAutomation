@@ -229,8 +229,8 @@ _SETTINGS_DEFAULTS = {
     'rachio_poll_interval':        str(RACHIO_TTL),
     'rachio_event_poll_interval':  '1800',    # 30 min — poll for completed watering events
     'rain_skip_enabled':           '0',       # off by default — smart rain skip
-    'rain_lookback_days':          '7',       # days of precipitation history to check
-    'rain_mm_per_skip_day':        '8',       # mm of accumulated rain per skip day
+    'rain_lookback_days':          '5',       # days of precipitation history to check
+    'rain_mm_per_skip_day':        '1',       # mm of accumulated rain per skip day
     'rain_skip_max_days':          '7',       # max skip days to apply
     'rain_skip_check_interval':    '3600',    # 1 hour — how often to evaluate
     'abode_enabled':               '1',
@@ -992,15 +992,39 @@ WMO = {
 }
 
 
+_device_coords: tuple | None = None  # (lat, lng) cached after first successful Rachio lookup
+
+
+def _get_device_coords() -> tuple[float, float]:
+    """Read lat/long from the Rachio device; cache module-level. Falls back to SD downtown."""
+    global _device_coords
+    if _device_coords is not None:
+        return _device_coords
+    try:
+        person_id = _rachio_get('/person/info')['id']
+        person    = _rachio_get(f'/person/{person_id}')
+        for device in person.get('devices', []):
+            lat, lng = device.get('latitude'), device.get('longitude')
+            if lat and lng:
+                _device_coords = (float(lat), float(lng))
+                print(f'Weather: using device coords ({lat}, {lng})')
+                return _device_coords
+    except Exception as exc:
+        print(f'Weather coord lookup error: {exc}')
+    _device_coords = (32.7157, -117.1611)
+    return _device_coords
+
+
 def fetch_weather() -> dict:
     global _wx_cache, _wx_ts
     if time.time() - _wx_ts < WX_TTL:
         return _wx_cache
 
-    lookback = get_setting_int('rain_lookback_days', 7)
+    lookback = get_setting_int('rain_lookback_days', 5)
+    lat, lng = _get_device_coords()
     url = (
         'https://api.open-meteo.com/v1/forecast'
-        '?latitude=32.7157&longitude=-117.1611'
+        f'?latitude={lat}&longitude={lng}'
         '&current_weather=true'
         '&daily=precipitation_sum,cloudcover_mean'
         f'&past_days={lookback}'
@@ -1052,7 +1076,7 @@ def fetch_weather() -> dict:
         try:
             aqi_url = (
                 'https://air-quality-api.open-meteo.com/v1/air-quality'
-                '?latitude=32.7157&longitude=-117.1611'
+                f'?latitude={lat}&longitude={lng}'
                 '&current=us_aqi&timezone=America%2FLos_Angeles'
             )
             with urllib.request.urlopen(aqi_url, timeout=10) as aq:
@@ -1690,6 +1714,9 @@ def api_debug_rachio_full():
             schedule_ids = [r.get('id') for r in (device.get('scheduleRules') or []) if r.get('id')]
             flex_ids = [r.get('id') for r in (device.get('flexScheduleRules') or []) if r.get('id')]
 
+            now_ms = int(time.time() * 1000)
+            future_ms = now_ms + 7 * 86400 * 1000
+
             result['devices_full'][did] = {
                 'name':                       device.get('name'),
                 'device_keys':                sorted(device.keys()),
@@ -1700,9 +1727,21 @@ def api_debug_rachio_full():
                 'forecast':                   _try(f'/device/{did}/forecast'),
                 'forecast_summary':           _try(f'/device/{did}/forecast_summary'),
                 'state':                      _try(f'/device/{did}/state'),
+                # Future-window event probes — does the events endpoint expose scheduled future skips?
+                'events_future':              _try(f'/device/{did}/event?startTime={now_ms}&endTime={future_ms}'),
+                # Possibly-scheduled / upcoming endpoints (undocumented; mostly likely 404)
+                'upcoming':                   _try(f'/device/{did}/upcoming'),
+                'upcoming_runs':              _try(f'/device/{did}/upcoming_runs'),
+                'scheduled_runs':             _try(f'/device/{did}/scheduled_runs'),
+                'scheduled_events':           _try(f'/device/{did}/scheduled_events'),
+                'calendar':                   _try(f'/device/{did}/calendar'),
+                'planned':                    _try(f'/device/{did}/planned'),
                 # Per schedule rule (full detail)
                 'scheduleRule_detail':        {sid: _try(f'/schedulerule/{sid}') for sid in schedule_ids},
                 'scheduleRule_skip':          {sid: _try(f'/schedulerule/{sid}/skip') for sid in schedule_ids},
+                'scheduleRule_next':          {sid: _try(f'/schedulerule/{sid}/next_run') for sid in schedule_ids},
+                'scheduleRule_skipped':       {sid: _try(f'/schedulerule/{sid}/skipped') for sid in schedule_ids},
+                'scheduleRule_upcoming':      {sid: _try(f'/schedulerule/{sid}/upcoming') for sid in schedule_ids},
                 'flexScheduleRule_detail':    {fid: _try(f'/flexschedulerule/{fid}') for fid in flex_ids},
                 # Per zone
                 'zone_detail':                {zid: _try(f'/zone/{zid}') for zid in zone_ids[:3]},  # first 3 only
@@ -1870,12 +1909,17 @@ def fetch_rachio_events() -> int:
 _rain_skip_ts: float = 0.0
 
 
-def evaluate_rain_skip() -> None:
-    """Check accumulated rainfall and extend Rachio rain delay if warranted.
+RAIN_MIN_MM = 1.0  # below this, rain is treated as noise (no qualifying event)
 
-    Cooperates with Rachio's own weather-based skip: only applies a delay
-    if our calculated end time is later than any existing delay.  Never
-    shortens an active Rachio delay.
+
+def evaluate_rain_skip() -> None:
+    """Apply a post-rain saturation buffer that extends ONE+ days past Rachio's last skip.
+
+    Behavior:
+    - Skip end is anchored to max(last_rain_date, last_rachio_wi_skip_date) + skip_days.
+    - skip_days = floor(accumulated_rain_mm / mm_per_skip_day), capped at max_days.
+    - Defers entirely if Rachio's own forecast covers the next 24-48h (Rachio will handle).
+    - Never shortens an active rainDelayExpirationDate.
     """
     global _rain_skip_ts
     if not get_setting_bool('rain_skip_enabled', False):
@@ -1884,23 +1928,29 @@ def evaluate_rain_skip() -> None:
         return
 
     import math
-    mm_per_day = get_setting_int('rain_mm_per_skip_day', 8)
-    max_days   = get_setting_int('rain_skip_max_days', 7)
+    mm_per_day    = get_setting_int('rain_mm_per_skip_day', 1)
+    max_days      = get_setting_int('rain_skip_max_days', 7)
+    lookback_days = get_setting_int('rain_lookback_days', 5)
 
     wx = fetch_weather()
     rain_history = wx.get('rain_history', [])
     if not rain_history:
         return
 
-    accumulated = sum(entry['mm'] for entry in rain_history)
-    skip_days   = min(int(math.floor(accumulated / mm_per_day)), max_days) if mm_per_day > 0 else 0
-
-    if skip_days <= 0:
+    # Need at least one qualifying rain day in window
+    rainy = [(e['date'], e['mm']) for e in rain_history if (e['mm'] or 0) >= RAIN_MIN_MM]
+    if not rainy:
         _rain_skip_ts = time.time()
         return
 
-    now_ts        = time.time()
-    our_end_ts    = now_ts + skip_days * 86400
+    last_rain_date_str = max(rainy, key=lambda r: r[0])[0]
+    last_rain_date     = datetime.strptime(last_rain_date_str, '%Y-%m-%d').date()
+
+    accumulated = sum((e['mm'] or 0) for e in rain_history)
+    skip_days   = min(int(math.floor(accumulated / mm_per_day)), max_days) if mm_per_day > 0 else 0
+    if skip_days <= 0:
+        _rain_skip_ts = time.time()
+        return
 
     try:
         person_id = _rachio_get('/person/info')['id']
@@ -1910,25 +1960,37 @@ def evaluate_rain_skip() -> None:
             did   = device['id']
             dname = device.get('name', '?')
 
-            # Check if Rachio already has an active rain delay
+            # Anchor: latest of (last rain day) or (Rachio's most recent WI skip date)
+            wi_skips, threshold_in = _rachio_wi_skip_info(did, lookback_hours=lookback_days * 24)
+            last_skip_date = None
+            for _sched_id, run_dt in wi_skips:
+                d = run_dt.date()
+                if last_skip_date is None or d > last_skip_date:
+                    last_skip_date = d
+            anchor_date = max(last_rain_date, last_skip_date) if last_skip_date else last_rain_date
+
+            # Fixed end-of-skip — never drags forward across hourly evaluations
+            end_dt     = datetime.combine(anchor_date, datetime.min.time()) + timedelta(days=skip_days)
+            our_end_ts = end_dt.timestamp()
+            now_ts     = time.time()
+            if our_end_ts <= now_ts:
+                continue  # buffer has already passed
+
+            # Existing rainDelayExpirationDate guard — don't shorten manual / prior delay
             existing_end_ts = 0
             rd_exp = device.get('rainDelayExpirationDate')
             if rd_exp and isinstance(rd_exp, (int, float)) and rd_exp > 0:
-                existing_end_ts = rd_exp / 1000  # epoch ms → seconds
-
+                existing_end_ts = rd_exp / 1000
             if existing_end_ts >= our_end_ts:
-                # Rachio's own delay already extends further — don't shorten it
                 existing_dt = datetime.fromtimestamp(existing_end_ts).strftime('%Y-%m-%d %H:%M')
                 print(f'Rain skip: {dname} — existing delay until {existing_dt} is longer, skipping')
                 continue
 
-            # Defer if Rachio's own forecast covers the next 24-48h —
-            # Rachio will WI-skip those runs itself; our role is post-rain saturation
+            # Forecast deferral — if Rachio's forecast says rain in next 24-48h, defer
             try:
-                _, threshold_in = _rachio_wi_skip_info(did, lookback_hours=72)
                 forecast_by_date = _rachio_device_forecast(did)
-                today_d    = datetime.now().date()
-                tomorrow_d = today_d + timedelta(days=1)
+                today_d     = datetime.now().date()
+                tomorrow_d  = today_d + timedelta(days=1)
                 today_in    = forecast_by_date.get(today_d.isoformat(), 0)
                 tomorrow_in = forecast_by_date.get(tomorrow_d.isoformat(), 0)
                 if today_in >= threshold_in or tomorrow_in >= threshold_in:
@@ -1938,23 +2000,28 @@ def evaluate_rain_skip() -> None:
                     continue
             except Exception as exc:
                 print(f'Rain skip forecast check error: {exc}')
-                # On error, fail safe by deferring (Rachio handles it)
-                continue
+                continue  # fail safe — defer to Rachio
 
-            # Apply our extended delay (duration from now)
+            # Apply rain delay anchored to the buffer end
             duration_secs = int(our_end_ts - now_ts)
-            _rachio_put(f'/device/{did}/rain_delay', {'id': did, 'duration': duration_secs})
+            _rachio_put('/device/rain_delay', {'id': did, 'duration': duration_secs})
+
+            # Invalidate the schedule cache so /api/schedule reflects the new delay
+            # immediately on next fetch (instead of waiting for the 3-hour TTL).
+            global _rachio_ts
+            _rachio_ts = 0.0
 
             existing_info = ''
             if existing_end_ts > now_ts:
                 existing_dt = datetime.fromtimestamp(existing_end_ts).strftime('%Y-%m-%d %H:%M')
                 existing_info = f'  existing_delay_until: {existing_dt}'
-            our_end_dt = datetime.fromtimestamp(our_end_ts).strftime('%Y-%m-%d %H:%M')
+            anchor_info = (f'rachio_last_skip: {last_skip_date}'
+                           if last_skip_date else f'last_rain: {last_rain_date}')
             detail = (f'device: {dname}  accumulated: {accumulated:.1f}mm  '
                       f'lookback: {len(rain_history)} days  skip: {skip_days} days  '
-                      f'delay_until: {our_end_dt}{existing_info}')
+                      f'anchor: {anchor_date} ({anchor_info})  '
+                      f'delay_until: {end_dt.strftime("%Y-%m-%d %H:%M")}{existing_info}')
 
-            # Log (deduplicate on today's date so we don't re-log hourly)
             today_ts = int(datetime.now().replace(hour=0, minute=0, second=0).timestamp())
             title    = f'Rain skip: {skip_days} days ({dname})'
             with sqlite3.connect(DB_PATH, timeout=10) as c:
@@ -1968,12 +2035,15 @@ def evaluate_rain_skip() -> None:
                         '(ts, system, event_type, title, detail, result, source) '
                         'VALUES (?,?,?,?,?,?,?)',
                         (today_ts, 'rachio', 'rain_skip_extended', title, detail, 'ok', 'live'))
-            print(f'Rain skip applied: {dname} — {skip_days} days ({accumulated:.1f}mm accumulated)')
+            print(f'Rain skip applied: {dname} — {skip_days} days '
+                  f'(anchor {anchor_date}, end {end_dt.strftime("%Y-%m-%d %H:%M")})')
 
         _rain_skip_ts = time.time()
     except Exception as exc:
-        print(f'Rain skip error: {exc}')
-        _log_system_error('rachio', 'Rain skip evaluation error', str(exc))
+        import traceback
+        err = f'{type(exc).__name__}: {exc}\n' + traceback.format_exc()[-400:]
+        print(f'Rain skip error: {err}')
+        _log_system_error('rachio', 'Rain skip evaluation error', err)
 
 
 def _rachio_device_forecast(device_id: str) -> dict:

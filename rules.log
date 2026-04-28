@@ -104497,3 +104497,28 @@ abodepy.exceptions.AbodeAuthenticationException: <html>
 2026-04-26 14:56:21  INFO      127.0.0.1 - - [26/Apr/2026 14:56:21] "GET /api/network/devices HTTP/1.1" 200 -
 2026-04-26 14:57:20  INFO      127.0.0.1 - - [26/Apr/2026 14:57:20] "GET /api/network/devices HTTP/1.1" 200 -
 2026-04-26 14:57:40  INFO      127.0.0.1 - - [26/Apr/2026 14:57:40] "GET /api/network/devices HTTP/1.1" 200 -
+2026-04-26 18:51:51  INFO      [31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5001
+ * Running on http://10.0.0.163:5001
+2026-04-26 18:51:51  INFO      [33mPress CTRL+C to quit[0m
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET / HTTP/1.1" 200 -
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET /_next/static/css/4362253a4ceb744c.css HTTP/1.1" 200 -
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET /_next/static/chunks/webpack-8658fdbc42bfbbae.js HTTP/1.1" 200 -
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET /_next/static/chunks/fd9d1056-42a1c2df9c4a85a8.js HTTP/1.1" 200 -
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET /_next/static/chunks/117-b25838a9c5b96a27.js HTTP/1.1" 200 -
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET /_next/static/chunks/main-app-d30f677688b44976.js HTTP/1.1" 200 -
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET /_next/static/chunks/ca377847-f43d7cc9c8cd016b.js HTTP/1.1" 200 -
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET /_next/static/chunks/9-8562dee907795732.js HTTP/1.1" 200 -
+2026-04-26 18:53:25  INFO      127.0.0.1 - - [26/Apr/2026 18:53:25] "GET /_next/static/chunks/app/page-c1cadf916b17a5a5.js HTTP/1.1" 200 -
+2026-04-26 18:53:26  INFO      127.0.0.1 - - [26/Apr/2026 18:53:26] "GET /api/weather HTTP/1.1" 200 -
+2026-04-26 18:53:26  INFO      127.0.0.1 - - [26/Apr/2026 18:53:26] "GET /api/today HTTP/1.1" 200 -
+2026-04-26 18:53:26  INFO      127.0.0.1 - - [26/Apr/2026 18:53:26] "GET /api/costs/ytd HTTP/1.1" 200 -
+2026-04-26 18:53:26  INFO      127.0.0.1 - - [26/Apr/2026 18:53:26] "GET /api/rates HTTP/1.1" 200 -
+2026-04-26 18:53:26  INFO      127.0.0.1 - - [26/Apr/2026 18:53:26] "GET /api/pool HTTP/1.1" 200 -
+2026-04-26 18:53:26  INFO      127.0.0.1 - - [26/Apr/2026 18:53:26] "GET /api/security HTTP/1.1" 200 -
+2026-04-26 18:53:26  INFO      127.0.0.1 - - [26/Apr/2026 18:53:26] "GET /api/live HTTP/1.1" 200 -
+2026-04-26 18:53:27  INFO      127.0.0.1 - - [26/Apr/2026 18:53:27] "GET /api/solar-forecast HTTP/1.1" 200 -
+2026-04-26 18:53:27  INFO      127.0.0.1 - - [26/Apr/2026 18:53:27] "GET /api/schedule HTTP/1.1" 200 -
+2026-04-26 18:53:32  INFO      127.0.0.1 - - [26/Apr/2026 18:53:32] "GET /api/debug/rachio/full HTTP/1.1" 200 -
+2026-04-26 18:53:32  INFO      127.0.0.1 - - [26/Apr/2026 18:53:32] "[33mGET /favicon.ico HTTP/1.1[0m" 404 -
