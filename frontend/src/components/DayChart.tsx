@@ -56,7 +56,9 @@ export default function DayChart() {
     chart.update('none');
   }, []);
 
-  const dataRefs = [solarDataRef, homeDataRef, forecastRef];
+  // Refs holding refs — stable identity across renders so the toggleDataset
+  // closure (empty deps) always sees the latest dataset payloads.
+  const dataRefs = useRef([solarDataRef, homeDataRef, forecastRef]);
 
   const toggleDataset = useCallback((index: number) => {
     setVisible((prev) => {
@@ -65,7 +67,7 @@ export default function DayChart() {
       visibilityRef.current = next;
       const chart = chartRef.current;
       if (chart) {
-        chart.data.datasets[index].data = next[index] ? dataRefs[index].current : [];
+        chart.data.datasets[index].data = next[index] ? dataRefs.current[index].current : [];
         chart.update('none');
       }
       return next;

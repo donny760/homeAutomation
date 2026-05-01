@@ -11,6 +11,7 @@ import time
 import sqlite3
 import threading
 import urllib.request
+import traceback
 import requests as _requests
 from datetime import datetime, date, timedelta, timezone
 
@@ -65,14 +66,9 @@ _security_ts: float = 0.0
 _rachio_schedule: list = []
 _rachio_ts: float      = 0.0
 
-# Switches (Kasa/Alexa/Nest-thermostat) caches
+# Switches (Kasa/Nest-thermostat/Tuya) caches
 _kasa_devices: dict     = {}   # mac -> {alias, ip, on, last_seen, host_obj}
 _kasa_ts: float         = 0.0
-_alexa_login            = None # alexapy AlexaLogin instance
-_alexa_client           = None # alexapy AlexaAPI instance
-_alexa_devices: dict    = {}   # entity_id -> {name, on, kind, appliance_id, serial}
-_alexa_routines: dict   = {}   # automation_id -> {name}
-_alexa_ts: float        = 0.0
 _nest_thermostats: dict = {}   # device_name -> {...thermostat traits...}
 _tuya_devices: dict     = {}   # dev_id -> {name, ip, local_key, version, on, last_seen}
 _tuya_ts: float         = 0.0
@@ -97,6 +93,11 @@ _kasa_quarantine: dict  = {}   # mac -> unix ts at which quarantine ends
 # ── Database ──────────────────────────────────────────────────────────────────
 def init_db() -> None:
     with sqlite3.connect(DB_PATH) as c:
+        # WAL allows the rules.py process to read while server.py writes
+        # (and vice-versa) without blocking. busy_timeout absorbs any brief
+        # contention during cost rebuilds.
+        c.execute('PRAGMA journal_mode=WAL')
+        c.execute('PRAGMA busy_timeout=10000')
         c.execute('''
             CREATE TABLE IF NOT EXISTS readings (
                 timestamp   INTEGER PRIMARY KEY,
@@ -173,7 +174,7 @@ def init_db() -> None:
             c.execute('ALTER TABLE rate_history ADD COLUMN base_services_charge_per_day REAL DEFAULT 0')
         except Exception:
             pass
-        # Switches drawer metadata — Kasa/Alexa/Pool/Nest devices surfaced as tiles
+        # Switches drawer metadata — Kasa/Pool/Nest/Tuya devices surfaced as tiles
         c.execute('''
             CREATE TABLE IF NOT EXISTS switches_meta (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -295,13 +296,6 @@ _SETTINGS_DEFAULTS = {
     # hammering the devices every 10s. Useful as a diagnostic when Kasa
     # schedules misbehave and we suspect connection churn is the cause.
     'kasa_state_poll_enabled':     '1',
-    # Alexa (plugs + routines via alexapy)
-    'alexa_enabled':               '0',
-    'alexa_poll_interval':         '60',
-    'alexa_email':                 os.environ.get('ALEXA_EMAIL', ''),
-    'alexa_password':              os.environ.get('ALEXA_PASSWORD', ''),
-    'alexa_url':                   os.environ.get('ALEXA_URL', 'amazon.com'),
-    'alexa_otp_pending':           '0',
     # Pool control (write path; read path is pool_enabled)
     'pool_control_enabled':        '0',
     # Tuya (tinytuya, LAN control of Smart Life / Tuya-platform devices)
@@ -511,10 +505,23 @@ def _backfill_rates_event_url() -> None:
         pass
 
 
+def _read_year_from_json(path):
+    """Tolerantly read {"year": N} from a JSON file. Returns None if the file
+    is missing, was deleted between exists() and open(), or is corrupt."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f).get('year')
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+
+
 def write_reading(solar_w, home_w, battery_w, grid_w, battery_pct) -> None:
+    # INSERT OR IGNORE: if the poll interval ever drops below 1s or two writes
+    # land in the same second, we keep the first reading rather than letting a
+    # second write clobber a battery_pct populated by the backfill path.
     with sqlite3.connect(DB_PATH) as c:
         c.execute(
-            'INSERT OR REPLACE INTO readings VALUES (?,?,?,?,?,?)',
+            'INSERT OR IGNORE INTO readings VALUES (?,?,?,?,?,?)',
             (int(time.time()), solar_w, home_w, battery_w, grid_w, battery_pct)
         )
 
@@ -522,6 +529,25 @@ def write_reading(solar_w, home_w, battery_w, grid_w, battery_pct) -> None:
 def purge_old() -> None:
     """Disabled — keep all readings forever."""
     pass
+
+
+_cost_rebuild_lock = threading.Lock()
+
+
+def _spawn_rebuild_daily_costs() -> bool:
+    """Spawn a daemon thread for rebuild_daily_costs unless one is already
+    running. Returns True if started, False if skipped due to overlap."""
+    if not _cost_rebuild_lock.acquire(blocking=False):
+        return False
+
+    def _run():
+        try:
+            rebuild_daily_costs()
+        finally:
+            _cost_rebuild_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
 
 
 def rebuild_daily_costs(year: int = None) -> None:
@@ -757,7 +783,6 @@ def poller() -> None:
     last_nest_event_poll = 0
     last_pool_poll = 0
     last_kasa_poll = 0
-    last_alexa_poll = 0
     last_tuya_poll = 0
 
     while True:
@@ -815,7 +840,7 @@ def poller() -> None:
 
             cost_interval = get_setting_int('cost_rebuild_days', 1) * 86400
             if now - last_cost_rebuild >= cost_interval:
-                threading.Thread(target=rebuild_daily_costs, daemon=True).start()
+                _spawn_rebuild_daily_costs()
                 last_cost_rebuild = now
 
             # Holidays + Rates refresh (calendar-driven from shared start date)
@@ -825,17 +850,12 @@ def poller() -> None:
             holidays_months = get_setting_int('holidays_poll_months', 1)
             if _is_refresh_due(refresh_start, holidays_months) and now - last_holidays_check >= 86400:
                 try:
-                    old_year = None
-                    if os.path.exists(HOLIDAYS_PATH):
-                        with open(HOLIDAYS_PATH) as f:
-                            old_year = json.load(f).get('year')
+                    old_year = _read_year_from_json(HOLIDAYS_PATH)
                     load_or_generate_holidays()
-                    if os.path.exists(HOLIDAYS_PATH):
-                        with open(HOLIDAYS_PATH) as f:
-                            new_year = json.load(f).get('year')
-                        if old_year and new_year and new_year != old_year:
-                            _log_success('holidays', 'holidays_updated',
-                                         f'Holidays regenerated for {new_year}')
+                    new_year = _read_year_from_json(HOLIDAYS_PATH)
+                    if old_year and new_year and new_year != old_year:
+                        _log_success('holidays', 'holidays_updated',
+                                     f'Holidays regenerated for {new_year}')
                     print('Holidays refreshed')
                 except Exception as exc:
                     print(f'Holidays refresh error: {exc}')
@@ -847,9 +867,11 @@ def poller() -> None:
             if _is_refresh_due(refresh_start, rates_months) and now - last_rates_check >= 86400:
                 try:
                     old_rates = {}
-                    if os.path.exists(RATES_PATH):
-                        with open(RATES_PATH) as f:
+                    try:
+                        with open(RATES_PATH, encoding='utf-8') as f:
                             old_rates = json.load(f)
+                    except (FileNotFoundError, json.JSONDecodeError, OSError):
+                        pass
                     page_url = get_setting('rates_page_url',
                                            'https://www.sdge.com/total-electric-rates')
                     schedule = get_setting('rate_schedule_name', 'EV-TOU')
@@ -943,17 +965,6 @@ def poller() -> None:
                         _log_system_error('kasa', 'State poll error', str(exc))
                 last_kasa_poll = now
 
-            # Alexa state polling (cloud, slow) — Phase 3 stub
-            alexa_poll_interval = get_setting_int('alexa_poll_interval', 60)
-            if now - last_alexa_poll >= alexa_poll_interval:
-                if get_setting_bool('alexa_enabled', False):
-                    try:
-                        _alexa_poll_state()
-                    except Exception as exc:
-                        print(f'Alexa poll error: {exc}')
-                        _log_system_error('alexa', 'State poll error', str(exc))
-                last_alexa_poll = now
-
             # Tuya state polling (LAN, sync socket calls)
             tuya_poll_interval = get_setting_int('tuya_poll_interval', 15)
             if now - last_tuya_poll >= tuya_poll_interval:
@@ -969,8 +980,10 @@ def poller() -> None:
                 last_tuya_poll = now
 
         except Exception as exc:
-            print(f'Poller error: {exc}')
-            _log_system_error('powerwall', 'Poller error', str(exc))
+            print(f'Poller error: {type(exc).__name__}: {exc}')
+            traceback.print_exc()
+            _log_system_error('powerwall', 'Poller error',
+                              f'{type(exc).__name__}: {exc}')
             pw = None  # force reconnect on next iteration
 
         time.sleep(poll_interval)
@@ -1345,6 +1358,11 @@ def fetch_pool() -> dict:
     now = time.time()
     if _pool_ts and int(now) // pool_ttl == int(_pool_ts) // pool_ttl:
         return _pool
+    # asyncio.run() spins a fresh event loop per call. Safe today because
+    # ScreenLogic uses one-shot UDP discovery with no persistent socket — a
+    # new loop per poll has no state to lose. If we ever cache a gateway
+    # connection, switch to a persistent loop on the Kasa pattern
+    # (_kasa_loop / _kasa_submit) to avoid handshake churn.
     try:
         _pool    = asyncio.run(_pool_fetch_async())
         _pool_ts = time.time()
@@ -2243,6 +2261,7 @@ def _abode_event_val(event, key):
 
 
 _abode_instance = None  # shared session reused by backfill
+_abode_status_lock = threading.Lock()
 _abode_status = {
     'state': 'idle',            # idle | disabled | connecting | connected | error
     'last_error': None,
@@ -2285,8 +2304,9 @@ def _abode_write_event(event):
                 'VALUES (?,?,?,?,?,?,?)',
                 (ts, 'abode', event_type, title, detail, 'info', 'live')
             )
-        _abode_status['events_received'] += 1
-        _abode_status['last_event_time'] = int(time.time())
+        with _abode_status_lock:
+            _abode_status['events_received'] += 1
+            _abode_status['last_event_time'] = int(time.time())
     except Exception as exc:
         print(f'Abode event write error: {exc}')
         _log_system_error('abode', 'Event write error', str(exc))
@@ -2362,22 +2382,24 @@ def abode_backfill(abode, days=30):
         for row in rows_to_insert:
             from datetime import datetime as _dt
             date_counts[_dt.fromtimestamp(row[0]).strftime('%Y-%m-%d')] += 1
-        _abode_status['last_backfill_time'] = int(time.time())
-        _abode_status['last_backfill_inserted'] = inserted
-        _abode_status['last_backfill_error'] = None
-        _abode_status['last_backfill_collected'] = len(rows_to_insert)
-        _abode_status['last_backfill_dates'] = dict(date_counts)
-        _abode_status['last_backfill_existing_size'] = len(existing)
-        _abode_status['last_backfill_page1'] = page1_raw
-        _abode_status['last_backfill_skipped'] = skipped
-        _abode_status['last_backfill_pages'] = page
+        with _abode_status_lock:
+            _abode_status['last_backfill_time'] = int(time.time())
+            _abode_status['last_backfill_inserted'] = inserted
+            _abode_status['last_backfill_error'] = None
+            _abode_status['last_backfill_collected'] = len(rows_to_insert)
+            _abode_status['last_backfill_dates'] = dict(date_counts)
+            _abode_status['last_backfill_existing_size'] = len(existing)
+            _abode_status['last_backfill_page1'] = page1_raw
+            _abode_status['last_backfill_skipped'] = skipped
+            _abode_status['last_backfill_pages'] = page
         print(f'Abode backfill: {inserted} inserted, {len(rows_to_insert)} collected, {skipped} skipped ({days} days, {page} pages)')
         print(f'  Dates: {dict(date_counts)}')
         return inserted
     except Exception as exc:
-        _abode_status['last_backfill_time'] = int(time.time())
-        _abode_status['last_backfill_inserted'] = 0
-        _abode_status['last_backfill_error'] = str(exc)
+        with _abode_status_lock:
+            _abode_status['last_backfill_time'] = int(time.time())
+            _abode_status['last_backfill_inserted'] = 0
+            _abode_status['last_backfill_error'] = str(exc)
         print(f'Abode backfill error: {exc}')
         _log_system_error('abode', 'Backfill error', str(exc))
         return 0
@@ -2392,8 +2414,9 @@ def start_abode_listener():
         try:
             from abodepy import Abode
         except ImportError:
-            _abode_status['state'] = 'error'
-            _abode_status['last_error'] = 'abodepy not installed'
+            with _abode_status_lock:
+                _abode_status['state'] = 'error'
+                _abode_status['last_error'] = 'abodepy not installed'
             print('Abode: abodepy not installed — run: py -m pip install abodepy')
             return
 
@@ -2409,7 +2432,8 @@ def start_abode_listener():
                         except Exception:
                             pass
                         _abode_instance = None
-                    _abode_status['state'] = 'disabled'
+                    with _abode_status_lock:
+                        _abode_status['state'] = 'disabled'
                     print('Abode: disabled in settings')
                 time.sleep(30)  # re-check toggle every 30s
                 continue
@@ -2426,12 +2450,14 @@ def start_abode_listener():
                 continue
 
             try:
-                _abode_status['state'] = 'connecting'
+                with _abode_status_lock:
+                    _abode_status['state'] = 'connecting'
                 print('Abode: connecting…')
                 abode = Abode(username=ABODE_EMAIL, password=ABODE_PASSWORD,
                               auto_login=True, get_devices=True)
                 _abode_instance = abode
-                _abode_status['state'] = 'connected'
+                with _abode_status_lock:
+                    _abode_status['state'] = 'connected'
                 retry_delay = 60  # reset backoff on successful connect
 
                 import abodepy.helpers.timeline as tl
@@ -2446,10 +2472,11 @@ def start_abode_listener():
 
             except Exception as exc:
                 _abode_instance = None
-                _abode_status['state'] = 'error'
-                _abode_status['last_error'] = str(exc)
-                _abode_status['last_error_time'] = int(time.time())
-                _abode_status['reconnect_count'] += 1
+                with _abode_status_lock:
+                    _abode_status['state'] = 'error'
+                    _abode_status['last_error'] = str(exc)
+                    _abode_status['last_error_time'] = int(time.time())
+                    _abode_status['reconnect_count'] += 1
                 is_429 = '429' in str(exc)
                 print(f'Abode listener error: {exc} — retrying in {retry_delay}s')
                 _log_system_error('abode', 'Listener error', f'{exc} — retrying in {retry_delay}s')
@@ -3183,8 +3210,6 @@ async def _kasa_update_state_async() -> None:
             elif info.get('was_offline'):
                 _log_kasa_reachability(name, 'online',
                                        f'state={"on" if new_on else "off"}')
-            info['was_offline'] = False
-            _kasa_failures.pop(mac, None)
             # State change vs last known (bridges across poll failures)
             if last_known is not None and new_on != last_known:
                 uptime_hint = _kasa_uptime_hint(dev)
@@ -3192,13 +3217,15 @@ async def _kasa_update_state_async() -> None:
                 if uptime_hint:
                     detail = f'{detail} · {uptime_hint}'
                 _log_kasa_external_change(name, new_on, detail)
-            info['on']            = new_on
-            info['last_known_on'] = new_on
-            info['last_seen']     = time.time()
-            if info.get('dimmable'):
-                b = _kasa_read_brightness(dev)
+            b = _kasa_read_brightness(dev) if info.get('dimmable') else None
+            with _switches_lock:
+                info['was_offline']   = False
+                info['on']            = new_on
+                info['last_known_on'] = new_on
+                info['last_seen']     = time.time()
                 if b is not None:
                     info['brightness'] = b
+            _kasa_failures.pop(mac, None)
         except Exception as exc:
             # Lost connection — drop the stale Device so next cycle reconnects
             old = _kasa_connections.pop(mac, None)
@@ -3233,14 +3260,14 @@ async def _kasa_set_async(mac: str, on: bool) -> bool:
         await dev.turn_off()
     await dev.update()
     new_state = bool(getattr(dev, 'is_on', False))
-    info['on']            = new_state
-    info['last_known_on'] = new_state
-    info['last_seen']     = time.time()
-    _kasa_failures.pop(mac, None)
-    if info.get('dimmable'):
-        b = _kasa_read_brightness(dev)
+    b = _kasa_read_brightness(dev) if info.get('dimmable') else None
+    with _switches_lock:
+        info['on']            = new_state
+        info['last_known_on'] = new_state
+        info['last_seen']     = time.time()
         if b is not None:
             info['brightness'] = b
+    _kasa_failures.pop(mac, None)
     return new_state
 
 
@@ -3266,12 +3293,14 @@ async def _kasa_set_brightness_async(mac: str, brightness: int) -> dict:
     await dev.update()
     new_on = bool(getattr(dev, 'is_on', False))
     new_b  = _kasa_read_brightness(dev)
-    info['on']            = new_on
-    info['last_known_on'] = new_on
-    info['brightness']    = new_b if new_b is not None else b
-    info['last_seen']     = time.time()
+    final_b = new_b if new_b is not None else b
+    with _switches_lock:
+        info['on']            = new_on
+        info['last_known_on'] = new_on
+        info['brightness']    = final_b
+        info['last_seen']     = time.time()
     _kasa_failures.pop(mac, None)
-    return {'on': new_on, 'brightness': info['brightness']}
+    return {'on': new_on, 'brightness': final_b}
 
 
 def kasa_set(mac: str, on: bool) -> bool:
@@ -3291,227 +3320,6 @@ def kasa_set_brightness(mac: str, brightness: int) -> dict:
     except Exception:
         _kasa_connections.pop(mac, None)
         raise
-
-
-# ── Alexa (alexapy, routines-based control) ──────────────────────────────────
-# Amazon's unofficial login is fragile; alexapy reverse-engineers it via HTML
-# scraping + cookie persistence. We only support Alexa ROUTINES in V1 — the
-# user creates "XYZ On" / "XYZ Off" routines in the Alexa app and we trigger
-# them by name via AlexaAPI.run_routine(). That pattern works consistently for
-# Amazon Smart Plugs and any third-party device linked to Alexa.
-_ALEXA_COOKIE_DIR = os.path.join(BASE_DIR, 'alexa_state')
-
-
-def _alexa_outputpath(fname: str) -> str:
-    os.makedirs(_ALEXA_COOKIE_DIR, exist_ok=True)
-    return os.path.join(_ALEXA_COOKIE_DIR, fname)
-
-
-def _alexa_status_dict(login) -> dict:
-    """Normalize login.status into a plain dict for JSON return."""
-    return dict(login.status or {}) if login is not None else {}
-
-
-async def _alexa_build_login_async():
-    """Construct an AlexaLogin using current settings. Tries to load cookie.
-
-    oauth_login=False uses the classic form-scraping login path, which
-    populates status dict (captcha_required, securitycode_required, etc.)
-    on the first page Amazon serves — OAuth mode often exits silently.
-    debug=True saves HTML snapshots to _ALEXA_COOKIE_DIR for diagnosis.
-    """
-    from alexapy import AlexaLogin
-    email    = get_setting('alexa_email', '')
-    password = get_setting('alexa_password', '')
-    url      = get_setting('alexa_url', 'amazon.com') or 'amazon.com'
-    if not email or not password:
-        raise RuntimeError('Alexa email/password not configured')
-    login = AlexaLogin(
-        url=url,
-        email=email,
-        password=password,
-        outputpath=_alexa_outputpath,
-        debug=True,
-        oauth_login=False,
-    )
-    try:
-        await login.load_cookie()
-    except Exception as exc:
-        print(f'Alexa cookie load failed (fresh login will be attempted): {exc}')
-    return login
-
-
-async def _alexa_test_loggedin_safe(login) -> bool:
-    """Wrap test_loggedin so an error just returns False, not raises."""
-    if login is None:
-        return False
-    try:
-        return bool(await login.test_loggedin())
-    except Exception as exc:
-        print(f'Alexa test_loggedin error: {exc}')
-        return False
-
-
-async def _alexa_login_start_async() -> dict:
-    """Begin a fresh login (or resume from cookie)."""
-    global _alexa_login
-    _alexa_login = await _alexa_build_login_async()
-    try:
-        await _alexa_login.login()
-    except Exception as exc:
-        print(f'Alexa login error: {exc}')
-        raise
-    logged_in = await _alexa_test_loggedin_safe(_alexa_login)
-    if logged_in:
-        try:
-            await _alexa_login.save_cookiefile()
-        except Exception as exc:
-            print(f'Alexa cookie save failed: {exc}')
-    status = _alexa_status_dict(_alexa_login)
-    status['logged_in'] = logged_in
-    return status
-
-
-async def _alexa_login_submit_otp_async(otp: str) -> dict:
-    """Submit OTP / security code to complete a pending login."""
-    global _alexa_login
-    if _alexa_login is None:
-        raise RuntimeError('No pending Alexa login; call /alexa/auth first')
-    # alexapy's form scraper populates field names dynamically via
-    # status['securitycode_tag']. Pass the code under common names so
-    # whichever one matches the current form gets used.
-    tag = None
-    try:
-        tag = (_alexa_login.status or {}).get('securitycode_tag')
-    except Exception:
-        pass
-    data = {'otpCode': otp, 'code': otp, 'otp': otp}
-    if isinstance(tag, str) and tag:
-        data[tag] = otp
-    await _alexa_login.login(data=data)
-    logged_in = await _alexa_test_loggedin_safe(_alexa_login)
-    if logged_in:
-        try:
-            await _alexa_login.save_cookiefile()
-        except Exception as exc:
-            print(f'Alexa cookie save failed: {exc}')
-    status = _alexa_status_dict(_alexa_login)
-    status['logged_in'] = logged_in
-    return status
-
-
-class _AlexaDeviceShim:
-    """Minimal device shim for AlexaAPI — exposes fields run_behavior reads."""
-    def __init__(self, d: dict):
-        self._device_type         = d.get('deviceType') or ''
-        self.device_serial_number = d.get('serialNumber') or ''
-        self._locale              = d.get('locale') or 'en-US'
-
-
-async def _alexa_pick_echo_async(login) -> dict:
-    """Return the first usable Echo device from the account."""
-    from alexapy import AlexaAPI
-    devices = await AlexaAPI.get_devices(login) or []
-    if not devices:
-        raise RuntimeError('No Alexa devices on account')
-    # Prefer a non-app device with a serial number
-    for d in devices:
-        if d.get('serialNumber') and d.get('deviceType'):
-            return d
-    return devices[0]
-
-
-async def _alexa_build_api_async():
-    """Return an AlexaAPI bound to one Echo, suitable for run_routine()."""
-    global _alexa_client
-    from alexapy import AlexaAPI
-    if _alexa_login is None:
-        raise RuntimeError('Alexa not logged in')
-    if _alexa_client is not None:
-        return _alexa_client
-    echo = await _alexa_pick_echo_async(_alexa_login)
-    _alexa_client = AlexaAPI(_AlexaDeviceShim(echo), _alexa_login)
-    return _alexa_client
-
-
-async def _alexa_refresh_async() -> int:
-    """Fetch Alexa routines, upsert to switches_meta as kind='routine'."""
-    global _alexa_routines
-    from alexapy import AlexaAPI
-    if _alexa_login is None:
-        return 0
-    automations = await AlexaAPI.get_automations(_alexa_login) or []
-    new: dict = {}
-    for a in automations:
-        if not isinstance(a, dict):
-            continue
-        aid  = a.get('automationId')
-        name = a.get('name')
-        if not aid or not isinstance(name, str) or not name.strip():
-            continue
-        new[aid] = {'name': name.strip()}
-    _alexa_routines = new
-    with sqlite3.connect(DB_PATH) as c:
-        for aid, info in new.items():
-            row = c.execute(
-                'SELECT id, name FROM switches_meta WHERE provider=? AND external_id=?',
-                ('alexa', aid)
-            ).fetchone()
-            if row is None:
-                c.execute(
-                    'INSERT INTO switches_meta (provider, external_id, kind, name) '
-                    'VALUES (?,?,?,?)',
-                    ('alexa', aid, 'routine', info['name'])
-                )
-    return len(new)
-
-
-async def _alexa_run_routine_async(automation_id: str) -> None:
-    """Fire an Alexa routine by its automation ID (looks up the name from cache)."""
-    info = _alexa_routines.get(automation_id)
-    if info is None:
-        # Fall back: refresh and retry once in case cache is stale
-        await _alexa_refresh_async()
-        info = _alexa_routines.get(automation_id)
-    if info is None:
-        raise ValueError(f'Unknown Alexa routine: {automation_id}')
-    api = await _alexa_build_api_async()
-    await api.run_routine(info['name'])
-
-
-def alexa_run_routine(automation_id: str) -> None:
-    """Sync wrapper for Alexa routine trigger."""
-    asyncio.run(_alexa_run_routine_async(automation_id))
-
-
-def _alexa_refresh_devices() -> int:
-    """Discovery entrypoint (used by /api/switches/rediscover).
-
-    Auto-attempts cookie-based login if _alexa_login is None but credentials
-    are present. For fresh logins (or OTP flow) the user hits /alexa/auth.
-    """
-    global _alexa_login
-    if _alexa_login is None:
-        try:
-            asyncio.run(_alexa_login_start_async())
-        except Exception as exc:
-            print(f'Alexa auto-login failed: {exc}')
-            _log_system_error('alexa', 'Auto-login failed', str(exc))
-            return 0
-    if not _alexa_status_dict(_alexa_login).get('login_successful'):
-        print('Alexa not logged in; skipping refresh. Use /alexa/auth.')
-        return 0
-    try:
-        return asyncio.run(_alexa_refresh_async())
-    except Exception as exc:
-        print(f'Alexa refresh error: {exc}')
-        _log_system_error('alexa', 'Refresh failed', str(exc))
-        return 0
-
-
-def _alexa_poll_state() -> None:
-    """Routines have no state; nothing to poll in V1."""
-    pass
 
 
 # ── Tuya (tinytuya, LAN control of Smart Life / Tuya-platform devices) ───────
@@ -3861,11 +3669,9 @@ def tuya_set(ext_id: str, on: bool) -> bool:
 # ── Switches (unified dispatch across providers) ─────────────────────────────
 def _switches_rediscover_all() -> dict:
     """Run discovery across every enabled provider.  Returns per-provider counts."""
-    counts = {'kasa': 0, 'alexa': 0, 'pool': 0, 'nest_thermostat': 0, 'tuya': 0}
+    counts = {'kasa': 0, 'pool': 0, 'nest_thermostat': 0, 'tuya': 0}
     if get_setting_bool('kasa_enabled', False):
         counts['kasa'] = _kasa_refresh_devices()
-    if get_setting_bool('alexa_enabled', False):
-        counts['alexa'] = _alexa_refresh_devices()
     if get_setting_bool('pool_enabled', True):
         counts['pool'] = _pool_discover_circuits()
     # Nest: refresh all devices (cameras + doorbells + thermostats). The
@@ -3906,21 +3712,6 @@ def _get_all_switches() -> list:
                     'dimmable':   bool(info.get('dimmable')),
                     'brightness': info.get('brightness'),
                 }
-        elif provider == 'alexa':
-            if not get_setting_bool('alexa_enabled', False):
-                reachable = False
-            elif kind == 'routine':
-                # Routines are stateless; reachable iff we have it in cache
-                reachable = ext_id in _alexa_routines
-                state     = None
-                detail    = {'type': 'routine'}
-            else:
-                info = _alexa_devices.get(ext_id)
-                if info is None:
-                    reachable = False
-                else:
-                    state  = info.get('on')
-                    detail = {}
         elif provider == 'pool':
             if not get_setting_bool('pool_enabled', True):
                 reachable = False
@@ -4064,13 +3855,6 @@ def switch_set_state(row_id: int, on: bool) -> dict:
                 name
             )
             return {'ok': True, 'state': new_state}
-        if provider == 'alexa':
-            if kind == 'routine':
-                alexa_run_routine(ext_id)
-                _switches_log_event('alexa', 'routine_triggered', name)
-                return {'ok': True, 'state': None}
-            return {'error': 'alexa plug control not implemented — use routines',
-                    'code': 501}
         if provider == 'abode':
             return {'error': 'use /api/switches/alarm/arm-home for abode',
                     'code': 400}
@@ -4116,8 +3900,6 @@ def switch_toggle(row_id: int) -> dict:
     current = None
     if provider == 'kasa':
         current = (_kasa_devices.get(ext_id) or {}).get('on')
-    elif provider == 'alexa':
-        current = (_alexa_devices.get(ext_id) or {}).get('on')
     elif provider == 'pool':
         field = POOL_EXT_TO_FIELD.get(ext_id)
         current = _pool.get(field) if field else None
@@ -4316,9 +4098,24 @@ def api_rules_get():
         return jsonify(_load_all_rules(c))
 
 
+_RULE_REQUIRED_FIELDS = ('name', 'days', 'months', 'hour', 'minute')
+
+
+def _validate_rule_body(body):
+    if not isinstance(body, dict):
+        return 'JSON object required'
+    missing = [k for k in _RULE_REQUIRED_FIELDS if k not in body]
+    if missing:
+        return f'missing fields: {", ".join(missing)}'
+    return None
+
+
 @app.route('/api/rules', methods=['POST'])
 def api_rules_post():
-    body = request.get_json(force=True)
+    body = request.get_json(silent=True)
+    err = _validate_rule_body(body)
+    if err:
+        return jsonify({'error': err}), 400
     days_j   = json.dumps(body['days'])
     months_j = json.dumps(body['months'])
     gc = body.get('grid_charging')
@@ -4349,7 +4146,10 @@ def api_rules_post():
 
 @app.route('/api/rules/<int:rid>', methods=['PUT'])
 def api_rules_put(rid):
-    body = request.get_json(force=True)
+    body = request.get_json(silent=True)
+    err = _validate_rule_body(body)
+    if err:
+        return jsonify({'error': err}), 400
     days_j   = json.dumps(body['days'])
     months_j = json.dumps(body['months'])
     gc = body.get('grid_charging')
@@ -5091,6 +4891,10 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
             return charge_end - charge_start
         return 0
 
+    # Cache TOU periods once — _rule_export_hours is called ~24× per
+    # projection build, and the value never changes mid-request.
+    _tou_periods_cache = _load_tou_periods() or {}
+
     def _rule_export_hours(month):
         """Check if any export rules exist for a given month and estimate the window.
 
@@ -5113,9 +4917,8 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
                 if latest_end is None or t > latest_end:
                     latest_end = t
         if earliest_start is not None and latest_end is None:
-            # Fall back to on-peak end from TOU periods
-            _tp = _load_tou_periods() or {}
-            _on_pk = _tp.get('weekday', {}).get('on_peak', [[16, 21]])
+            # Fall back to on-peak end from TOU periods (cached above)
+            _on_pk = _tou_periods_cache.get('weekday', {}).get('on_peak', [[16, 21]])
             latest_end = float(max(e for _, e in _on_pk))
         if earliest_start is not None and latest_end is not None and latest_end > earliest_start:
             return latest_end - earliest_start
@@ -5870,14 +5673,27 @@ def api_costs_ytd():
     })
 
 
+def _arg_int(name, default):
+    """Parse an int query-string param. Returns (value, error_response)."""
+    raw = request.args.get(name)
+    if raw is None or raw == '':
+        return default, None
+    try:
+        return int(raw), None
+    except (TypeError, ValueError):
+        return None, (jsonify({'error': f'{name} must be an integer'}), 400)
+
+
 @app.route('/api/costs/daily')
 def api_costs_daily():
     # Support start/end date filters (default: current year) + pagination
     today = date.today()
     start = request.args.get('start', f'{today.year}-01-01')
     end   = request.args.get('end', today.isoformat())
-    limit  = int(request.args.get('limit', 0))   # 0 = no limit
-    offset = int(request.args.get('offset', 0))
+    limit, err  = _arg_int('limit', 0)   # 0 = no limit
+    if err: return err
+    offset, err = _arg_int('offset', 0)
+    if err: return err
     with sqlite3.connect(DB_PATH) as c:
         # Total count for pagination
         total = c.execute(
@@ -5918,8 +5734,9 @@ def api_costs_daily():
 
 @app.route('/api/costs/rebuild', methods=['POST'])
 def api_costs_rebuild():
-    threading.Thread(target=rebuild_daily_costs, daemon=True).start()
-    return jsonify({'ok': True})
+    started = _spawn_rebuild_daily_costs()
+    return jsonify({'ok': True, 'started': started,
+                    'note': None if started else 'rebuild already in progress'})
 
 
 @app.route('/api/rates')
@@ -5957,7 +5774,8 @@ def api_debug_abode_timeline():
 @app.route('/api/debug/abode/status')
 def api_debug_abode_status():
     """Return Abode listener connection state and stats."""
-    info = dict(_abode_status)
+    with _abode_status_lock:
+        info = dict(_abode_status)
     info['connected'] = _abode_instance is not None
     return jsonify(info)
 
@@ -5967,7 +5785,8 @@ def api_debug_abode_backfill():
     """Manually trigger Abode backfill and return result with diagnostics."""
     if _abode_instance is None:
         return jsonify({'error': 'Abode not connected'}), 503
-    days = int(request.args.get('days', 30))
+    days, err = _arg_int('days', 30)
+    if err: return err
 
     # Collect diagnostics: fetch page 1 raw to show what we're getting
     diag = {}
@@ -6324,74 +6143,6 @@ def api_switches_alarm_arm_home():
 def api_switches_rediscover():
     counts = _switches_rediscover_all()
     return jsonify({'ok': True, 'counts': counts})
-
-
-@app.route('/alexa/auth', methods=['POST'])
-def api_alexa_auth():
-    """Start or resume Alexa login. Returns status + whether OTP is needed."""
-    try:
-        status = asyncio.run(_alexa_login_start_async())
-    except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
-    # logged_in (via test_loggedin()) is authoritative — alexapy's status
-    # dict only sets login_successful in one specific code path.
-    success   = bool(status.get('logged_in') or status.get('login_successful'))
-    needs_otp = bool(status.get('securitycode_required'))
-    needs_cap = bool(status.get('captcha_required'))
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)',
-                  ('alexa_otp_pending', '1' if needs_otp else '0'))
-    resp = {
-        'ok':        success,
-        'needs_otp': needs_otp,
-        'status':    status,
-    }
-    if needs_cap:
-        resp['needs_captcha'] = True
-        resp['captcha_url']   = status.get('captcha_image_url')
-    if not success and not needs_otp and not needs_cap:
-        # Silent failure — include a hint for debugging
-        resp['hint'] = ('Login did not complete. Check server logs + '
-                        'alexa_state/*.html for what Amazon returned.')
-    return jsonify(resp)
-
-
-@app.route('/alexa/otp', methods=['POST'])
-def api_alexa_otp():
-    """Submit OTP to complete login."""
-    data = request.get_json(silent=True) or {}
-    otp  = (data.get('otp') or '').strip()
-    if not otp:
-        return jsonify({'error': 'otp required'}), 400
-    try:
-        status = asyncio.run(_alexa_login_submit_otp_async(otp))
-    except Exception as exc:
-        return jsonify({'error': str(exc)}), 500
-    success   = bool(status.get('logged_in') or status.get('login_successful'))
-    needs_otp = bool(status.get('securitycode_required'))
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)',
-                  ('alexa_otp_pending', '1' if needs_otp else '0'))
-    return jsonify({
-        'ok':        success,
-        'needs_otp': needs_otp,
-        'status':    status,
-    })
-
-
-@app.route('/api/debug/alexa')
-def api_debug_alexa():
-    """Dump Alexa state: login status, routine cache, any cached plugs."""
-    status = _alexa_status_dict(_alexa_login)
-    return jsonify({
-        'enabled':       get_setting_bool('alexa_enabled', False),
-        'logged_in':     bool(status.get('login_successful')),
-        'otp_pending':   bool(status.get('securitycode_required')),
-        'status':        status,
-        'routine_count': len(_alexa_routines),
-        'routines':      _alexa_routines,
-        'devices':       _alexa_devices,
-    })
 
 
 @app.route('/api/debug/tuya')
@@ -6854,7 +6605,10 @@ def api_network_device_filters(mac):
         'wl0': dict(body.get('wl0') or {}),
         'wl1': dict(body.get('wl1') or {}),
     }
+    return _apply_filter_ban_map(mac, desired)
 
+
+def _apply_filter_ban_map(mac: str, desired: dict) -> "tuple":
     aps = _network_ap_cfgs()
     results = []
     for ap in aps:
@@ -6930,9 +6684,7 @@ def api_network_device_pin(mac):
             else:
                 desired[radio][ap_name] = True   # ban everywhere else
 
-    # Reuse the filters PUT logic.
-    request._cached_json = (True, desired)
-    return api_network_device_filters(mac)
+    return _apply_filter_ban_map(mac.lower(), desired)
 
 
 @app.route('/api/network/devices/<mac>/unpin', methods=['POST'])
@@ -6941,28 +6693,30 @@ def api_network_device_unpin(mac):
     aps = [a.get('name') for a in _network_ap_cfgs() if a.get('name')]
     desired = {'wl0': {n: False for n in aps},
                'wl1': {n: False for n in aps}}
-    request._cached_json = (True, desired)
-    return api_network_device_filters(mac)
+    return _apply_filter_ban_map(mac.lower(), desired)
 
 
 # ── Event Log endpoint ────────────────────────────────────────────────────────
 @app.route('/api/events')
 def api_events():
-    limit  = min(int(request.args.get('limit', 50)), 500)
-    offset = max(int(request.args.get('offset', 0)), 0)
+    limit, err  = _arg_int('limit', 50)
+    if err: return err
+    offset, err = _arg_int('offset', 0)
+    if err: return err
+    limit  = min(limit, 500)
+    offset = max(offset, 0)
     system = request.args.get('system', 'all')
     etype  = request.args.get('type')
 
     # Date range: accept start/end unix timestamps, fall back to days param
-    start_ts = request.args.get('start')
-    end_ts   = request.args.get('end')
-    if start_ts:
-        start_ts = int(start_ts)
-    else:
-        days = min(int(request.args.get('days', 7)), 365)
-        start_ts = int(time.time()) - days * 86400
-    if end_ts:
-        end_ts = int(end_ts)
+    start_ts, err = _arg_int('start', None)
+    if err: return err
+    end_ts, err = _arg_int('end', None)
+    if err: return err
+    if start_ts is None:
+        days, err = _arg_int('days', 7)
+        if err: return err
+        start_ts = int(time.time()) - min(days, 365) * 86400
 
     query  = 'SELECT id,ts,system,event_type,title,detail,result,source,battery_pct FROM event_log WHERE ts >= ?'
     params: list = [start_ts]
@@ -7099,10 +6853,6 @@ def api_settings():
                 {'key': 'tuya_poll_interval', 'label': 'State poll', 'unit': 's'},
             ],
         },
-        # Alexa integration shelved — alexapy fails silently against modern
-        # Amazon login. Settings card removed to prevent accidental
-        # "Authenticate" clicks. Backend code remains behind alexa_enabled=0
-        # in case we revisit with authcaptureproxy later.
         {
             'key': 'maintenance',
             'label': 'Maintenance',
@@ -7241,8 +6991,8 @@ def _start():
     _backfill_rates_event_url()
     backfill_history()
     # Seed switches_meta with known pool circuits on startup so tiles appear
-    # without requiring a manual rediscover. Kasa/Alexa discovery is driven
-    # by their enabled flag in the poller loop.
+    # without requiring a manual rediscover. Kasa discovery is driven
+    # by its enabled flag in the poller loop.
     if get_setting_bool('pool_enabled', True):
         try:
             _pool_discover_circuits()

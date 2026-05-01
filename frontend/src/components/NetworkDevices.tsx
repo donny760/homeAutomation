@@ -121,13 +121,20 @@ export default function NetworkDevices({ isActive }: NetworkDevicesProps) {
     if (!editingMac) return;
     setBusy(true);
     try {
-      await fetch(`/api/network/devices/${editingMac}`, {
+      const r = await fetch(`/api/network/devices/${editingMac}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ friendly_name: editValue }),
       });
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({}));
+        alert('Save failed: ' + (err.error || r.statusText));
+        return;
+      }
       setEditingMac(null);
       await refresh();
+    } catch (e) {
+      alert('Save failed: ' + e);
     } finally {
       setBusy(false);
     }

@@ -48,7 +48,9 @@ export default function PowerflowSVG({ data }: PowerflowSVGProps) {
 
     setFlow('flow-solar-home', solarOn, d.solar_w);
     setFlow('flow-solar-battery', battChg, d.battery_w);
-    setFlow('flow-solar-grid', gridOut, Math.abs(d.grid_w));
+    // Solar→grid only when solar is actually contributing — otherwise the
+    // dot animates a phantom export that's really coming from the battery.
+    setFlow('flow-solar-grid', solarOn && gridOut, Math.abs(d.grid_w));
     setFlow('flow-battery-home', battDis, Math.abs(d.battery_w));
     setFlow('flow-grid-home', gridIn, d.grid_w);
     setFlow('flow-battery-grid', battDis && gridOut, Math.abs(d.battery_w));
@@ -86,20 +88,20 @@ export default function PowerflowSVG({ data }: PowerflowSVGProps) {
     setText('p-grid-dir', gridIn ? 'importing' : gridOut ? 'exporting' : '');
     const gridDot = svg.getElementById('p-grid-dot') as HTMLElement | null;
     if (gridDot) {
-      gridDot.style.background = gridOut ? '#1D9E75' : '#888780';
+      gridDot.style.background = gridOut ? 'var(--green)' : 'var(--dim)';
     }
     const pGridW = svg.getElementById('p-grid-w') as HTMLElement | null;
     if (pGridW) {
-      pGridW.style.color = gridOut ? '#1D9E75' : '#888780';
+      pGridW.style.color = gridOut ? 'var(--green)' : 'var(--dim)';
     }
 
     // Battery icon fill width
     const fillEl = svg.getElementById('batt-icon-fill');
     if (fillEl) fillEl.setAttribute('width', String(Math.max(2, Math.round(22 * (d.battery_pct || 0) / 100))));
 
-    // Battery ring color
-    const ringColor = (d.battery_pct || 0) > 30 ? '#1D9E75' : (d.battery_pct || 0) > 15 ? '#EF9F27' : '#e05252';
-    setAttr('batt-flow-ring', 'stroke', ringColor);
+    // Battery ring color (set via style so CSS vars resolve correctly)
+    const ringColor = (d.battery_pct || 0) > 30 ? 'var(--green)' : (d.battery_pct || 0) > 15 ? 'var(--amber)' : '#e05252';
+    setStyle('batt-flow-ring', 'stroke', ringColor);
 
     // Grid today
     if (d.grid_kwh_today != null) {
@@ -110,21 +112,21 @@ export default function PowerflowSVG({ data }: PowerflowSVGProps) {
     if (d.mode) {
       const label = modeLabel(d.mode) || d.mode;
       const modeColors: Record<string, string> = {
-        self_consumption: '#1D9E75',
-        autonomous: '#EF9F27',
+        self_consumption: 'var(--green)',
+        autonomous: 'var(--amber)',
         backup: '#e05252',
       };
-      const col = modeColors[d.mode] || '#888780';
-      const pMode = svg.getElementById('p-mode');
+      const col = modeColors[d.mode] || 'var(--dim)';
+      const pMode = svg.getElementById('p-mode') as unknown as (SVGElement & { style: CSSStyleDeclaration }) | null;
       if (pMode) {
         pMode.textContent = label.toUpperCase();
-        pMode.setAttribute('fill', col);
+        pMode.style.fill = col;
       }
-      setAttr('p-mode-accent', 'fill', col);
-      setAttr('p-mode-dot', 'fill', col);
-      const pModeBg = svg.getElementById('p-mode-bg') as SVGElement | null;
+      setStyle('p-mode-accent', 'fill', col);
+      setStyle('p-mode-dot', 'fill', col);
+      const pModeBg = svg.getElementById('p-mode-bg') as unknown as (SVGElement & { style: CSSStyleDeclaration }) | null;
       if (pModeBg) {
-        pModeBg.setAttribute('stroke', col);
+        pModeBg.style.stroke = col;
         (pModeBg as any).style.opacity = '0.85';
         const w = Math.max(100, label.length * 6.8 + 42);
         pModeBg.setAttribute('width', String(w));

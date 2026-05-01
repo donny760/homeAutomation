@@ -37,6 +37,10 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
+  // Authoritative offset for the next page fetch. Decoupled from days.length
+  // so an in-flight observer trigger during a date-change reset can't request
+  // the wrong offset.
+  const offsetRef = useRef(0);
 
   // Fetch a page of data, optionally appending to existing
   const fetchPage = useCallback(async (start: string, end: string, offset: number, append: boolean) => {
@@ -52,8 +56,10 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
         setDays(newDays);
         setExpanded({});
       }
+      const newOffset = offset + newDays.length;
+      offsetRef.current = newOffset;
       setTotal(data.total || 0);
-      setHasMore(offset + newDays.length < (data.total || 0));
+      setHasMore(newOffset < (data.total || 0));
       if (data.rates_as_of) setRatesNote('rates as of ' + data.rates_as_of);
     } catch (e) {
       console.warn('CostsPage:', e);
@@ -63,12 +69,18 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
     }
   }, []);
 
-  // Initial load and on filter change
+  // Initial load and on filter change — reset offset so the observer can't
+  // append against a stale cursor while a fresh fetch is in flight.
   useEffect(() => {
-    if (isActive) fetchPage(startDate, endDate, 0, false);
+    if (isActive) {
+      offsetRef.current = 0;
+      fetchPage(startDate, endDate, 0, false);
+    }
   }, [isActive, startDate, endDate, fetchPage]);
 
-  // Infinite scroll via IntersectionObserver
+  // Infinite scroll via IntersectionObserver. Deps intentionally omit
+  // `days.length` — re-creating the observer on every page append was
+  // wasteful; offsetRef carries the cursor across renders.
   useEffect(() => {
     const sentinel = sentinelRef.current;
     const container = scrollRef.current;
@@ -76,14 +88,14 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries[0].isIntersecting && hasMore && !loadingMore && !loading) {
-          fetchPage(startDate, endDate, days.length, true);
+          fetchPage(startDate, endDate, offsetRef.current, true);
         }
       },
       { root: container, threshold: 0.1 }
     );
     observer.observe(sentinel);
     return () => observer.disconnect();
-  }, [hasMore, loadingMore, loading, days.length, startDate, endDate, fetchPage]);
+  }, [hasMore, loadingMore, loading, startDate, endDate, fetchPage]);
 
   async function costsRebuild() {
     setRebuilding(true);

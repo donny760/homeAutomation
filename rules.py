@@ -414,6 +414,8 @@ def main_loop(stop_fn=None):
     log.info('Powerwall Rules Engine v2 starting.')
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=10000')
     conn.execute('PRAGMA foreign_keys = ON')
     init_db(conn)
     seed_default_rules(conn)
@@ -482,7 +484,8 @@ def main_loop(stop_fn=None):
                 last_eval = now
 
             except Exception as exc:
-                log.error('Evaluation error: %s', exc)
+                log.exception('Evaluation error: %s: %s',
+                              type(exc).__name__, exc)
                 pw = None
 
         time.sleep(LOOP_SLEEP)

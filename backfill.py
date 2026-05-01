@@ -125,8 +125,10 @@ def backfill_readings(start=None):
             soe_count = len(soe_series)
             print(f'  {day_lbl}: power={pwr_count} soe={soe_count} inserted={day_inserted}')
 
-            # Commit every month
-            if current.day == 1:
+            # Commit weekly so a crash mid-backfill loses at most ~7 days
+            # of work, not a full month. INSERT OR IGNORE means a re-run is
+            # safe regardless.
+            if current.weekday() == 6:  # Sunday
                 conn.commit()
 
             current += timedelta(days=1)

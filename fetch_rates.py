@@ -15,6 +15,15 @@ RATES_PATH    = os.path.join(BASE_DIR, 'rates.json')
 HOLIDAYS_PATH = os.path.join(BASE_DIR, 'holidays.json')
 
 
+def _atomic_write_json(path, data):
+    """Write JSON via temp + os.replace so a kill mid-write can't truncate
+    the destination file. UTF-8 explicit since Windows defaults to cp1252."""
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
 # ── SDG&E holiday calendar ────────────────────────────────────────────────────
 
 def _nth_weekday(year, month, weekday, n):
@@ -53,20 +62,23 @@ def generate_sdge_holidays(year):
 
 
 def load_or_generate_holidays():
-    """Load holidays.json, regenerating if missing or from a different year."""
+    """Load holidays.json, regenerating if missing, corrupt, or from a
+    different year. Tolerates concurrent deletion (deploy, manual edit) and
+    truncated/invalid JSON by falling through to regeneration."""
     current_year = date.today().year
-    if os.path.exists(HOLIDAYS_PATH):
-        with open(HOLIDAYS_PATH) as f:
+    try:
+        with open(HOLIDAYS_PATH, encoding='utf-8') as f:
             data = json.load(f)
         if data.get('year') == current_year:
             return {date.fromisoformat(d) for d in data['dates']}
+    except (FileNotFoundError, json.JSONDecodeError, KeyError, ValueError):
+        pass
     holidays = generate_sdge_holidays(current_year)
-    with open(HOLIDAYS_PATH, 'w') as f:
-        json.dump({
-            'year':      current_year,
-            'dates':     [d.isoformat() for d in holidays],
-            'generated': date.today().isoformat(),
-        }, f, indent=2)
+    _atomic_write_json(HOLIDAYS_PATH, {
+        'year':      current_year,
+        'dates':     [d.isoformat() for d in holidays],
+        'generated': date.today().isoformat(),
+    })
     return set(holidays)
 
 
@@ -297,8 +309,7 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
     rates['updated'] = datetime.now().isoformat()
     rates['source_url'] = pdf_url
     rates['effective_date'] = eff_date
-    with open(RATES_PATH, 'w') as f:
-        json.dump(rates, f, indent=2)
+    _atomic_write_json(RATES_PATH, rates)
 
     # Step 4: Store in rate_history if db_path provided
     if db_path:

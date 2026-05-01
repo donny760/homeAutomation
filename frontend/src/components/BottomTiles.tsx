@@ -1,23 +1,48 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { touPeriod } from '@/lib/tou';
+import { usePolling } from '@/lib/usePolling';
+
+interface PoolData {
+  temp_f?: number | null;
+  pump_on?: boolean;
+  pump_watts?: number | null;
+  edge_pump_on?: boolean;
+  cleaner_on?: boolean;
+  pool_light_on?: boolean;
+  water_light_on?: boolean;
+  spa_light_on?: boolean;
+  waterfall_on?: boolean;
+  spillway_on?: boolean;
+  salt_ppm?: number | null;
+  scg_active?: boolean;
+  scg_pool_pct?: number | null;
+  super_chlor?: boolean;
+}
+
+interface SecurityIssue {
+  name: string;
+  type: string;
+}
+interface SecurityData {
+  connected?: boolean;
+  mode?: string | null;
+  mode_display?: string | null;
+  issues?: SecurityIssue[];
+}
 
 // ── Energy YTD tile ──
 function EnergyYTDTile() {
   const [data, setData] = useState<{ import_cost: number; export_credit: number; net_cost: number } | null>(null);
 
-  useEffect(() => {
-    async function refresh() {
-      try {
-        const d = await fetch('/api/costs/ytd').then((r) => r.json());
-        setData(d);
-      } catch (e) { /* leave dashes */ }
-    }
-    refresh();
-    const id = setInterval(refresh, 300_000);
-    return () => clearInterval(id);
+  const refresh = useCallback(async () => {
+    try {
+      const d = await fetch('/api/costs/ytd').then((r) => r.json());
+      setData(d);
+    } catch { /* leave dashes */ }
   }, []);
+  usePolling(refresh, 300_000);
 
   const fmt = (v: number) => '$' + v.toFixed(2);
 
@@ -60,22 +85,25 @@ interface RateData {
 
 function CurrentRateTile() {
   const [r, setR] = useState<RateData | null>(null);
+  const [now, setNow] = useState<Date>(() => new Date());
 
+  const refresh = useCallback(async () => {
+    try {
+      const data = await fetch('/api/rates').then((x) => x.json());
+      setR(data);
+    } catch { /* leave dashes */ }
+  }, []);
+  usePolling(refresh, 600_000);
+
+  // Re-tick `now` every minute so the period highlight crosses TOU boundaries
+  // (4 PM on-peak start, 9 PM end, etc.) without waiting for the rates poll.
   useEffect(() => {
-    async function refresh() {
-      try {
-        const data = await fetch('/api/rates').then((x) => x.json());
-        setR(data);
-      } catch (e) { /* leave dashes */ }
-    }
-    refresh();
-    const id = setInterval(refresh, 600_000);
+    const id = setInterval(() => setNow(new Date()), 60_000);
     return () => clearInterval(id);
   }, []);
 
   const fmt2 = (v?: number) => (v != null ? '$' + Number(v).toFixed(3) : '\u2014');
 
-  const now = new Date();
   const h = now.getHours();
   const mon = now.getMonth() + 1;
   const dow = now.getDay();
@@ -145,21 +173,17 @@ function CurrentRateTile() {
 
 // ── Pool tile ──
 function PoolTile() {
-  const [d, setD] = useState<any>(null);
+  const [d, setD] = useState<PoolData | null>(null);
 
-  useEffect(() => {
-    async function refresh() {
-      try {
-        const data = await fetch('/api/pool').then((r) => r.json());
-        setD(data);
-      } catch (e) {
-        console.warn('Pool:', e);
-      }
+  const refresh = useCallback(async () => {
+    try {
+      const data = await fetch('/api/pool').then((r) => r.json());
+      setD(data);
+    } catch (e) {
+      console.warn('Pool:', e);
     }
-    refresh();
-    const id = setInterval(refresh, 60_000);
-    return () => clearInterval(id);
   }, []);
+  usePolling(refresh, 60_000);
 
   const temp = d?.temp_f != null ? d.temp_f + '\u00b0F' : '--\u00b0F';
   const tempNa = d?.temp_f == null;
@@ -216,39 +240,26 @@ function PoolTile() {
 
 // ── Security tile ──
 function SecurityTile() {
-  const [d, setD] = useState<any>(null);
+  const [d, setD] = useState<SecurityData | null>(null);
 
-  useEffect(() => {
-    async function refresh() {
-      try {
-        const data = await fetch('/api/security').then((r) => r.json());
-        setD(data);
-      } catch (e) {
-        console.warn('Security:', e);
-      }
+  const refresh = useCallback(async () => {
+    try {
+      const data = await fetch('/api/security').then((r) => r.json());
+      setD(data);
+    } catch (e) {
+      console.warn('Security:', e);
     }
-    refresh();
-    const id = setInterval(refresh, 60_000);
-    return () => clearInterval(id);
   }, []);
+  usePolling(refresh, 60_000);
 
   const notConnected = !d || !d.connected || d.mode == null;
-  const modeText = notConnected ? '--' : d.mode_display || d.mode;
+  const modeText = notConnected ? '--' : d!.mode_display || d!.mode;
   const modeColors: Record<string, string> = { away: 'var(--amber)', home: 'var(--green)', standby: 'var(--dim)' };
-  const modeColor = notConnected ? undefined : modeColors[d.mode] || 'var(--dim)';
+  const modeColor = notConnected ? undefined : (modeColors[d!.mode!] || 'var(--dim)');
 
-  let issuesHtml = '';
-  let issuesColor = 'var(--green)';
-  if (notConnected) {
-    issuesHtml = 'Not connected';
-    issuesColor = '';
-  } else if (!d.issues || d.issues.length === 0) {
-    issuesHtml = 'All secure';
-    issuesColor = 'var(--green)';
-  } else {
-    issuesHtml = d.issues.map((i: any) => i.name + ' ' + i.type).join('<br>');
-    issuesColor = '#e05252';
-  }
+  const issues = !notConnected ? (d!.issues || []) : [];
+  const hasIssues = issues.length > 0;
+  const issuesColor = notConnected ? '' : (hasIssues ? '#e05252' : 'var(--green)');
 
   return (
     <div className="tile" id="security-tile">
@@ -260,8 +271,15 @@ function SecurityTile() {
         <div
           className={`tile-detail tile-sub${notConnected ? ' tile-na' : ''}`}
           style={issuesColor ? { color: issuesColor } : {}}
-          dangerouslySetInnerHTML={{ __html: issuesHtml }}
-        />
+        >
+          {notConnected
+            ? 'Not connected'
+            : !hasIssues
+              ? 'All secure'
+              : issues.map((i, idx) => (
+                  <div key={idx}>{i.name} {i.type}</div>
+                ))}
+        </div>
       </div>
     </div>
   );

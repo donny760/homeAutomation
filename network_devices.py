@@ -1265,9 +1265,15 @@ def merge_into_state(state: dict[str, dict[str, Any]],
         now_ts = int(time.time())
 
     # `fresh_records` may already be merged-by-mac OR a flat per-source list;
-    # collapse to merged form so we always work on one entry per MAC.
-    merged = merge_by_mac(fresh_records) if fresh_records and 'seen_on' \
-        not in fresh_records[0] else fresh_records
+    # detect by looking for `seen_on` on ANY record (merged form always sets
+    # it, even when empty — flat form never does). Checking only [0] was
+    # fragile because a merged record with no labels could lack the key.
+    if not fresh_records:
+        merged = []
+    elif any('seen_on' in r for r in fresh_records):
+        merged = fresh_records
+    else:
+        merged = merge_by_mac(fresh_records)
 
     for r in merged:
         mac = (r.get('mac') or '').lower()

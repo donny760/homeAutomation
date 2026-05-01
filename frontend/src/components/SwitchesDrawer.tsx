@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback, useRef } from 'react';
 
 interface Switch {
   id: number;
-  provider: 'kasa' | 'alexa' | 'pool' | 'nest' | 'tuya' | 'abode';
+  provider: 'kasa' | 'pool' | 'nest' | 'tuya' | 'abode';
   external_id: string;
   kind: 'plug' | 'dimmer' | 'routine' | 'circuit' | 'thermostat' | 'alarm';
   name: string;
@@ -294,6 +294,25 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
   const [localSetpoint, setLocalSetpoint] = useState<
     Record<number, { heat?: number; cool?: number; single?: number }>
   >({});
+  // Per-tile in-flight flag — prevents double-tap from sending two toggles
+  // back-to-back, which can leave the device in an indeterminate state.
+  const [busyIds, setBusyIds] = useState<Set<number>>(new Set());
+  // Surfaced error from the last device control attempt; cleared on next
+  // successful action or auto-cleared after 5s.
+  const [errorMsg, setErrorMsg] = useState<string>('');
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const showError = useCallback((msg: string) => {
+    setErrorMsg(msg);
+    if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    errorTimerRef.current = setTimeout(() => setErrorMsg(''), 5000);
+  }, []);
+  const setBusy = useCallback((id: number, on: boolean) => {
+    setBusyIds((prev) => {
+      const next = new Set(prev);
+      if (on) next.add(id); else next.delete(id);
+      return next;
+    });
+  }, []);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const brightnessTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
   const setpointTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
@@ -337,6 +356,10 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
   }, [open, onClose]);
 
   async function toggle(id: number) {
+    if (busyIds.has(id)) return;
+    setBusy(id, true);
+    const sw = switches.find((s) => s.id === id);
+    const label = sw?.name || `Switch #${id}`;
     try {
       const res = await fetch('/api/switches/toggle', {
         method: 'POST',
@@ -345,11 +368,13 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        console.warn('Toggle failed:', err);
+        showError(`${label}: ${err.error || res.statusText}`);
       }
       load();
     } catch (e) {
-      console.warn('Toggle error:', e);
+      showError(`${label}: ${e}`);
+    } finally {
+      setBusy(id, false);
     }
   }
 
@@ -374,6 +399,8 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
   }
 
   async function armAlarmHome(id: number) {
+    if (busyIds.has(id)) return;
+    setBusy(id, true);
     try {
       const res = await fetch('/api/switches/alarm/arm-home', {
         method: 'POST',
@@ -382,15 +409,19 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        console.warn('Arm home failed:', err);
+        showError(`Arm home: ${err.error || res.statusText}`);
       }
       load();
     } catch (e) {
-      console.warn('Arm home error:', e);
+      showError(`Arm home: ${e}`);
+    } finally {
+      setBusy(id, false);
     }
   }
 
   async function setThermostatMode(id: number, mode: ThermostatMode) {
+    if (busyIds.has(id)) return;
+    setBusy(id, true);
     try {
       const res = await fetch('/api/switches/thermostat', {
         method: 'POST',
@@ -399,7 +430,7 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
-        console.warn('Mode change failed:', err);
+        showError(`Thermostat mode: ${err.error || res.statusText}`);
       }
       setLocalSetpoint((prev) => {
         const next = { ...prev };
@@ -408,7 +439,9 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
       });
       load();
     } catch (e) {
-      console.warn('Thermostat mode error:', e);
+      showError(`Thermostat mode: ${e}`);
+    } finally {
+      setBusy(id, false);
     }
   }
 
@@ -442,13 +475,17 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
       delete setpointTargets.current[`${id}:heat`];
       delete setpointTargets.current[`${id}:cool`];
       try {
-        await fetch('/api/switches/thermostat', {
+        const res = await fetch('/api/switches/thermostat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          showError(`Setpoint: ${err.error || res.statusText}`);
+        }
       } catch (e) {
-        console.warn('Setpoint error:', e);
+        showError(`Setpoint: ${e}`);
       } finally {
         delete setpointTimers.current[id];
         // Clear optimistic state for this id so the server-confirmed value shows
@@ -535,7 +572,12 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
         className={`drawer-backdrop${open ? ' open' : ''}`}
         onClick={onClose}
       />
-      <div className={`drawer${open ? ' open' : ''}`} role="dialog" aria-label="Home Control">
+      <div
+        className={`drawer${open ? ' open' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Home Control"
+      >
         <div className="drawer-header">
           <div className="drawer-title">
             <span className="drawer-title-icon">&#x1F3E0;</span>
@@ -564,6 +606,22 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
           </div>
         </div>
         <div className="drawer-body">
+          {errorMsg && (
+            <div
+              role="alert"
+              style={{
+                padding: '8px 12px',
+                margin: '0 12px 8px',
+                background: 'rgba(224,82,82,0.12)',
+                border: '1px solid #e05252',
+                borderRadius: 6,
+                color: '#e05252',
+                fontSize: '0.85rem',
+              }}
+            >
+              {errorMsg}
+            </div>
+          )}
           {loading && switches.length === 0 ? (
             <div className="drawer-empty">Loading&hellip;</div>
           ) : visible.length === 0 ? (
@@ -665,9 +723,10 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
                       <div
                         key={sw.id}
                         className={cls}
-                        onClick={() => sw.reachable && toggle(sw.id)}
+                        onClick={() => sw.reachable && !busyIds.has(sw.id) && toggle(sw.id)}
                         role="button"
                         aria-pressed={on}
+                        aria-busy={busyIds.has(sw.id)}
                         style={
                           isDimmer
                             ? ({ ['--b' as string]: `${brightness}%` } as React.CSSProperties)

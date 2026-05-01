@@ -1,7 +1,8 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useCallback } from 'react';
 import { fmtFireTime, settingsBadges } from '@/lib/format';
+import { usePolling } from '@/lib/usePolling';
 
 interface ScheduleEntry {
   fire_time: string;
@@ -20,20 +21,16 @@ export default function AutomationsPanel() {
   const [items, setItems] = useState<ScheduleEntry[]>([]);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    async function refresh() {
-      try {
-        const data = await fetch('/api/schedule').then((r) => r.json());
-        setItems((data.schedule || []).slice(0, 5));
-        setLoading(false);
-      } catch (e) {
-        console.warn('Automations:', e);
-      }
+  const refresh = useCallback(async () => {
+    try {
+      const data = await fetch('/api/schedule').then((r) => r.json());
+      setItems((data.schedule || []).slice(0, 5));
+      setLoading(false);
+    } catch (e) {
+      console.warn('Automations:', e);
     }
-    refresh();
-    const id = setInterval(refresh, 60_000);
-    return () => clearInterval(id);
   }, []);
+  usePolling(refresh, 60_000);
 
   return (
     <div className="automations-col">

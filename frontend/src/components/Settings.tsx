@@ -192,7 +192,7 @@ export default function Settings({ isActive }: SettingsProps) {
   }
 
   async function saveCard(connKey: string) {
-    const card = document.querySelector(`[data-connector="${connKey}"]`);
+    const card = document.querySelector(`[data-connector="${CSS.escape(connKey)}"]`);
     if (!card) return;
     const inputs = card.querySelectorAll('input[data-key]:not([type="checkbox"]), textarea[data-key]');
     const selects = card.querySelectorAll('select[data-key]');
@@ -204,7 +204,7 @@ export default function Settings({ isActive }: SettingsProps) {
       if (storageUnit === 'url' || storageUnit === 'text' || storageUnit === 'date' || storageUnit === 'password') {
         updates[key] = input.value;
       } else {
-        const unitSelect = card.querySelector(`select[data-for="${key}"]`) as HTMLSelectElement | null;
+        const unitSelect = card.querySelector(`select[data-for="${CSS.escape(key)}"]`) as HTMLSelectElement | null;
         const displayUnit = unitSelect ? unitSelect.value : storageUnit;
         updates[key] = String(toStorageValue(Number(input.value), displayUnit, storageUnit));
       }
@@ -370,7 +370,6 @@ export default function Settings({ isActive }: SettingsProps) {
                   Save
                 </button>
               )}
-              {/* Alexa auth UI removed — integration shelved. */}
             </div>
           );
         })}

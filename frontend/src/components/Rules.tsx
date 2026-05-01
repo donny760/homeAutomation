@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { modeLabel, settingsBadges, DAYS_LBL, fmtTime12 } from '@/lib/format';
 import { touPeriod } from '@/lib/tou';
 import { mdToHtml } from '@/lib/markdown';
@@ -103,6 +103,27 @@ export default function Rules({ isActive }: RulesProps) {
   const [insightsLoaded, setInsightsLoaded] = useState(false);
   const [insightsElapsed, setInsightsElapsed] = useState('');
   const thinkingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const cancelledRef = useRef(false);
+
+  // Re-tick `now` every minute so the rate-card "NOW" badge crosses TOU
+  // boundaries (4 PM, 9 PM, midnight) without waiting for a rates refresh.
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setNowTick((n) => n + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  // Clean up the thinking interval on unmount even if a fetch is mid-flight.
+  useEffect(() => {
+    cancelledRef.current = false;
+    return () => {
+      cancelledRef.current = true;
+      if (thinkingRef.current) {
+        clearInterval(thinkingRef.current);
+        thinkingRef.current = null;
+      }
+    };
+  }, []);
 
   // Form state
   const [fName, setFName] = useState('');
@@ -116,28 +137,28 @@ export default function Rules({ isActive }: RulesProps) {
   const [fMonths, setFMonths] = useState<Set<number>>(new Set());
   const [fConditions, setFConditions] = useState<Condition[]>([]);
 
-  useEffect(() => {
-    if (isActive) {
-      refreshRules();
-      loadRates();
-    }
-  }, [isActive]);
-
-  async function refreshRules() {
+  const refreshRules = useCallback(async () => {
     try {
       const data = await fetch('/api/rules').then((r) => r.json());
       setRules(data);
     } catch (e) {
       console.warn('Rules:', e);
     }
-  }
+  }, []);
 
-  async function loadRates() {
+  const loadRates = useCallback(async () => {
     try {
       const r = await fetch('/api/rates').then((x) => x.json());
       setRates(r);
-    } catch (e) { /* leave dashes */ }
-  }
+    } catch { /* leave dashes */ }
+  }, []);
+
+  useEffect(() => {
+    if (isActive) {
+      refreshRules();
+      loadRates();
+    }
+  }, [isActive, refreshRules, loadRates]);
 
   async function toggleRule(id: number, checked: boolean) {
     try {
@@ -281,18 +302,28 @@ export default function Rules({ isActive }: RulesProps) {
     setInsightsElapsed('');
 
     let idx = 0;
+    if (thinkingRef.current) clearInterval(thinkingRef.current);
     thinkingRef.current = setInterval(() => {
       idx = (idx + 1) % THINKING_TERMS.length;
       const el = document.getElementById('ai-thinking');
       if (el) el.textContent = 'Analyzing with ' + THINKING_TERMS[idx] + '…';
     }, 1800);
 
+    const stopThinking = () => {
+      if (thinkingRef.current) {
+        clearInterval(thinkingRef.current);
+        thinkingRef.current = null;
+      }
+    };
+
     const t0 = Date.now();
     try {
       const res = await fetch('/api/rules/ai-insights' + (forceRefresh ? '?refresh=1' : ''), { method: 'POST' });
-      if (thinkingRef.current) clearInterval(thinkingRef.current);
+      stopThinking();
+      if (cancelledRef.current) return;
       const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
       const data = await res.json();
+      if (cancelledRef.current) return;
 
       if (data.ok) {
         const now = new Date();
@@ -317,8 +348,9 @@ export default function Rules({ isActive }: RulesProps) {
         );
       }
       setInsightsLoaded(true);
-    } catch (e) {
-      if (thinkingRef.current) clearInterval(thinkingRef.current);
+    } catch {
+      stopThinking();
+      if (cancelledRef.current) return;
       setInsightsHtml('<div class="ai-error">Could not reach Gemini API.</div>');
       setInsightsLoaded(true);
     }
@@ -327,6 +359,8 @@ export default function Rules({ isActive }: RulesProps) {
   // ── Rate card rendering ──
   const fmt3 = (v?: number) => (v != null ? '$' + Number(v).toFixed(3) : '\u2014');
 
+  // nowTick triggers re-render every minute; using it here keeps `now` fresh.
+  void nowTick;
   const now = new Date();
   const h = now.getHours();
   const mon = now.getMonth() + 1;
@@ -536,7 +570,12 @@ export default function Rules({ isActive }: RulesProps) {
         className={`insights-backdrop${insightsOpen ? ' open' : ''}`}
         onClick={() => setInsightsOpen(false)}
       />
-      <div className={`insights-drawer${insightsOpen ? ' open' : ''}`}>
+      <div
+        className={`insights-drawer${insightsOpen ? ' open' : ''}`}
+        role="dialog"
+        aria-modal="true"
+        aria-label="AI Insights"
+      >
         <div className="insights-header">
           <span className="insights-title">
             &#10022; Insights{' '}

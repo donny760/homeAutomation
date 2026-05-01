@@ -53,7 +53,6 @@ export default function NetworkPinModal({
       })
       .catch((e) => setErr(`Load failed: ${e}`))
       .finally(() => setBusy(false));
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, mac]);
 
   if (!open) return null;

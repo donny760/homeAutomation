@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 
 interface EventItem {
+  id?: number;
   ts: number;
   system: string;
   title: string;
@@ -217,8 +218,9 @@ export default function EventLog({ isActive }: EventLogProps) {
               const onRowClick = url
                 ? () => window.open(url, '_blank', 'noopener,noreferrer')
                 : undefined;
+              const rowKey = e.id != null ? `e${e.id}` : `${e.ts}-${e.system}-${e.title}-${i}`;
               return (
-                <span key={i}>
+                <span key={rowKey}>
                   {showDivider && (
                     <div className="event-date-divider">
                       <span>{dateKey}</span>

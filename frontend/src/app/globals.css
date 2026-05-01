@@ -1572,7 +1572,6 @@ table.rules-table {
   opacity: 0.72;
 }
 .switch-tile-badge.kasa  { background: var(--blue); }
-.switch-tile-badge.alexa { background: var(--amber); }
 .switch-tile-badge.pool  { background: var(--pool); }
 .switch-tile-badge.nest  { background: var(--nest); }
 .switch-tile-badge.tuya  { background: #E5522E; }
