@@ -3,3 +3,10 @@ devices.json
 tuya-raw.json
 network_devices.json
 
+# Runtime artifacts — never commit
+powerwall.db
+rates.json
+rules.log
+.pypowerwall.auth
+__pycache__/
+frontend/tsconfig.tsbuildinfo
