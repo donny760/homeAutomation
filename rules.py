@@ -248,8 +248,9 @@ def load_rules_from_db(conn) -> list:
 
 # ── Condition evaluation ──────────────────────────────────────────────────────
 def _eval_single(cond: dict, live: dict) -> bool:
-    if cond['type'] == 'battery_pct':
-        actual = live.get('battery_pct', 0)
+    ctype = cond['type']
+    if ctype in ('battery_pct', 'net_cost'):
+        actual = live.get(ctype, 0)
         op = cond['operator']
         v  = cond['value']
         if op == '>':  return actual >  v
@@ -329,11 +330,21 @@ def next_rule_fire(dt: datetime, rules: list) -> datetime | None:
     return soonest
 
 
-def get_live_state(pw) -> dict:
+def get_live_state(pw, conn) -> dict:
+    state = {}
     try:
-        return {'battery_pct': float(pw.level() or 0)}
+        state['battery_pct'] = float(pw.level() or 0)
     except Exception:
-        return {'battery_pct': 0}
+        state['battery_pct'] = 0
+    try:
+        today = date.today().isoformat()
+        row = conn.execute(
+            'SELECT import_cost - export_credit FROM daily_costs WHERE date = ?', (today,)
+        ).fetchone()
+        state['net_cost'] = float(row[0]) if row and row[0] is not None else 0.0
+    except Exception:
+        state['net_cost'] = 0.0
+    return state
 
 
 # ── Mode label for display ────────────────────────────────────────────────────
@@ -449,7 +460,7 @@ def main_loop(stop_fn=None):
         if now - last_eval >= EVAL_INTERVAL:
             try:
                 rules = load_rules_from_db(conn)
-                live  = get_live_state(pw)
+                live  = get_live_state(pw, conn)
                 dt    = datetime.now()
 
                 target = current_target_state(dt, rules, live)

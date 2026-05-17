@@ -57,6 +57,12 @@ _pool: dict    = {}
 _pool_ts: float = 0.0
 _pool_prev: dict = {}       # previous state for change detection
 _pool_pending: dict = {}    # pending state changes (debounce — must persist 2 consecutive polls)
+_pool_gallons_today: float = 0.0
+_pool_gallons_date:  str   = ''
+_pool_last_accum_ts: float = 0.0
+_pool_normal_gpm:    float = 0.0   # last pump_gpm observed while cleaner was OFF
+_pool_cleaner_gpm:   float = 0.0   # last pump_gpm observed while cleaner was ON
+_pool_edge_gpm:      float = 0.0   # last edge_pump_gpm observed while edge was ON
 
 # Security cache
 _security: dict    = {}
@@ -550,6 +556,68 @@ def _spawn_rebuild_daily_costs() -> bool:
     return True
 
 
+def _rebuild_today() -> None:
+    """Recompute and upsert daily_costs for today only."""
+    today_dt = date.today()
+    today_str = today_dt.isoformat()
+    midnight = int(datetime(today_dt.year, today_dt.month, today_dt.day).timestamp())
+    tomorrow = midnight + 86400
+
+    rate_periods = _load_rate_history()
+    fallback_rates = load_rates() if not rate_periods else None
+    if not rate_periods and not fallback_rates:
+        return
+
+    tou_cfg = _load_tou_periods()
+    day_rate = (_rate_for_date(rate_periods, today_str) if rate_periods else None) or fallback_rates or {}
+
+    with sqlite3.connect(DB_PATH) as c:
+        rows = c.execute(
+            'SELECT timestamp, grid_w FROM readings '
+            'WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp',
+            (midnight, tomorrow)
+        ).fetchall()
+
+        v = {
+            'import_kwh': 0.0, 'export_kwh': 0.0,
+            'import_cost': 0.0, 'export_credit': 0.0,
+            'on_peak_kwh': 0.0, 'off_peak_kwh': 0.0, 'super_off_peak_kwh': 0.0,
+            'on_peak_cost': 0.0, 'off_peak_cost': 0.0, 'super_off_peak_cost': 0.0,
+        }
+        for i in range(1, len(rows)):
+            ts0, g0 = rows[i - 1]
+            ts1, g1 = rows[i]
+            dt_h = (ts1 - ts0) / 3600
+            if dt_h > 1:
+                continue
+            dt = datetime.fromtimestamp(ts1)
+            avg_grid = ((g0 or 0) + (g1 or 0)) / 2
+            kwh = avg_grid * dt_h / 1000
+            season, period = tou_period(dt, tou_cfg)
+            rate = day_rate.get(f'{season}_{period}', 0.0)
+            if kwh > 0:
+                v['import_kwh'] += kwh
+                v['import_cost'] += kwh * rate
+            elif kwh < 0:
+                v['export_kwh'] += abs(kwh)
+                v['export_credit'] += abs(kwh) * rate
+            v[f'{period}_kwh'] += kwh
+            v[f'{period}_cost'] += kwh * rate
+
+        c.execute(
+            'INSERT OR REPLACE INTO daily_costs '
+            '(date, import_kwh, export_kwh, import_cost, export_credit, '
+            ' on_peak_kwh, off_peak_kwh, super_off_peak_kwh, '
+            ' on_peak_cost, off_peak_cost, super_off_peak_cost) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (today_str,
+             round(v['import_kwh'], 4), round(v['export_kwh'], 4),
+             round(v['import_cost'], 4), round(v['export_credit'], 4),
+             round(v['on_peak_kwh'], 4), round(v['off_peak_kwh'], 4), round(v['super_off_peak_kwh'], 4),
+             round(v['on_peak_cost'], 4), round(v['off_peak_cost'], 4), round(v['super_off_peak_cost'], 4))
+        )
+
+
 def rebuild_daily_costs(year: int = None) -> None:
     """Rebuild daily_costs from readings for a given year (default: current year)."""
     # Load rate history — fall back to rates.json if empty
@@ -776,6 +844,7 @@ def poller() -> None:
     last_write = 0
     last_purge = 0
     last_cost_rebuild = 0
+    last_today_rebuild = 0
     last_holidays_check = 0
     last_rates_check = 0
     last_rachio_event_poll = 0
@@ -838,10 +907,14 @@ def poller() -> None:
                 purge_old()
                 last_purge = now
 
-            cost_interval = get_setting_int('cost_rebuild_days', 1) * 86400
+            cost_interval = get_setting_int('cost_rebuild_days', 7) * 86400
             if now - last_cost_rebuild >= cost_interval:
                 _spawn_rebuild_daily_costs()
                 last_cost_rebuild = now
+
+            if now - last_today_rebuild >= 3600:
+                threading.Thread(target=_rebuild_today, daemon=True).start()
+                last_today_rebuild = now
 
             # Holidays + Rates refresh (calendar-driven from shared start date)
             refresh_start = get_setting('refresh_start_date', '')
@@ -1231,10 +1304,15 @@ async def _pool_fetch_async() -> dict:
         hm_opts = _nested(pool_b, 'heat_mode', 'enum_options') or []
         heat_mode = hm_opts[hm_idx] if (hm_idx is not None and isinstance(hm_opts, list) and hm_idx < len(hm_opts)) else None
 
-        # Pump 1 = pool pump; edge pump via circuit 506 (pump 0 is unreliable)
+        # Pump 1 = pool pump; edge pump via circuit 506 (pump 0 is unreliable for state)
         pool_pump_on    = bool(_nested(pump1, 'state', 'value'))
         pool_pump_watts = _nested(pump1, 'watts_now', 'value')
+        pool_pump_rpm   = _nested(pump1, 'rpm_now', 'value')
+        pool_pump_gpm   = _nested(pump1, 'gpm_now', 'value')
         edge_pump_on    = bool(_nested(c506, 'value'))
+        edge_pump_watts = _nested(pump0, 'watts_now', 'value')
+        edge_pump_rpm   = _nested(pump0, 'rpm_now', 'value')
+        edge_pump_gpm   = _nested(pump0, 'gpm_now', 'value')
 
         # Circuits
         pool_circuit_on = bool(_nested(c505, 'value'))
@@ -1268,7 +1346,12 @@ async def _pool_fetch_async() -> dict:
             'temp_f':          round(float(temp_f), 1) if temp_f is not None else None,
             'pump_on':         pool_pump_on,
             'pump_watts':      int(pool_pump_watts) if pool_pump_watts is not None else None,
+            'pump_rpm':        int(pool_pump_rpm)   if pool_pump_rpm   is not None else None,
+            'pump_gpm':        int(pool_pump_gpm)   if pool_pump_gpm   is not None else None,
             'edge_pump_on':    edge_pump_on,
+            'edge_pump_watts': int(edge_pump_watts) if edge_pump_watts is not None else None,
+            'edge_pump_rpm':   int(edge_pump_rpm)   if edge_pump_rpm   is not None else None,
+            'edge_pump_gpm':   int(edge_pump_gpm)   if edge_pump_gpm   is not None else None,
             'cleaner_on':      cleaner_on,
             'pool_circuit_on': pool_circuit_on,
             'spa_circuit_on':  spa_circuit_on,
@@ -1348,8 +1431,202 @@ def _log_pool_changes(new: dict) -> None:
         print(f'Pool event log error: {exc}')
 
 
+def _accumulate_pool_gallons(pool: dict) -> None:
+    global _pool_gallons_today, _pool_gallons_date, _pool_last_accum_ts
+    global _pool_normal_gpm, _pool_cleaner_gpm, _pool_edge_gpm
+    now   = time.time()
+    today = time.strftime('%Y-%m-%d', time.localtime(now))
+    if today != _pool_gallons_date:
+        _pool_gallons_today = 0.0
+        _pool_gallons_date  = today
+        _pool_last_accum_ts = now
+        threading.Thread(target=_recalc_pool_target, daemon=True).start()
+        return
+    if _pool_last_accum_ts == 0.0:
+        _pool_last_accum_ts = now
+        return
+    elapsed_min = (now - _pool_last_accum_ts) / 60.0
+    _pool_last_accum_ts = now
+    if elapsed_min <= 0:
+        return
+    pool_gpm      = pool.get('pump_gpm')
+    edge_gpm      = pool.get('edge_pump_gpm')
+    cleaner_is_on = bool(pool.get('cleaner_on'))
+    gpm_updates: list = []
+    if pool.get('pump_on') and pool_gpm:
+        _pool_gallons_today += pool_gpm * elapsed_min
+        if cleaner_is_on:
+            if float(pool_gpm) != _pool_cleaner_gpm:
+                _pool_cleaner_gpm = float(pool_gpm)
+                gpm_updates.append(('pool_cached_cleaner_gpm', str(_pool_cleaner_gpm)))
+        else:
+            if float(pool_gpm) != _pool_normal_gpm:
+                _pool_normal_gpm = float(pool_gpm)
+                gpm_updates.append(('pool_cached_normal_gpm', str(_pool_normal_gpm)))
+    if pool.get('edge_pump_on') and edge_gpm:
+        _pool_gallons_today += edge_gpm * elapsed_min
+        if float(edge_gpm) != _pool_edge_gpm:
+            _pool_edge_gpm = float(edge_gpm)
+            gpm_updates.append(('pool_cached_edge_gpm', str(_pool_edge_gpm)))
+    if gpm_updates:
+        try:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute('PRAGMA busy_timeout=5000')
+                conn.executemany(
+                    'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                    gpm_updates
+                )
+                conn.commit()
+        except Exception as exc:
+            print(f'Pool GPM cache write error: {exc}')
+
+
+_CLEANER_PRESET_RPM = 2950  # pump gateway preset RPM for cleaner mode
+_MAX_SEGMENT_HOURS  = 18    # cap segments to guard against missed off-events
+
+
+def _recalc_pool_target() -> None:
+    """Derive weekday/weekend daily gallons targets from 30 days of event_log.
+    Called in a daemon thread at midnight rollover and on server startup.
+    """
+    global _pool_normal_gpm, _pool_cleaner_gpm, _pool_edge_gpm
+
+    normal_gpm = _pool_normal_gpm if _pool_normal_gpm > 0 else 23.0
+    edge_gpm   = _pool_edge_gpm   if _pool_edge_gpm   > 0 else 34.0
+    if _pool_cleaner_gpm > 0:
+        cleaner_gpm = _pool_cleaner_gpm
+    elif _pool_normal_gpm > 0:
+        normal_rpm  = _pool.get('pump_rpm') or 1770
+        cleaner_gpm = normal_gpm * (_CLEANER_PRESET_RPM / normal_rpm)
+    else:
+        cleaner_gpm = 38.3
+
+    cutoff_ts    = int(time.time()) - 30 * 86400
+    MAX_SEG_SECS = _MAX_SEGMENT_HOURS * 3600
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA busy_timeout=5000')
+            rows = conn.execute(
+                '''SELECT ts, event_type, title FROM event_log
+                   WHERE  system = 'pool'
+                     AND  event_type IN ('pump_changed','edge_pump_changed','cleaner_changed')
+                     AND  ts >= ?
+                   ORDER BY ts''',
+                (cutoff_ts,)
+            ).fetchall()
+    except Exception as exc:
+        print(f'_recalc_pool_target DB error: {exc}')
+        return
+
+    from collections import defaultdict
+    by_date: dict = defaultdict(list)
+    for ts, event_type, title in rows:
+        by_date[time.strftime('%Y-%m-%d', time.localtime(ts))].append((ts, event_type, title))
+
+    today = time.strftime('%Y-%m-%d', time.localtime(time.time()))
+
+    def build_segments(events, day, etype):
+        segs, start = [], None
+        day_start = int(time.mktime(time.strptime(day, '%Y-%m-%d')))
+        for ts, et, title in events:
+            if et != etype:
+                continue
+            if 'turned on' in title and start is None:
+                start = ts
+            elif 'turned off' in title and start is not None:
+                segs.append((start, start + min(ts - start, MAX_SEG_SECS)))
+                start = None
+        if start is not None:
+            segs.append((start, start + min(day_start + 86400 - start, MAX_SEG_SECS)))
+        return segs
+
+    def intersect_min(a_segs, b_segs):
+        total = 0.0
+        for as_, ae in a_segs:
+            for bs, be in b_segs:
+                lo, hi = max(as_, bs), min(ae, be)
+                if hi > lo:
+                    total += hi - lo
+        return total / 60.0
+
+    weekday_vals: list = []
+    weekend_vals: list = []
+
+    for day, events in sorted(by_date.items()):
+        if day == today:
+            continue
+        pump_segs    = build_segments(events, day, 'pump_changed')
+        cleaner_segs = build_segments(events, day, 'cleaner_changed')
+        edge_segs    = build_segments(events, day, 'edge_pump_changed')
+        if not pump_segs:
+            continue
+        pump_min    = sum(e - s for s, e in pump_segs) / 60.0
+        cleaner_min = intersect_min(cleaner_segs, pump_segs)
+        normal_min  = pump_min - cleaner_min
+        edge_min    = sum(e - s for s, e in edge_segs) / 60.0
+        gallons     = normal_min * normal_gpm + cleaner_min * cleaner_gpm + edge_min * edge_gpm
+        dow = time.localtime(time.mktime(time.strptime(day, '%Y-%m-%d'))).tm_wday
+        (weekday_vals if dow < 5 else weekend_vals).append(gallons)
+
+    # Seed today's partial gallons — same logic, open segments cap at now
+    now_ts = time.time()
+    today_events = by_date.get(today, [])
+    if today_events:
+        def build_segments_now(events, etype):
+            segs, start = [], None
+            for ts, et, title in events:
+                if et != etype:
+                    continue
+                if 'turned on' in title and start is None:
+                    start = ts
+                elif 'turned off' in title and start is not None:
+                    segs.append((start, start + min(ts - start, MAX_SEG_SECS)))
+                    start = None
+            if start is not None:
+                segs.append((start, start + min(now_ts - start, MAX_SEG_SECS)))
+            return segs
+
+        t_pump    = build_segments_now(today_events, 'pump_changed')
+        t_cleaner = build_segments_now(today_events, 'cleaner_changed')
+        t_edge    = build_segments_now(today_events, 'edge_pump_changed')
+        t_pump_min    = sum(e - s for s, e in t_pump)    / 60.0
+        t_cleaner_min = intersect_min(t_cleaner, t_pump)
+        t_normal_min  = t_pump_min - t_cleaner_min
+        t_edge_min    = sum(e - s for s, e in t_edge)    / 60.0
+        seeded = t_normal_min * normal_gpm + t_cleaner_min * cleaner_gpm + t_edge_min * edge_gpm
+        global _pool_gallons_today, _pool_gallons_date, _pool_last_accum_ts
+        _pool_gallons_today = seeded
+        _pool_gallons_date  = today
+        _pool_last_accum_ts = now_ts
+
+    if not weekday_vals and not weekend_vals:
+        return
+
+    def _avg(vals, fallback=21500):
+        return int(sum(vals) / len(vals)) if vals else fallback
+
+    target_wd = _avg(weekday_vals[-2:])
+    target_we = _avg(weekend_vals[-2:], target_wd)
+
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute('PRAGMA busy_timeout=5000')
+            conn.executemany(
+                'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                [('pool_gallons_target_weekday', str(target_wd)),
+                 ('pool_gallons_target_weekend', str(target_we))]
+            )
+            conn.commit()
+        print(f'Pool target recalc: weekday={target_wd} gal, weekend={target_we} gal '
+              f'({len(weekday_vals)} weekdays, {len(weekend_vals)} weekends)')
+    except Exception as exc:
+        print(f'_recalc_pool_target write error: {exc}')
+
+
 def fetch_pool() -> dict:
-    global _pool, _pool_ts
+    global _pool, _pool_ts, _pool_gallons_today, _pool_gallons_date, _pool_last_accum_ts
     if not get_setting_bool('pool_enabled', True):
         return _pool or {'temp_f': None, 'pump_on': None, 'spa_temp_f': None}
     pool_ttl = get_setting_int('pool_poll_interval', POOL_POLL_INTERVAL)
@@ -1367,6 +1644,11 @@ def fetch_pool() -> dict:
         _pool    = asyncio.run(_pool_fetch_async())
         _pool_ts = time.time()
         _log_pool_changes(_pool)
+        _accumulate_pool_gallons(_pool)
+        _pool['gallons_today']  = int(_pool_gallons_today)
+        is_weekday = datetime.today().weekday() < 5
+        key = 'pool_gallons_target_weekday' if is_weekday else 'pool_gallons_target_weekend'
+        _pool['gallons_target'] = get_setting_int(key, 21500)
     except Exception as exc:
         print(f'Pool error: {exc}')
         _log_system_error('pool', 'Pool fetch error', str(exc))
@@ -1523,6 +1805,11 @@ def next_static(filename):
     return send_from_directory(os.path.join('static', 'frontend', '_next'), filename)
 
 
+@app.route('/<path:filename>')
+def frontend_static(filename):
+    return send_from_directory(os.path.join('static', 'frontend'), filename)
+
+
 @app.route('/api/live')
 def api_live():
     with _lock:
@@ -1587,7 +1874,7 @@ def _filter_chart_rows(raw: list) -> list:
             if prev_h > 0 and next_h > 0 and cur_h > 0:
                 if abs(cur_h - prev_h) / prev_h > 0.5 and abs(cur_h - next_h) / next_h > 0.5:
                     continue
-        out.append({'ts': r[0], 'solar_w': r[1], 'home_w': r[2]})
+        out.append({'ts': r[0], 'solar_w': r[1], 'home_w': r[2], 'grid_w': r[4]})
     return out
 
 
@@ -4598,13 +4885,19 @@ The table MUST appear before any rule change recommendations.
 **2. Seasonal transition impact**
 Based on the current season and when the next season starts:
 - Walk through what happens on a typical day in the upcoming season based on the
-  current rules — what mode is the system in at each key time of day?
+  current rules — what mode is the system in at each key time of day? Describe this
+  in plain English (e.g., "Around 4:00 AM the battery charges from the grid...").
+  Do not quote rule names directly — describe what the system does, not which rule fires.
 - How will the season shift affect solar production, electricity rates, and the
   opportunity to sell power back to the grid?
 - What rule changes should be made BEFORE the transition?
-- Address the battery export window timing given longer summer daylight hours
+- Address the battery export window timing given longer summer daylight hours.
 
 **3. Rule review (not "optimization" by default)**
+**ONLY discuss rules where you have identified an actual issue — name-vs-value
+inconsistency, sequencing gap, or month coverage error. Do not narrate rules that
+are functioning correctly. Silence on a rule means it is fine.**
+
 **ONLY suggest rule changes if you can point to a specific inconsistency or gap that
 the homeowner likely did not intend.** If the rules appear internally consistent and
 the projection is within target, say so — do not invent optimizations for their own sake.
@@ -4625,9 +4918,31 @@ Focus on these checks:
   rule but another doesn't, mention it as an observation — not a requirement — unless
   it's creating a measurable problem.
 
+**When a Rule-Based Finding flags that battery export starts later than the on-peak
+window opens:** Do NOT simply recommend moving it earlier. Instead, reason through
+the full energy picture for that window:
+- Is solar production still strong between the on-peak start and the current export
+  start time? If so, the battery may be charging or at capacity — active export
+  during that window would cut into solar charging, not idle capacity.
+- After the export window closes, how much battery capacity remains? Would starting
+  export earlier leave insufficient reserve for post-on-peak self-consumption,
+  potentially causing grid imports at off-peak rates that offset the credit gains?
+- Only recommend an earlier export start if you can demonstrate from the data that
+  the battery is genuinely full AND idle during that window AND adequate reserve
+  would remain for evening self-consumption. If you cannot demonstrate both
+  conditions, note the timing as likely intentional and explain the probable rationale
+  (e.g., "the later start preserves a full battery for solar charging earlier in the
+  afternoon, then exports once solar tapers off").
+
 For any change you suggest, show the dollar impact per month using actual rates from
 the data. If the impact is under $20/month, note that the rule complexity may not be
 worth it. Alternative perspectives are welcome as observations, but not required.
+
+**The rule_based_insights findings are already displayed to the user above your
+response. Do not restate them.** Your job is to synthesize: do multiple findings
+point to a pattern? Does a finding connect to something measurable in the daily
+data or projection? A finding is only worth mentioning if you can add context
+that the finding itself does not contain — otherwise, leave it out.
 
 **4. Daily data observations**
 Looking at the daily cost data, comment ONLY if you notice:
@@ -4654,7 +4969,8 @@ The `data_quality` object tells you how reliable each projection input is:
 When data sources are estimated rather than measured, hedge your language accordingly.
 
 ## Format
-Use markdown. Use the actual rate values and cost figures from the data — no generic estimates.
+Use markdown. Use at most ### for headings — never #### or deeper. Use the actual rate
+values and cost figures from the data — no generic estimates.
 Do not repeat findings already listed in rule_based_insights.
 
 CRITICAL — Write for a homeowner, not an engineer:
@@ -4833,12 +5149,26 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
             'import_kwh': row[1] or 0, 'export_kwh': row[2] or 0,
         }
 
-    # Home consumption ratio — Q1 is winter, so ratio applies best to winter months.
-    # Summer home usage is more sun-driven (AC, etc.) so cap the summer ratio at 1.1×
-    cy_q1_home = sum(cy_power.get(m, {}).get('home_kwh', 0) for m in [1, 2, 3])
-    py_q1_home = sum(py_power.get(m, {}).get('home_kwh', 0) for m in [1, 2, 3])
-    winter_home_ratio = cy_q1_home / py_q1_home if py_q1_home > 0 else 1.0
-    summer_home_ratio = min(winter_home_ratio, 1.10)  # cap summer at 10% increase
+    # Home consumption ratio — only use months where both CY and PY have readings data.
+    # This prevents ratio explosion when CY is missing future months (e.g. Nov/Dec
+    # haven't happened yet) while PY has full-year data.
+    # Winter = Nov–May (SDG&E), summer = Jun–Oct.
+    winter_months = {1, 2, 3, 4, 5, 11, 12}
+    summer_months = {6, 7, 8, 9, 10}
+
+    def _ratio_for_season(months):
+        cy_tot = py_tot = 0.0
+        for m in months:
+            cy_h = cy_power.get(m, {}).get('home_kwh', 0)
+            py_h = py_power.get(m, {}).get('home_kwh', 0)
+            if cy_h > 0 and py_h > 0:
+                cy_tot += cy_h
+                py_tot += py_h
+        return cy_tot / py_tot if py_tot > 0 else 1.0
+
+    winter_home_ratio = _ratio_for_season(winter_months)
+    raw_summer_ratio = _ratio_for_season(summer_months)
+    summer_home_ratio = raw_summer_ratio if raw_summer_ratio != 1.0 else min(winter_home_ratio, 1.10)
 
     # Rate periods
     rate_periods = c.execute(
@@ -5247,6 +5577,10 @@ def _build_ai_context():
         'battery_ok': 'active battery export enabled',
         'pv_only': 'battery export disabled (solar-only export)',
     }
+    _COND_LABELS = {
+        'battery_pct': 'battery %',
+        'net_cost': 'net cost today $',
+    }
 
     def _fmt_days(days):
         if set(days) == {0, 1, 2, 3, 4, 5, 6}:
@@ -5288,6 +5622,8 @@ def _build_ai_context():
         actions = []
         if r.get('mode'):
             actions.append(_MODE_LABELS.get(r['mode'], r['mode']))
+        else:
+            actions.append('mode unchanged')
         if r.get('reserve') is not None:
             actions.append(f'battery reserve {r["reserve"]}%')
         if r.get('grid_charging') is True:
@@ -5296,8 +5632,17 @@ def _build_ai_context():
             actions.append('grid charging OFF')
         if r.get('grid_export'):
             actions.append(_EXPORT_LABELS.get(r['grid_export'], r['grid_export']))
-        if actions:
-            parts.append('→ ' + ', '.join(actions))
+        parts.append('→ ' + ', '.join(actions))
+        conds = r.get('conditions', [])
+        if conds:
+            cond_parts = []
+            for c in conds:
+                label = _COND_LABELS.get(c['type'], c['type'])
+                cond_parts.append(f'{c["logic"]} {label} {c["operator"]} {c["value"]}')
+            # strip leading 'AND '/'OR ' from first condition
+            first = cond_parts[0].split(' ', 1)[1] if cond_parts else ''
+            rest = cond_parts[1:]
+            parts.append('if ' + first + (' ' + ' '.join(rest) if rest else ''))
         rule_descriptions.append(' | '.join(parts))
 
     # Prior year monthly summaries
@@ -6985,9 +7330,20 @@ except ImportError:
     HAS_WIN32 = False
 
 
+def _load_pool_gpm_cache() -> None:
+    global _pool_normal_gpm, _pool_cleaner_gpm, _pool_edge_gpm
+    try:
+        _pool_normal_gpm  = float(get_setting('pool_cached_normal_gpm',  0) or 0)
+        _pool_cleaner_gpm = float(get_setting('pool_cached_cleaner_gpm', 0) or 0)
+        _pool_edge_gpm    = float(get_setting('pool_cached_edge_gpm',    0) or 0)
+    except Exception as exc:
+        print(f'Pool GPM cache load error: {exc}')
+
+
 def _start():
     os.chdir(BASE_DIR)
     init_db()
+    _load_pool_gpm_cache()
     _backfill_rates_event_url()
     backfill_history()
     # Seed switches_meta with known pool circuits on startup so tiles appear
@@ -7010,6 +7366,7 @@ def _start():
         except Exception as exc:
             print(f'Kasa loop start error: {exc}')
     threading.Thread(target=rebuild_daily_costs, daemon=True).start()
+    threading.Thread(target=_recalc_pool_target, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=_network_poll_loop, daemon=True).start()
     start_abode_listener()

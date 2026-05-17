@@ -29,8 +29,9 @@ export default function DayChart() {
   const solarDataRef = useRef<{ x: number; y: number }[]>([]);
   const homeDataRef = useRef<{ x: number; y: number }[]>([]);
   const forecastRef = useRef<{ x: number; y: number }[]>([]);
-  const visibilityRef = useRef([true, true, true]);
-  const [visible, setVisible] = useState([true, true, true]);
+  const gridDataRef = useRef<{ x: number; y: number }[]>([]);
+  const visibilityRef = useRef([true, true, true, true]);
+  const [visible, setVisible] = useState([true, true, true, true]);
   const [viewedDate, setViewedDate] = useState<Date>(() => {
     const d = new Date();
     d.setHours(0, 0, 0, 0);
@@ -58,7 +59,7 @@ export default function DayChart() {
 
   // Refs holding refs — stable identity across renders so the toggleDataset
   // closure (empty deps) always sees the latest dataset payloads.
-  const dataRefs = useRef([solarDataRef, homeDataRef, forecastRef]);
+  const dataRefs = useRef([solarDataRef, homeDataRef, forecastRef, gridDataRef]);
 
   const toggleDataset = useCallback((index: number) => {
     setVisible((prev) => {
@@ -125,6 +126,16 @@ export default function DayChart() {
             pointRadius: 0,
             borderWidth: 1.5,
             borderDash: [6, 4],
+          },
+          {
+            label: 'Grid',
+            data: [],
+            borderColor: '#52C27A',
+            backgroundColor: 'rgba(82,194,122,0.07)',
+            fill: true,
+            tension: 0,
+            pointRadius: 0,
+            borderWidth: 2,
           },
         ],
       },
@@ -216,8 +227,10 @@ export default function DayChart() {
         if (!chart) return;
         solarDataRef.current = rows.filter((r: any) => r.solar_w > 0).map((r: any) => ({ x: r.ts * 1000, y: r.solar_w }));
         homeDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.home_w) }));
+        gridDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.grid_w ?? 0) }));
         if (visibilityRef.current[0]) chart.data.datasets[0].data = solarDataRef.current;
         if (visibilityRef.current[1]) chart.data.datasets[1].data = homeDataRef.current;
+        if (visibilityRef.current[3]) chart.data.datasets[3].data = gridDataRef.current;
         chart.update('none');
       } catch (e) {
         console.warn('Chart:', e);
@@ -266,7 +279,7 @@ export default function DayChart() {
     <div className="card chart-card">
       <div className="chart-header">
         <div className="chart-title-wrap">
-          <div className="chart-title">Solar vs Home Load &mdash; {dayLabel(viewedDate)}</div>
+          <div className="chart-title">Power &mdash; {dayLabel(viewedDate)}</div>
           <div className="chart-nav">
             <button className="chart-nav-btn" onClick={() => shiftDay(-1)} aria-label="Previous day">&#9664;</button>
             <button className="chart-nav-btn" onClick={() => shiftDay(1)} disabled={isToday} aria-label="Next day">&#9654;</button>
@@ -296,6 +309,13 @@ export default function DayChart() {
               Forecast
             </div>
           )}
+          <div
+            className={`legend-item${visible[3] ? '' : ' legend-inactive'}`}
+            onClick={() => toggleDataset(3)}
+          >
+            <div className="legend-dot" style={{ background: '#52C27A' }} />
+            Grid
+          </div>
         </div>
       </div>
       <div className="chart-wrap">

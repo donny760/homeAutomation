@@ -708,6 +708,7 @@ export default function Rules({ isActive }: RulesProps) {
                       </select>
                       <select className="form-select" value={c.type} onChange={(e) => updateCondition(idx, 'type', e.target.value)}>
                         <option value="battery_pct">Battery %</option>
+                        <option value="net_cost">Net Cost Today ($)</option>
                       </select>
                       <select className="form-select" value={c.operator} onChange={(e) => updateCondition(idx, 'operator', e.target.value)}>
                         <option value="&gt;">&gt;</option>

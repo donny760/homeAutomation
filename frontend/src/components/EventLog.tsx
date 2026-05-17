@@ -71,7 +71,7 @@ interface EventLogProps {
 
 export default function EventLog({ isActive }: EventLogProps) {
   const today = toDateStr(new Date());
-  const weekAgo = toDateStr(new Date(Date.now() - 7 * 86400_000));
+  const sixMonthsAgo = toDateStr(new Date(new Date().setMonth(new Date().getMonth() - 6)));
 
   const [events, setEvents] = useState<EventItem[]>([]);
   const [filter, setFilter] = useState('all');
@@ -79,7 +79,7 @@ export default function EventLog({ isActive }: EventLogProps) {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
-  const [startDate, setStartDate] = useState(weekAgo);
+  const [startDate, setStartDate] = useState(sixMonthsAgo);
   const [endDate, setEndDate] = useState(today);
 
   const offsetRef = useRef(0);

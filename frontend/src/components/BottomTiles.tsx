@@ -8,7 +8,12 @@ interface PoolData {
   temp_f?: number | null;
   pump_on?: boolean;
   pump_watts?: number | null;
+  pump_rpm?: number | null;
+  pump_gpm?: number | null;
   edge_pump_on?: boolean;
+  edge_pump_watts?: number | null;
+  edge_pump_rpm?: number | null;
+  edge_pump_gpm?: number | null;
   cleaner_on?: boolean;
   pool_light_on?: boolean;
   water_light_on?: boolean;
@@ -19,6 +24,8 @@ interface PoolData {
   scg_active?: boolean;
   scg_pool_pct?: number | null;
   super_chlor?: boolean;
+  gallons_today?: number | null;
+  gallons_target?: number | null;
 }
 
 interface SecurityIssue {
@@ -191,8 +198,20 @@ function PoolTile() {
   // Build list of active circuits
   const circuits: { label: string; on: boolean }[] = d
     ? [
-        { label: 'Pump' + (d.pump_watts != null ? ` \u00b7 ${d.pump_watts}W` : ''), on: !!d.pump_on },
-        { label: 'Edge Pump', on: !!d.edge_pump_on },
+        {
+          label: 'Pump'
+            + (d.pump_watts != null ? ` \u00b7 ${d.pump_watts}W`       : '')
+            + (d.pump_rpm   != null ? ` \u00b7 ${d.pump_rpm}rpm`       : '')
+            + (d.pump_gpm   != null ? ` \u00b7 ${d.pump_gpm}gpm`       : ''),
+          on: !!d.pump_on,
+        },
+        {
+          label: 'Edge'
+            + (d.edge_pump_watts != null ? ` \u00b7 ${d.edge_pump_watts}W`   : '')
+            + (d.edge_pump_rpm   != null ? ` \u00b7 ${d.edge_pump_rpm}rpm`   : '')
+            + (d.edge_pump_gpm   != null ? ` \u00b7 ${d.edge_pump_gpm}gpm`   : ''),
+          on: !!d.edge_pump_on,
+        },
         { label: 'Cleaner', on: !!d.cleaner_on },
         { label: 'Pool Light', on: !!d.pool_light_on },
         { label: 'Water Light', on: !!d.water_light_on },
@@ -230,6 +249,19 @@ function PoolTile() {
           {saltText && (
             <div className={`tile-sub${d?.salt_ppm == null ? ' tile-na' : ''}`} style={{ color: saltColor }}>
               {saltText}
+            </div>
+          )}
+          {d?.gallons_today != null && d?.gallons_target != null && (
+            <div
+              className="tile-sub"
+              style={{
+                color:
+                  d.gallons_today >= d.gallons_target          ? 'var(--green)'
+                  : d.gallons_today >= d.gallons_target * 0.75 ? 'var(--amber)'
+                  : 'var(--dim)',
+              }}
+            >
+              {d.gallons_today.toLocaleString()} / {d.gallons_target.toLocaleString()} gal
             </div>
           )}
         </div>

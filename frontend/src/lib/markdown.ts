@@ -37,6 +37,10 @@ export function mdToHtml(md: string): string {
       inTable = false;
     }
 
+    if (/^####\s(.+)/.test(trimmed)) {
+      html += '<h5>' + trimmed.replace(/^####\s/, '') + '</h5>';
+      continue;
+    }
     if (/^###\s(.+)/.test(trimmed)) {
       html += '<h4>' + trimmed.replace(/^###\s/, '') + '</h4>';
       continue;
