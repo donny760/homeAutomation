@@ -47,18 +47,33 @@ export default function PowerflowSVG({ data }: PowerflowSVGProps) {
     const batChg   = d.battery_w >  THRESHOLD ? d.battery_w : 0;
     const gridImp  = gridIn ? d.grid_w : 0;
 
-    // Grid covers home first (keeps grid visible when importing),
-    // then solar covers remaining home, then battery covers the rest.
-    const gridToHome     = Math.min(gridImp, d.home_w);
-    const homeAfterGrid  = Math.max(0, d.home_w - gridToHome);
-    const solarToHome    = Math.min(solarGen, homeAfterGrid);
-    const homeAfterSolar = Math.max(0, homeAfterGrid - solarToHome);
-    const batToHome      = Math.min(batDis, homeAfterSolar);
-    const solarAfterHome = Math.max(0, solarGen - solarToHome);
-    const solarToBat     = Math.min(solarAfterHome, batChg);
-    const solarToGrid    = Math.max(0, solarAfterHome - solarToBat);
-    const batToGrid      = gridOut ? Math.max(0, batDis - batToHome) : 0;
-    const gridToBat      = gridIn  ? Math.max(0, gridImp - gridToHome) : 0;
+    // When exporting: solar feeds grid first (matches Tesla app / TBC intent),
+    //   remaining solar covers home, battery covers the rest of home + remaining export.
+    // When importing: grid covers home first, solar covers remainder, solar/grid charge battery.
+    let solarToGrid = 0, solarToHome = 0, solarToBat = 0;
+    let batToHome = 0, batToGrid = 0;
+    let gridToHome = 0, gridToBat = 0;
+
+    if (gridOut) {
+      const gridExp  = Math.abs(d.grid_w);
+      solarToGrid    = Math.min(solarGen, gridExp);
+      const solLeft  = Math.max(0, solarGen - solarToGrid);
+      solarToHome    = Math.min(solLeft, d.home_w);
+      solarToBat     = Math.min(Math.max(0, solLeft - solarToHome), batChg);
+      batToHome      = Math.min(batDis, Math.max(0, d.home_w - solarToHome));
+      batToGrid      = Math.max(0, gridExp - solarToGrid);
+    } else if (gridIn) {
+      gridToHome     = Math.min(gridImp, d.home_w);
+      const homLeft  = Math.max(0, d.home_w - gridToHome);
+      solarToHome    = Math.min(solarGen, homLeft);
+      solarToBat     = Math.min(Math.max(0, solarGen - solarToHome), batChg);
+      batToHome      = Math.min(batDis, Math.max(0, homLeft - solarToHome));
+      gridToBat      = Math.max(0, gridImp - gridToHome);
+    } else {
+      solarToHome    = Math.min(solarGen, d.home_w);
+      solarToBat     = Math.min(Math.max(0, solarGen - solarToHome), batChg);
+      batToHome      = Math.min(batDis, Math.max(0, d.home_w - solarToHome));
+    }
 
     setFlow('flow-solar-home',    solarToHome > 0, solarToHome);
     setFlow('flow-solar-battery', solarToBat  > 0, solarToBat);
