@@ -40,20 +40,33 @@ export default function PowerflowSVG({ data }: PowerflowSVGProps) {
     if (!data) return;
     const d = data;
 
-    const solarOn = d.solar_w > THRESHOLD;
-    const battChg = d.battery_w > THRESHOLD;
-    const battDis = d.battery_w < -THRESHOLD;
-    const gridIn = d.grid_w > THRESHOLD;
+    const gridIn  = d.grid_w >  THRESHOLD;
     const gridOut = d.grid_w < -THRESHOLD;
+    const solarGen = Math.max(0, d.solar_w);
+    const batDis   = d.battery_w < -THRESHOLD ? Math.abs(d.battery_w) : 0;
+    const batChg   = d.battery_w >  THRESHOLD ? d.battery_w : 0;
+    const gridImp  = gridIn ? d.grid_w : 0;
 
-    setFlow('flow-solar-home', solarOn, d.solar_w);
-    setFlow('flow-solar-battery', battChg, d.battery_w);
-    // Solar→grid only when solar is actually contributing — otherwise the
-    // dot animates a phantom export that's really coming from the battery.
-    setFlow('flow-solar-grid', solarOn && gridOut, Math.abs(d.grid_w));
-    setFlow('flow-battery-home', battDis, Math.abs(d.battery_w));
-    setFlow('flow-grid-home', gridIn, d.grid_w);
-    setFlow('flow-battery-grid', battDis && gridOut, Math.abs(d.battery_w));
+    // Grid covers home first (keeps grid visible when importing),
+    // then solar covers remaining home, then battery covers the rest.
+    const gridToHome     = Math.min(gridImp, d.home_w);
+    const homeAfterGrid  = Math.max(0, d.home_w - gridToHome);
+    const solarToHome    = Math.min(solarGen, homeAfterGrid);
+    const homeAfterSolar = Math.max(0, homeAfterGrid - solarToHome);
+    const batToHome      = Math.min(batDis, homeAfterSolar);
+    const solarAfterHome = Math.max(0, solarGen - solarToHome);
+    const solarToBat     = Math.min(solarAfterHome, batChg);
+    const solarToGrid    = Math.max(0, solarAfterHome - solarToBat);
+    const batToGrid      = gridOut ? Math.max(0, batDis - batToHome) : 0;
+    const gridToBat      = gridIn  ? Math.max(0, gridImp - gridToHome) : 0;
+
+    setFlow('flow-solar-home',    solarToHome > 0, solarToHome);
+    setFlow('flow-solar-battery', solarToBat  > 0, solarToBat);
+    setFlow('flow-solar-grid',    solarToGrid > 0, solarToGrid);
+    setFlow('flow-battery-home',  batToHome   > 0, batToHome);
+    setFlow('flow-battery-grid',  batToGrid   > 0, batToGrid);
+    setFlow('flow-grid-home',     gridToHome  > 0, gridToHome);
+    setFlow('flow-grid-battery',  gridToBat   > 0, gridToBat);
 
     const svg = svgRef.current;
     if (!svg) return;
@@ -152,6 +165,7 @@ export default function PowerflowSVG({ data }: PowerflowSVGProps) {
         <path id="flow-battery-home" className="flow-path" stroke="#1D9E75" pathLength={1} d="M 210,185 L 690,185" />
         <path id="flow-grid-home" className="flow-path" stroke="#888780" pathLength={1} d="M 450,295 C 640,295 690,250 690,185" />
         <path id="flow-battery-grid" className="flow-path" stroke="#1D9E75" pathLength={1} d="M 210,185 C 210,280 350,295 450,295" />
+        <path id="flow-grid-battery" className="flow-path" stroke="#888780" pathLength={1} d="M 450,295 C 350,295 210,280 210,185" />
 
         {/* Solar node */}
         <circle cx="450" cy="55" r="36" className="node-ring" stroke="#EF9F27" />

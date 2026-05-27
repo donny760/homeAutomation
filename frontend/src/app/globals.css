@@ -1165,8 +1165,17 @@ table.rules-table {
   vertical-align: middle;
   white-space: nowrap;
 }
-.rules-table td:nth-child(2) { white-space: normal; }  /* Name column can wrap */
+.rules-table td:nth-child(3) { white-space: normal; }  /* Name column can wrap */
 .rules-table tr:last-child td { border-bottom: none; }
+.drag-handle {
+  cursor: grab;
+  color: var(--very-dim);
+  font-size: 1rem;
+  padding: 9px 6px 9px 10px !important;
+  user-select: none;
+  touch-action: none;
+}
+.drag-handle:active { cursor: grabbing; }
 
 .toggle-wrap { display: flex; align-items: center; }
 .toggle {

@@ -10,7 +10,7 @@ Usage:
   py rules.py remove
 """
 
-import os, sys, time, logging, sqlite3, json
+import os, sys, time, logging, logging.handlers, sqlite3, json
 from datetime import datetime, date, timedelta
 
 import pypowerwall
@@ -33,7 +33,9 @@ logging.basicConfig(
     format='%(asctime)s  %(levelname)-8s  %(message)s',
     datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
-        logging.FileHandler(LOG_PATH),
+        logging.handlers.RotatingFileHandler(
+            LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=3
+        ),
         logging.StreamHandler(sys.stdout),
     ]
 )
@@ -220,7 +222,10 @@ def load_rules_from_db(conn) -> list:
     ).fetchall()
 
     cond_rows = conn.execute(
-        'SELECT rule_id,logic,type,operator,value FROM rule_conditions'
+        '''SELECT rc.rule_id, rc.logic, rc.type, rc.operator, rc.value
+           FROM rule_conditions rc
+           JOIN rules r ON r.id = rc.rule_id
+           WHERE r.enabled = 1'''
     ).fetchall()
     cond_map = {}
     for rule_id, logic, ctype, op, val in cond_rows:
@@ -280,17 +285,24 @@ def evaluate_conditions(conditions: list, live: dict) -> bool:
 
 # ── State reconstruction ──────────────────────────────────────────────────────
 def _rule_fires_at(rule: dict, d: date) -> datetime | None:
-    weekday = d.weekday()
-    if weekday not in rule['days']:
-        # On holidays, fire if rule includes any weekend day (Sat=5 or Sun=6)
-        if not (is_sdge_holiday(d) and rule['days'] & {5, 6}):
+    weekday    = d.weekday()
+    is_holiday = is_sdge_holiday(d)
+    has_weekend = bool(rule['days'] & {5, 6})
+
+    if is_holiday:
+        # Treat holiday like a weekend: only weekend rules fire
+        if not has_weekend:
             return None
+    else:
+        if weekday not in rule['days']:
+            return None
+
     if d.month not in rule['months']:
         return None
     return datetime(d.year, d.month, d.day, rule['hour'], rule['minute'])
 
 
-def current_target_state(dt: datetime, rules: list, live: dict) -> dict:
+def current_target_state(dt: datetime, rules: list, live: dict, cond_cache: dict | None = None) -> dict:
     state = {
         'mode':          'autonomous',
         'reserve':       20,
@@ -306,8 +318,13 @@ def current_target_state(dt: datetime, rules: list, live: dict) -> dict:
                 fired_events.append((fire_dt, rule))
 
     for fire_dt, rule in sorted(fired_events, key=lambda x: x[0]):
-        if not evaluate_conditions(rule['conditions'], live):
-            continue
+        if rule['conditions']:
+            cache_key = (rule['id'], fire_dt.isoformat())
+            if cond_cache is not None and cache_key not in cond_cache:
+                cond_cache[cache_key] = evaluate_conditions(rule['conditions'], live)
+            passed = cond_cache.get(cache_key, True) if cond_cache is not None else evaluate_conditions(rule['conditions'], live)
+            if not passed:
+                continue
         for key in ('mode', 'reserve', 'grid_charging', 'grid_export'):
             if rule[key] is not None:
                 state[key] = rule[key]
@@ -330,12 +347,15 @@ def next_rule_fire(dt: datetime, rules: list) -> datetime | None:
     return soonest
 
 
-def get_live_state(pw, conn) -> dict:
+def get_live_state(conn) -> dict:
     state = {}
     try:
-        state['battery_pct'] = float(pw.level() or 0)
+        row = conn.execute(
+            'SELECT battery_pct FROM readings ORDER BY timestamp DESC LIMIT 1'
+        ).fetchone()
+        state['battery_pct'] = float(row[0]) if row else 0.0
     except Exception:
-        state['battery_pct'] = 0
+        state['battery_pct'] = 0.0
     try:
         today = date.today().isoformat()
         row = conn.execute(
@@ -357,11 +377,10 @@ _MODE_LABEL = {
 
 # ── Apply Settings ────────────────────────────────────────────────────────────
 def apply_settings(pw, target: dict, last: dict,
-                   conn=None, battery_pct=None, first_run=False) -> bool:
-    """Apply target state to Powerwall. Logs one combined event row per call
-    (skipped on first_run to avoid startup-sync noise)."""
-    changes = []   # list of (label, event_type) for successful changes
-    errors  = []   # list of label strings for failures
+                   conn=None, battery_pct=None) -> bool:
+    """Apply target state to Powerwall. Logs one combined event row per call."""
+    changes = []
+    errors  = []
 
     if target['reserve'] is not None and target['reserve'] != last.get('reserve'):
         result = pw.set_reserve(target['reserve'])
@@ -405,7 +424,7 @@ def apply_settings(pw, target: dict, last: dict,
             log.error('set_grid_export(%s) failed', target['grid_export'])
             errors.append(f"set_grid_export({target['grid_export']}) failed")
 
-    if conn and not first_run:
+    if conn:
         if changes:
             title  = '  ·  '.join(label for label, _ in changes)
             etype  = changes[0][1] if len(changes) == 1 else 'automation_fired'
@@ -434,8 +453,10 @@ def main_loop(stop_fn=None):
     pw         = None
     last_eval  = 0.0
     last_state = {}
-    first_run  = True
     last_holiday_logged = None   # date — log holiday override once per day
+    last_nxt         = None
+    last_state_sig   = None
+    cond_cache: dict = {}  # {(rule_id, fire_dt_iso): bool} — conditions evaluated once at fire time
 
     while True:
         if stop_fn and stop_fn():
@@ -458,12 +479,17 @@ def main_loop(stop_fn=None):
                 continue
 
         if now - last_eval >= EVAL_INTERVAL:
+            target = None
             try:
                 rules = load_rules_from_db(conn)
-                live  = get_live_state(pw, conn)
+                live  = get_live_state(conn)
                 dt    = datetime.now()
 
-                target = current_target_state(dt, rules, live)
+                # Prune cond_cache entries older than 3 days to prevent unbounded growth
+                cutoff = (dt - timedelta(days=3)).isoformat()
+                cond_cache = {k: v for k, v in cond_cache.items() if k[1] >= cutoff}
+
+                target = current_target_state(dt, rules, live, cond_cache)
                 nxt    = next_rule_fire(dt, rules)
 
                 # Log holiday once per day
@@ -475,29 +501,34 @@ def main_loop(stop_fn=None):
                               result='ok', battery_pct=live.get('battery_pct'))
                     last_holiday_logged = dt.date()
 
-                log.info(
-                    'STATE  mode=%-16s reserve=%s  grid_charge=%-5s  grid_export=%s%s',
-                    target['mode'],
-                    f"{target['reserve']}%" if target['reserve'] is not None else 'none',
-                    target['grid_charging'], target['grid_export'],
-                    '  [HOLIDAY]' if hol else '',
-                )
-                if nxt:
-                    log.info('Next rule fires at %s', nxt.strftime('%Y-%m-%d %H:%M'))
+                state_sig = (target['mode'], target['reserve'], target['grid_charging'], target['grid_export'])
+                if state_sig != last_state_sig:
+                    log.info(
+                        'STATE  mode=%-16s reserve=%s  grid_charge=%-5s  grid_export=%s%s',
+                        target['mode'],
+                        f"{target['reserve']}%" if target['reserve'] is not None else 'none',
+                        target['grid_charging'], target['grid_export'],
+                        '  [HOLIDAY]' if hol else '',
+                    )
+                    last_state_sig = state_sig
 
-                changed = apply_settings(pw, target, last_state,
-                                         conn=conn, battery_pct=live.get('battery_pct'),
-                                         first_run=first_run)
-                first_run = False
-                if not changed:
-                    log.info('No changes needed.')
+                if nxt != last_nxt:
+                    if nxt:
+                        log.info('Next rule fires at %s', nxt.strftime('%Y-%m-%d %H:%M'))
+                    last_nxt = nxt
 
                 last_eval = now
 
             except Exception as exc:
-                log.exception('Evaluation error: %s: %s',
-                              type(exc).__name__, exc)
-                pw = None
+                log.exception('Evaluation error: %s: %s', type(exc).__name__, exc)
+
+            if target is not None:
+                try:
+                    apply_settings(pw, target, last_state,
+                                   conn=conn, battery_pct=live.get('battery_pct'))
+                except Exception as exc:
+                    log.error('Powerwall apply error: %s — reconnecting', exc)
+                    pw = None
 
         time.sleep(LOOP_SLEEP)
 

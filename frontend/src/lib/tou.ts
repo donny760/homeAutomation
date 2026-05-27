@@ -4,7 +4,6 @@ export interface TouPeriods {
   weekday: {
     on_peak?: Range[];
     super_off_peak?: Range[];
-    super_off_peak_winter_mar_apr?: Range[];
   };
   weekend_holiday: {
     on_peak?: Range[];
@@ -26,8 +25,7 @@ export function touPeriod(
   const defaultCfg: TouPeriods = {
     weekday: {
       on_peak: [[16, 21]],
-      super_off_peak: [[0, 6]],
-      super_off_peak_winter_mar_apr: [[10, 14]],
+      super_off_peak: [[0, 6], [10, 14]],
     },
     weekend_holiday: {
       on_peak: [[16, 21]],
@@ -40,13 +38,5 @@ export function touPeriod(
 
   if (inRanges(h, rules.on_peak)) return 'on_peak';
   if (inRanges(h, rules.super_off_peak)) return 'super_off_peak';
-  if (
-    dayType === 'weekday' &&
-    !isSummer &&
-    [3, 4].includes(mon) &&
-    'super_off_peak_winter_mar_apr' in rules &&
-    inRanges(h, (rules as TouPeriods['weekday']).super_off_peak_winter_mar_apr)
-  )
-    return 'super_off_peak';
   return 'off_peak';
 }

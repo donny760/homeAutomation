@@ -114,7 +114,7 @@ for %%f in (
     )
 )
 
-REM Frontend bundle — mirror so stale hashed chunks are cleaned up
+REM Frontend bundle ? mirror so stale hashed chunks are cleaned up
 echo       static\frontend\ mirroring...
 robocopy "%LOCAL_ROOT%\static\frontend" "%SERVER_PATH%\static\frontend" /MIR /NFL /NDL /NJH /NJS /NC /NS /NP >nul
 set ROBO_RC=!ERRORLEVEL!

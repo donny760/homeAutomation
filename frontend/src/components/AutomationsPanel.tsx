@@ -15,6 +15,8 @@ interface ScheduleEntry {
   reserve?: number | null;
   grid_charging?: boolean | null;
   grid_export?: string | null;
+  rule_id?: number;
+  enabled?: boolean;
 }
 
 export default function AutomationsPanel() {
@@ -32,6 +34,15 @@ export default function AutomationsPanel() {
   }, []);
   usePolling(refresh, 60_000);
 
+  async function toggleRule(ruleId: number) {
+    try {
+      await fetch(`/api/rules/${ruleId}/toggle`, { method: 'PUT' });
+      refresh();
+    } catch (e) {
+      console.warn('Toggle rule:', e);
+    }
+  }
+
   return (
     <div className="automations-col">
       <div className="auto-card card">
@@ -47,7 +58,8 @@ export default function AutomationsPanel() {
             items.map((e, i) => {
               const isRachio = e.source === 'rachio';
               const isSkip = !!e.skip;
-              const nextUp = i === 0 && !isSkip ? 'next-up' : '';
+              const isPaused = e.rule_id != null && e.enabled === false;
+              const nextUp = i === 0 && !isSkip && !isPaused ? 'next-up' : '';
               const racchioCls = isRachio ? 'rachio' : '';
               const skipCls = isSkip ? 'rain-delay' : '';
 
@@ -65,14 +77,42 @@ export default function AutomationsPanel() {
                 : '';
 
               return (
-                <div key={i} className={`auto-row ${nextUp} ${racchioCls} ${skipCls}`.trim()}>
+                <div
+                  key={i}
+                  className={`auto-row ${nextUp} ${racchioCls} ${skipCls}`.trim()}
+                  style={isPaused ? { opacity: 0.45 } : undefined}
+                >
                   <div style={{ display: 'flex', alignItems: 'baseline', gap: '8px' }}>
                     <div className="auto-time">{fmtFireTime(e.fire_time)}</div>
                     <div className="auto-source">{isRachio ? 'Rachio/Sprinklers' : 'Powerwall'}</div>
+                    {isPaused && (
+                      <span style={{
+                        fontSize: '10px', fontWeight: 600, letterSpacing: '0.05em',
+                        color: '#9e9c96', background: '#2a2a2c', borderRadius: '4px',
+                        padding: '1px 5px', lineHeight: '16px',
+                      }}>PAUSED</span>
+                    )}
                   </div>
-                  <div className="auto-name">
-                    {e.name}
-                    {skipSuffix && <span className="skip-reason">{skipSuffix}</span>}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                    <div className="auto-name" style={{ flex: 1 }}>
+                      {e.name}
+                      {skipSuffix && <span className="skip-reason">{skipSuffix}</span>}
+                    </div>
+                    {e.rule_id != null && (
+                      <button
+                        onClick={() => toggleRule(e.rule_id!)}
+                        title={isPaused ? 'Resume rule' : 'Pause rule'}
+                        style={{
+                          background: 'none', border: '1px solid #444',
+                          borderRadius: '4px', color: '#9e9c96',
+                          cursor: 'pointer', fontSize: '12px',
+                          padding: '2px 7px', flexShrink: 0,
+                          lineHeight: '18px',
+                        }}
+                      >
+                        {isPaused ? '▶' : '⏸'}
+                      </button>
+                    )}
                   </div>
                   {badges.length > 0 && (
                     <div className="auto-badges">

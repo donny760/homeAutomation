@@ -1,4 +1,4 @@
-"""
+﻿"""
 Powerwall Dashboard — Backend
 Polls pypowerwall every 10s, writes to SQLite every 30s, serves JSON via Flask.
 Run: py server.py
@@ -222,6 +222,24 @@ def init_db() -> None:
         _seed_rules(c)   # idempotent — only inserts if rules table is empty
         _seed_settings(c)  # idempotent — only inserts missing keys
         _seed_rate_history(c)  # seed from rates.json if rate_history is empty
+        # Migration: add sort_order column if not present
+        try:
+            c.execute('ALTER TABLE rules ADD COLUMN sort_order INTEGER DEFAULT 0')
+            c.execute('UPDATE rules SET sort_order = id')
+        except Exception:
+            pass  # column already exists
+        # Migration: add notes column if not present
+        try:
+            c.execute('ALTER TABLE rules ADD COLUMN notes TEXT')
+        except Exception:
+            pass  # column already exists
+        # Migration: force-update tou_periods to year-round weekday super off-peak (effective 2026-05-01)
+        correct_tou = json.dumps({
+            'weekday':         {'on_peak': [[16, 21]], 'super_off_peak': [[0, 6], [10, 14]]},
+            'weekend_holiday': {'on_peak': [[16, 21]], 'super_off_peak': [[0, 14]]},
+        })
+        c.execute("INSERT INTO settings (key,value) VALUES ('tou_periods',?) ON CONFLICT(key) DO UPDATE SET value=?",
+                  (correct_tou, correct_tou))
 
 
 # ── Settings helpers ──────────────────────────────────────────────────────────
@@ -249,12 +267,11 @@ _SETTINGS_DEFAULTS = {
     # SDG&E rate source (configurable)
     'rates_page_url':              'https://www.sdge.com/total-electric-rates',
     'rate_schedule_name':          'EV-TOU',
-    # TOU period definitions (JSON) — per official SDG&E EV-TOU-2 tariff Sheet 3
+    # TOU period definitions (JSON) — per official SDG&E EV-TOU-2 tariff (effective 2026-05-01)
     'tou_periods':                 json.dumps({
         'weekday': {
             'on_peak':        [[16, 21]],
-            'super_off_peak': [[0, 6]],
-            'super_off_peak_winter_mar_apr': [[10, 14]],
+            'super_off_peak': [[0, 6], [10, 14]],
         },
         'weekend_holiday': {
             'on_peak':        [[16, 21]],
@@ -540,7 +557,7 @@ def purge_old() -> None:
 _cost_rebuild_lock = threading.Lock()
 
 
-def _spawn_rebuild_daily_costs() -> bool:
+def _spawn_rebuild_daily_costs(from_date=None) -> bool:
     """Spawn a daemon thread for rebuild_daily_costs unless one is already
     running. Returns True if started, False if skipped due to overlap."""
     if not _cost_rebuild_lock.acquire(blocking=False):
@@ -548,7 +565,7 @@ def _spawn_rebuild_daily_costs() -> bool:
 
     def _run():
         try:
-            rebuild_daily_costs()
+            rebuild_daily_costs(from_date=from_date)
         finally:
             _cost_rebuild_lock.release()
 
@@ -618,8 +635,13 @@ def _rebuild_today() -> None:
         )
 
 
-def rebuild_daily_costs(year: int = None) -> None:
-    """Rebuild daily_costs from readings for a given year (default: current year)."""
+def rebuild_daily_costs(year: int = None, from_date=None) -> None:
+    """Rebuild daily_costs from readings for a given year (default: current year).
+
+    from_date: optional date object; if provided, only readings on or after this
+    date are processed. Useful to avoid applying new TOU configs to historical
+    periods where different rates applied.
+    """
     # Load rate history — fall back to rates.json if empty
     rate_periods = _load_rate_history()
     fallback_rates = load_rates() if not rate_periods else None
@@ -630,6 +652,8 @@ def rebuild_daily_costs(year: int = None) -> None:
     target_year = year or date.today().year
     jan1 = int(datetime(target_year, 1, 1).timestamp())
     dec31_end = int(datetime(target_year + 1, 1, 1).timestamp())
+    start_ts = max(jan1, int(datetime(from_date.year, from_date.month, from_date.day).timestamp())) \
+               if from_date else jan1
 
     # Load TOU period definitions from DB setting
     tou_cfg = _load_tou_periods()
@@ -638,7 +662,7 @@ def rebuild_daily_costs(year: int = None) -> None:
         rows = c.execute(
             'SELECT timestamp, grid_w FROM readings '
             'WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp',
-            (jan1, dec31_end)
+            (start_ts, dec31_end)
         ).fetchall()
 
         # Aggregate into per-date buckets using trapezoidal intervals
@@ -4278,7 +4302,7 @@ def switch_update_meta(row_id: int, fields: dict) -> dict:
 
 # ── Rules helpers ────────────────────────────────────────────────────────────
 def _rule_row_to_dict(row, conditions):
-    rid, name, enabled, days_j, months_j, hour, minute, mode, reserve, gc, ge = row
+    rid, name, enabled, days_j, months_j, hour, minute, mode, reserve, gc, ge, notes = row
     return {
         'id':           rid,
         'name':         name,
@@ -4291,13 +4315,14 @@ def _rule_row_to_dict(row, conditions):
         'reserve':      reserve,
         'grid_charging': None if gc is None else bool(gc),
         'grid_export':  ge,
+        'notes':        notes,
         'conditions':   conditions,
     }
 
 
 def _load_all_rules(c):
     rows = c.execute(
-        'SELECT id,name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export FROM rules ORDER BY id'
+        'SELECT id,name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export,notes FROM rules ORDER BY sort_order, id'
     ).fetchall()
     cond_rows = c.execute('SELECT rule_id,logic,type,operator,value FROM rule_conditions').fetchall()
     cond_map = {}
@@ -4309,12 +4334,19 @@ def _load_all_rules(c):
 
 
 def _rule_fires_at(rule, d):
-    weekday = d.weekday()
-    days_set = set(rule['days'])
-    if weekday not in days_set:
-        # On holidays, fire if rule includes any weekend day (Sat=5 or Sun=6)
-        if not (is_sdge_holiday(d) and days_set & {5, 6}):
+    weekday     = d.weekday()
+    days_set    = set(rule['days'])
+    is_holiday  = is_sdge_holiday(d)
+    has_weekend = bool(days_set & {5, 6})
+
+    if is_holiday:
+        # Treat holiday like a weekend: only weekend rules fire
+        if not has_weekend:
             return None
+    else:
+        if weekday not in days_set:
+            return None
+
     if d.month not in set(rule['months']):
         return None
     return datetime(d.year, d.month, d.day, rule['hour'], rule['minute'])
@@ -4324,6 +4356,7 @@ def _upcoming_firings(rules, hours=48):
     now = datetime.now()
     cutoff = now + timedelta(hours=hours)
     events = []
+    paused_shown: set = set()  # track disabled rules already added (show next occurrence only)
     tou = _load_tou_periods()
     for delta_days in (0, 1, 2):
         d = now.date() + timedelta(days=delta_days)
@@ -4343,7 +4376,7 @@ def _upcoming_firings(rules, hours=48):
                     'conditions':    [],
                 })
         for rule in rules:
-            if not rule['enabled']:
+            if not rule['enabled'] and rule['id'] in paused_shown:
                 continue
             fire_dt = _rule_fires_at(rule, d)
             if fire_dt and now < fire_dt <= cutoff:
@@ -4351,6 +4384,7 @@ def _upcoming_firings(rules, hours=48):
                     'fire_time':     fire_dt.strftime('%Y-%m-%dT%H:%M:%S'),
                     'source':        'powerwall',
                     'rule_id':       rule['id'],
+                    'enabled':       bool(rule['enabled']),
                     'name':          rule['name'],
                     'mode':          rule['mode'],
                     'reserve':       rule['reserve'],
@@ -4358,6 +4392,8 @@ def _upcoming_firings(rules, hours=48):
                     'grid_export':   rule['grid_export'],
                     'conditions':    rule['conditions'],
                 })
+                if not rule['enabled']:
+                    paused_shown.add(rule['id'])
     events.sort(key=lambda e: e['fire_time'])
     return events
 
@@ -4409,12 +4445,14 @@ def api_rules_post():
     gc_val = None if gc is None else (1 if gc else 0)
     with sqlite3.connect(DB_PATH) as c:
         c.execute('PRAGMA foreign_keys = ON')
+        max_order = c.execute('SELECT COALESCE(MAX(sort_order), 0) FROM rules').fetchone()[0]
         cur = c.execute(
-            'INSERT INTO rules (name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export) '
-            'VALUES (?,?,?,?,?,?,?,?,?,?)',
+            'INSERT INTO rules (name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export,sort_order,notes) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
             (body['name'], 1 if body.get('enabled', True) else 0,
              days_j, months_j, body['hour'], body['minute'],
-             body.get('mode'), body.get('reserve'), gc_val, body.get('grid_export'))
+             body.get('mode'), body.get('reserve'), gc_val, body.get('grid_export'),
+             max_order + 1, body.get('notes') or None)
         )
         rid = cur.lastrowid
         for cond in body.get('conditions', []):
@@ -4423,7 +4461,7 @@ def api_rules_post():
                 (rid, cond['logic'], cond['type'], cond['operator'], cond['value'])
             )
         row = c.execute(
-            'SELECT id,name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export FROM rules WHERE id=?', (rid,)
+            'SELECT id,name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export,notes FROM rules WHERE id=?', (rid,)
         ).fetchone()
         conds = c.execute('SELECT rule_id,logic,type,operator,value FROM rule_conditions WHERE rule_id=?', (rid,)).fetchall()
     cond_list = [{'logic': r[1], 'type': r[2], 'operator': r[3], 'value': r[4]} for r in conds]
@@ -4444,10 +4482,11 @@ def api_rules_put(rid):
     with sqlite3.connect(DB_PATH) as c:
         c.execute('PRAGMA foreign_keys = ON')
         c.execute(
-            'UPDATE rules SET name=?,enabled=?,days=?,months=?,hour=?,minute=?,mode=?,reserve=?,grid_charging=?,grid_export=? WHERE id=?',
+            'UPDATE rules SET name=?,enabled=?,days=?,months=?,hour=?,minute=?,mode=?,reserve=?,grid_charging=?,grid_export=?,notes=? WHERE id=?',
             (body['name'], 1 if body.get('enabled', True) else 0,
              days_j, months_j, body['hour'], body['minute'],
-             body.get('mode'), body.get('reserve'), gc_val, body.get('grid_export'), rid)
+             body.get('mode'), body.get('reserve'), gc_val, body.get('grid_export'),
+             body.get('notes') or None, rid)
         )
         c.execute('DELETE FROM rule_conditions WHERE rule_id=?', (rid,))
         for cond in body.get('conditions', []):
@@ -4456,7 +4495,7 @@ def api_rules_put(rid):
                 (rid, cond['logic'], cond['type'], cond['operator'], cond['value'])
             )
         row = c.execute(
-            'SELECT id,name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export FROM rules WHERE id=?', (rid,)
+            'SELECT id,name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export,notes FROM rules WHERE id=?', (rid,)
         ).fetchone()
         conds = c.execute('SELECT rule_id,logic,type,operator,value FROM rule_conditions WHERE rule_id=?', (rid,)).fetchall()
     if not row:
@@ -4471,6 +4510,20 @@ def api_rules_delete(rid):
     with sqlite3.connect(DB_PATH) as c:
         c.execute('PRAGMA foreign_keys = ON')
         c.execute('DELETE FROM rules WHERE id=?', (rid,))
+    _ai_cache['ts'] = 0
+    return '', 204
+
+
+@app.route('/api/rules/reorder', methods=['POST'])
+def api_rules_reorder():
+    """Accept an ordered list of rule IDs and update sort_order accordingly."""
+    body = request.get_json(silent=True)
+    ids = body.get('ids') if body else None
+    if not ids or not isinstance(ids, list):
+        return jsonify({'error': 'ids list required'}), 400
+    with sqlite3.connect(DB_PATH) as c:
+        for pos, rid in enumerate(ids):
+            c.execute('UPDATE rules SET sort_order=? WHERE id=?', (pos, rid))
     _ai_cache['ts'] = 0
     return '', 204
 
@@ -4517,17 +4570,16 @@ def _analyze_rules(rules, rates, holidays, tou_periods=None):
     _wd = _tp.get('weekday', {})
     _wh = _tp.get('weekend_holiday', {})
 
-    # Weekday super off-peak window (e.g. midnight–6 AM)
-    wd_sop_ranges = _wd.get('super_off_peak', [[0, 6]])
-    wd_sop_start  = _fmt_hour(min(s for s, _ in wd_sop_ranges))
-    wd_sop_end    = _fmt_hour(max(e for _, e in wd_sop_ranges))
-
-    # Mar/Apr bonus super off-peak window (e.g. 10 AM–2 PM)
-    mar_apr_ranges = _wd.get('super_off_peak_winter_mar_apr', [[10, 14]])
-    mar_apr_start_h = min(s for s, _ in mar_apr_ranges)
-    mar_apr_end_h   = max(e for _, e in mar_apr_ranges)
-    mar_apr_start   = _fmt_hour(mar_apr_start_h)
-    mar_apr_end     = _fmt_hour(mar_apr_end_h)
+    # Split weekday super off-peak into overnight (<8 AM) and daytime (>=8 AM) windows
+    wd_sop_ranges    = _wd.get('super_off_peak', [[0, 6], [10, 14]])
+    wd_sop_overnight = [r for r in wd_sop_ranges if r[0] < 8] or [[0, 6]]
+    wd_sop_daytime   = [r for r in wd_sop_ranges if r[0] >= 8]
+    wd_sop_start     = _fmt_hour(min(s for s, _ in wd_sop_overnight))
+    wd_sop_end       = _fmt_hour(max(e for _, e in wd_sop_overnight))
+    day_sop_start_h  = min(s for s, _ in wd_sop_daytime) if wd_sop_daytime else 10
+    day_sop_end_h    = max(e for _, e in wd_sop_daytime) if wd_sop_daytime else 14
+    day_sop_start    = _fmt_hour(day_sop_start_h)
+    day_sop_end      = _fmt_hour(day_sop_end_h)
 
     # On-peak window (e.g. 4 PM–9 PM)
     on_peak_ranges = _wd.get('on_peak', [[16, 21]])
@@ -4593,23 +4645,24 @@ def _analyze_rules(rules, rates, holidays, tou_periods=None):
                 'action': 'Add Sunday to an existing grid charging rule or create a Sunday-specific rule.',
             })
 
-    # ── 3. Mar/Apr weekday super off-peak window ────────────────────────────
-    mar_apr_tbc = [r for r in enabled
+    # ── 3. Weekday daytime super off-peak window ─────────────────────────────
+    if wd_sop_daytime:
+        day_tbc = [r for r in enabled
                    if r.get('mode') == 'autonomous'
-                   and {3, 4} & set(r['months'])
                    and {0, 1, 2, 3, 4} & set(r['days'])
-                   and mar_apr_start_h <= r['hour'] < mar_apr_end_h]
-    if not mar_apr_tbc:
-        insights.append({
-            'severity': 'suggestion',
-            'title':  'Mar/Apr weekday super off-peak window not utilized',
-            'detail': (
-                f'EV-TOU-2 has a bonus super off-peak window {mar_apr_start}\u2013{mar_apr_end} on weekdays in March & April '
-                f'(${sop_winter:.3f}/kWh). Switching to Time-Based Control enables grid charging.'
-            ),
-            'action': f'Create rules: Time-Based Control at {mar_apr_start} and Self-Powered at {mar_apr_end}, weekdays, Mar\u2013Apr.',
-        })
-
+                   and day_sop_start_h <= r['hour'] < day_sop_end_h]
+        if not day_tbc:
+            insights.append({
+                'severity': 'suggestion',
+                'title':  f'Weekday daytime super off-peak window ({day_sop_start}–{day_sop_end}) not utilized',
+                'detail': (
+                    f'EV-TOU-2 has a daytime super off-peak window {day_sop_start}–{day_sop_end} on weekdays year-round '
+                    f'(${sop_winter:.3f}/kWh winter, ${sop_summer:.3f}/kWh summer). '
+                    f'Switching to Time-Based Control means the home draws from the grid at the cheapest rate '
+                    f'while solar (if available) charges the battery instead of exporting at the low super off-peak credit rate.'
+                ),
+                'action': f'Create rules: Time-Based Control at {day_sop_start} and Self-Powered at {day_sop_end}, weekdays.',
+            })
     # ── 4. No rule at on-peak boundary ──────────────────────────────────────
     at_on_start = [r for r in enabled if r['hour'] == on_start_h and r['minute'] <= 5]
     if not at_on_start:
@@ -4754,12 +4807,12 @@ def _gemini_system_prompt(tou_periods=None):
     _wd = _tp.get('weekday', {})
     _wh = _tp.get('weekend_holiday', {})
 
-    wd_sop = _wd.get('super_off_peak', [[0, 6]])
-    wd_sop_end = _fmt_hour(max(e for _, e in wd_sop))
-
-    mar_apr = _wd.get('super_off_peak_winter_mar_apr', [[10, 14]])
-    mar_apr_start = _fmt_hour(min(s for s, _ in mar_apr))
-    mar_apr_end   = _fmt_hour(max(e for _, e in mar_apr))
+    wd_sop = _wd.get('super_off_peak', [[0, 6], [10, 14]])
+    wd_sop_overnight = [r for r in wd_sop if r[0] < 8] or [[0, 6]]
+    wd_sop_daytime   = [r for r in wd_sop if r[0] >= 8] or [[10, 14]]
+    wd_sop_night_end = _fmt_hour(max(e for _, e in wd_sop_overnight))
+    wd_day_start     = _fmt_hour(min(s for s, _ in wd_sop_daytime))
+    wd_day_end       = _fmt_hour(max(e for _, e in wd_sop_daytime))
 
     on_pk = _wd.get('on_peak', [[16, 21]])
     on_start = _fmt_hour(min(s for s, _ in on_pk))
@@ -4815,7 +4868,7 @@ winter_off_peak, winter_super_off_peak values from the rates object provided.
 
 Key EV-TOU-2 nuances:
 - On-peak ({on_start}–{on_end}) applies EVERY day including weekends and holidays — no exemptions
-- Super off-peak bonus window: {mar_apr_start}–{mar_apr_end} weekdays in March and April only
+- Weekday super off-peak: midnight–{wd_sop_night_end} and {wd_day_start}–{wd_day_end} year-round
 - Holidays follow weekend schedule: super off-peak midnight–{hol_sop_end}, on-peak {hol_on_start}–{hol_on_end}, off-peak fills the remaining hours
 - Summer rates apply June–October; winter rates apply November–May
 
@@ -4824,12 +4877,41 @@ The rules array defines the automation schedule. Each rule fires at hour:minute 
 the specified days (0=Mon..6=Sun) and months (1=Jan..12=Dec). Rules change only the
 fields they specify — null fields carry forward from the previous rule.
 
-Key fields: mode (self_consumption | autonomous | backup), reserve (battery floor %),
-grid_charging (true/false), grid_export (battery_ok | pv_only).
+Key fields:
+- mode: controls how the Powerwall sources home power
+  - autonomous (Time-Based Control): home draws ALL power from the grid; battery does NOT
+    discharge to power the home; solar (if available) charges the battery instead of exporting
+  - self_consumption: home draws from solar + battery first; grid is fallback; excess solar exports
+  - backup: battery reserved for outages only
+- reserve: battery floor % — personal preference, not strategy-driven
+- grid_charging (true/false): explicit control to charge battery FROM grid; separate from mode;
+  most useful overnight when no solar is available
+- grid_export (battery_ok | pv_only): whether battery actively discharges to grid
 
-IMPORTANT: grid_export = battery_ok means ACTIVE continuous battery discharge to grid
-at up to ~15 kW combined (3× Powerwall). At 1% reserve, nearly the full 40.5 kWh
-is available to export. This is NOT passive solar overflow.
+## Rule intent validation
+Some rules include an "Intent:" note written by the homeowner describing what the rule
+is supposed to do. When a rule has an intent note:
+1. Treat the note as an assertion to verify, not just context.
+2. Check whether the rule's actual values (mode, grid_export, reserve, grid_charging,
+   conditions, days, months) produce the behavior described in the note.
+3. Check whether other rules that fire before or after this rule on the same day type
+   (weekday / Saturday / Sunday / holiday) interfere with the stated intent.
+4. If the rule does what the note says: confirm it briefly and move on.
+5. If the rule does NOT do what the note says: flag the specific discrepancy clearly.
+   Explain what the rule actually does vs. what the note claims, and identify which
+   specific value or interaction is causing the gap.
+6. If the note is ambiguous or partially correct: say so and explain what is and isn't accurate.
+Do not treat intent notes as authoritative. They are the homeowner's best understanding,
+which may be incomplete or incorrect.
+
+IMPORTANT: grid_export = battery_ok PERMITS battery discharge to grid (up to ~15 kW
+combined, 3× Powerwall; at 1% reserve nearly the full 40.5 kWh is available). However,
+in TBC (autonomous) mode the Powerwall only actually exports during windows its internal
+schedule marks as peak (4–9 PM daily). Outside that window, battery_ok is effectively
+a no-op in TBC mode — the battery will not export even though export is permitted.
+This is NOT passive solar overflow. If an intent note claims a rule exports to grid,
+verify that the rule fires within 4–9 PM; if it fires outside that window in TBC mode,
+flag it — the export will likely not occur as intended.
 
 The rules are the homeowner's deliberate automation design. Your job is to understand
 what they do by reading the rules array — not to assume what they "should" do. Read
@@ -4837,12 +4919,18 @@ rules in firing order (by hour/minute within each day-type) to understand daily 
 
 INFER the homeowner's strategy from the rules — do not impose a strategy. Common
 patterns you may see:
-- Passive solar overflow during on-peak daytime hours (battery full, solar exporting
-  excess) — this already captures on-peak credit without draining the battery.
-- Active battery export scheduled for the window when solar is insufficient to cover
-  home load but on-peak rates still apply — preserves battery for part of the day.
-- Battery reserved for post-on-peak self-consumption to avoid evening grid imports.
-- Grid charging during super off-peak hours to replenish the battery.
+- TBC (autonomous) during super off-peak: home draws ALL power from the grid at the cheapest
+  rate; battery does not discharge. During the daytime window (10 AM–2 PM), solar charges the
+  battery instead of exporting at the low super off-peak credit rate — a deliberate counter to
+  SDG&E pricing that reduces export credit during peak solar hours. Overnight TBC (midnight–6 AM)
+  has no solar; a short grid_charging: true window may be added to explicitly fill the battery
+  from grid before solar arrives.
+- Self-Powered during on-peak: draw from stored battery + solar to minimize grid imports at the
+  most expensive rate.
+- Active battery export (grid_export: battery_ok) during on-peak evening: discharge stored energy
+  to grid for maximum credit. This is NOT passive solar overflow — it actively drains the battery.
+- Battery idle during on-peak daytime: may be intentional if solar alone covers home load and
+  the battery is being held for evening export or self-consumption.
 
 These are all valid design choices. A battery sitting idle during on-peak hours is
 NOT automatically a problem — it may be intentional passive-export mode or reserved
@@ -4934,15 +5022,21 @@ the full energy picture for that window:
   (e.g., "the later start preserves a full battery for solar charging earlier in the
   afternoon, then exports once solar tapers off").
 
-For any change you suggest, show the dollar impact per month using actual rates from
-the data. If the impact is under $20/month, note that the rule complexity may not be
-worth it. Alternative perspectives are welcome as observations, but not required.
+For any change you suggest, describe the directional impact only (e.g., "captures
+more on-peak credit", "reduces morning grid imports"). Do NOT estimate or invent
+dollar figures — you do not have the granular hourly data needed to compute them
+accurately. Alternative perspectives are welcome as observations, but not required.
 
 **The rule_based_insights findings are already displayed to the user above your
 response. Do not restate them.** Your job is to synthesize: do multiple findings
 point to a pattern? Does a finding connect to something measurable in the daily
 data or projection? A finding is only worth mentioning if you can add context
 that the finding itself does not contain — otherwise, leave it out.
+
+Concrete example of what NOT to do: "The Rule-Based Findings correctly identify
+that export starts at 7 PM, missing the first three hours of on-peak..." — that
+is pure repetition. Instead, connect to data: "On May 17 the battery was at 0%
+at 7 AM, which is consistent with the short charging window flagged above."
 
 **4. Daily data observations**
 Looking at the daily cost data, comment ONLY if you notice:
@@ -4988,21 +5082,18 @@ Keep the total response focused — depth over breadth.
 After all rule recommendations, end with:
 
 **5. Projected impact (informational)**
-A pre-calculated "After Changes" projection table is displayed in the UI alongside
-the baseline. It models adding battery export for months that currently have no
-export rules. These numbers are computed server-side — DO NOT reproduce them.
+Check `optimized_identical` in Data Quality Notes.
 
-**If the BASELINE projection Net is already within -$500 to -$100 (target credit
-range), explicitly state this. The optimized projection is informational only —
-not a recommendation to execute unless the baseline is outside target.**
-
-Analyze:
-- Is the baseline already within the $100-$500 target credit range? If so, note
-  that changes are optional.
-- If the baseline is outside target, does the optimized projection bring it in?
-  If it overshoots into >$500 credit, suggest scaling back (fewer months, higher
-  reserve). If it still falls short, note what additional changes might help.
-- Compare the baseline total vs optimized total and state the difference.\
+- If `true`: the optimized projection is identical to the baseline — all projected
+  months already have export rules configured. **Skip this section entirely. Do not
+  mention the optimized projection or the "After Changes" table.**
+- If `false`: a pre-calculated "After Changes" projection is displayed in the UI
+  alongside the baseline. These numbers are computed server-side — DO NOT reproduce
+  them as a table. Analyze:
+  - Does the optimized projection bring the baseline within the $100-$500 target?
+  - If it overshoots into >$500 credit, suggest scaling back (fewer months, higher
+    reserve). If it still falls short, note what additional changes might help.
+  - State the difference between baseline total and optimized total.
 """
 
 
@@ -5428,6 +5519,7 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
         'actual_months': actual_months,
         'projected_months': projected_months,
         'projection_basis': projection_basis,
+        'optimized_identical': (baseline_md == optimized_md),
     }
     return baseline, baseline_md, optimized, optimized_md, meta
 
@@ -5643,6 +5735,8 @@ def _build_ai_context():
             first = cond_parts[0].split(' ', 1)[1] if cond_parts else ''
             rest = cond_parts[1:]
             parts.append('if ' + first + (' ' + ' '.join(rest) if rest else ''))
+        if r.get('notes'):
+            parts.append(f'Intent: {r["notes"]}')
         rule_descriptions.append(' | '.join(parts))
 
     # Prior year monthly summaries
@@ -5681,7 +5775,7 @@ def _build_ai_context():
         'Rules': rule_descriptions,
         'Rule-Based Findings': [{'Title': i['title'], 'Action': i['action']} for i in rule_insights],
         'True-Up Projection Table': baseline_md,
-        'Optimized Projection Table': optimized_md,
+        'Optimized Projection Table': None if projection_meta.get('optimized_identical') else optimized_md,
         'Prior Year Monthly Summary': prior_year_monthly,
         'Prior Year Note': _build_prior_year_note(rules, prior_year, now.year),
         'Current Year Monthly Summary': current_year_monthly,
@@ -6079,7 +6173,14 @@ def api_costs_daily():
 
 @app.route('/api/costs/rebuild', methods=['POST'])
 def api_costs_rebuild():
-    started = _spawn_rebuild_daily_costs()
+    from_str = request.args.get('from')
+    from_date = None
+    if from_str:
+        try:
+            from_date = date.fromisoformat(from_str)
+        except ValueError:
+            return jsonify({'error': 'invalid from date, use YYYY-MM-DD'}), 400
+    started = _spawn_rebuild_daily_costs(from_date=from_date)
     return jsonify({'ok': True, 'started': started,
                     'note': None if started else 'rebuild already in progress'})
 

@@ -117,8 +117,7 @@ def holiday_name(d: date) -> str:
 _DEFAULT_TOU_PERIODS = {
     'weekday': {
         'on_peak':        [[16, 21]],
-        'super_off_peak': [[0, 6]],
-        'super_off_peak_winter_mar_apr': [[10, 14]],
+        'super_off_peak': [[0, 6], [10, 14]],
     },
     'weekend_holiday': {
         'on_peak':        [[16, 21]],
@@ -157,10 +156,6 @@ def tou_period(dt: datetime, periods: dict = None):
     if _hour_in_ranges(h, rules.get('on_peak', [])):
         return season, 'on_peak'
     if _hour_in_ranges(h, rules.get('super_off_peak', [])):
-        return season, 'super_off_peak'
-    # Winter March/April extra super off-peak window (weekdays only)
-    if (day_type == 'weekday' and season == 'winter' and dt.month in (3, 4)
-            and _hour_in_ranges(h, rules.get('super_off_peak_winter_mar_apr', []))):
         return season, 'super_off_peak'
     return season, 'off_peak'
 

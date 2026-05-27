@@ -4,6 +4,23 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { modeLabel, settingsBadges, DAYS_LBL, fmtTime12 } from '@/lib/format';
 import { touPeriod } from '@/lib/tou';
 import { mdToHtml } from '@/lib/markdown';
+import {
+  DndContext,
+  closestCenter,
+  PointerSensor,
+  KeyboardSensor,
+  useSensor,
+  useSensors,
+  DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+  arrayMove,
+} from '@dnd-kit/sortable';
+import { CSS } from '@dnd-kit/utilities';
 
 interface Rule {
   id: number;
@@ -17,6 +34,7 @@ interface Rule {
   reserve: number | null;
   grid_charging: boolean | null;
   grid_export: string | null;
+  notes?: string | null;
   conditions?: Condition[];
 }
 
@@ -92,8 +110,56 @@ const THINKING_TERMS = [
   'Battery Reserve', 'Net Energy Balance', 'Daily Cycle', 'Weather Patterns',
 ];
 
+interface SortableRowProps {
+  rule: Rule;
+  nextFire: string;
+  onEdit: (id: number) => void;
+  onDelete: (id: number) => void;
+}
+
+function SortableRow({ rule: r, nextFire, onEdit, onDelete }: SortableRowProps) {
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
+    useSortable({ id: r.id });
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.5 : r.enabled ? 1 : 0.4,
+    background: isDragging ? 'var(--surface)' : undefined,
+  };
+
+  return (
+    <tr ref={setNodeRef} style={style}>
+      <td className="drag-handle" {...attributes} {...listeners} title="Drag to reorder">
+        ⠿
+      </td>
+      <td>
+        <span>{r.name}</span>
+        {r.notes && (
+          <div style={{ color: 'var(--very-dim)', fontSize: '0.73rem', marginTop: 2, whiteSpace: 'normal' }}>
+            {r.notes}
+          </div>
+        )}
+      </td>
+      <td className="next-fire">{nextFire}</td>
+      <td>
+        <div className="rule-actions">
+          <button className="btn-icon" onClick={() => onEdit(r.id)}>Edit</button>
+          <button className="btn-icon btn-delete" onClick={() => onDelete(r.id)}>Delete</button>
+        </div>
+      </td>
+      <td style={{ color: 'var(--dim)', fontSize: '0.82rem' }}>{modeLabel(r.mode) || '—'}</td>
+      <td style={{ color: 'var(--dim)', fontSize: '0.82rem' }}>{r.reserve != null ? r.reserve + '%' : '—'}</td>
+    </tr>
+  );
+}
 
 export default function Rules({ isActive }: RulesProps) {
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
+
   const [rules, setRules] = useState<Rule[]>([]);
   const [rates, setRates] = useState<RateData | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
@@ -136,6 +202,8 @@ export default function Rules({ isActive }: RulesProps) {
   const [fDays, setFDays] = useState<Set<number>>(new Set());
   const [fMonths, setFMonths] = useState<Set<number>>(new Set());
   const [fConditions, setFConditions] = useState<Condition[]>([]);
+  const [fEnabled, setFEnabled] = useState(true);
+  const [fNotes, setFNotes] = useState('');
 
   const refreshRules = useCallback(async () => {
     try {
@@ -181,6 +249,25 @@ export default function Rules({ isActive }: RulesProps) {
     }
   }
 
+  async function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const oldIndex = rules.findIndex((r) => r.id === active.id);
+    const newIndex = rules.findIndex((r) => r.id === over.id);
+    const reordered = arrayMove(rules, oldIndex, newIndex);
+    setRules(reordered);
+    try {
+      await fetch('/api/rules/reorder', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids: reordered.map((r) => r.id) }),
+      });
+    } catch (e) {
+      console.warn('Reorder:', e);
+      await refreshRules();
+    }
+  }
+
   function openModal(id: number | null) {
     setEditId(id);
     if (id) {
@@ -196,6 +283,8 @@ export default function Rules({ isActive }: RulesProps) {
       setFDays(new Set(rule.days));
       setFMonths(new Set(rule.months));
       setFConditions(rule.conditions || []);
+      setFEnabled(rule.enabled);
+      setFNotes(rule.notes || '');
     } else {
       setFName('');
       setFHour(0);
@@ -207,6 +296,8 @@ export default function Rules({ isActive }: RulesProps) {
       setFDays(new Set());
       setFMonths(new Set());
       setFConditions([]);
+      setFEnabled(true);
+      setFNotes('');
     }
     setModalOpen(true);
   }
@@ -227,7 +318,7 @@ export default function Rules({ isActive }: RulesProps) {
 
     const body = {
       name: fName.trim(),
-      enabled: true,
+      enabled: fEnabled,
       days: Array.from(fDays),
       months: Array.from(fMonths),
       hour: fHour,
@@ -236,6 +327,7 @@ export default function Rules({ isActive }: RulesProps) {
       reserve: fReserve !== '' ? parseInt(fReserve) : null,
       grid_charging: fGridCharging === '' ? null : fGridCharging === 'true',
       grid_export: fGridExport || null,
+      notes: fNotes.trim() || null,
       conditions: fConditions,
     };
 
@@ -441,7 +533,7 @@ export default function Rules({ isActive }: RulesProps) {
                   <td>Off-peak</td>
                   <td className={rateCellClass('off_peak', 'summer')}>{fmt3(rates?.summer_off_peak)}</td>
                   <td className={rateCellClass('off_peak', 'winter')}>{fmt3(rates?.winter_off_peak)}</td>
-                  <td>6am &ndash; 4pm, 9pm &ndash; midnight</td>
+                  <td>all other hours</td>
                 </tr>
                 <tr
                   id="rate-row-super-off-peak"
@@ -451,14 +543,14 @@ export default function Rules({ isActive }: RulesProps) {
                   <td>Super off-peak</td>
                   <td className={rateCellClass('super_off_peak', 'summer')}>{fmt3(rates?.summer_super_off_peak)}</td>
                   <td className={rateCellClass('super_off_peak', 'winter')}>{fmt3(rates?.winter_super_off_peak)}</td>
-                  <td>midnight &ndash; 6am + weekends</td>
+                  <td>wd: midnight&ndash;6am &amp; 10am&ndash;2pm<br/>wknd: midnight&ndash;2pm</td>
                 </tr>
               </tbody>
             </table>
             </div>
 
             {/* Today's firing actions (embedded right side) */}
-            <div style={{ flex: '0 0 400px', borderLeft: '0.5px solid var(--border)', paddingLeft: 14 }}>
+            <div style={{ flex: '1 1 0', minWidth: 0, borderLeft: '0.5px solid var(--border)', paddingLeft: 14 }}>
               <div style={{ marginBottom: 4 }}>
                 <span style={{ color: 'var(--dim)', textTransform: 'uppercase', letterSpacing: '0.07em', fontSize: '0.75rem' }}>
                   Today&apos;s Actions
@@ -480,11 +572,13 @@ export default function Rules({ isActive }: RulesProps) {
                 firing.forEach((r, i) => {
                   if (r.hour * 60 + r.minute <= nowMin) activeIdx = i;
                 });
-                return (
-                  <table className="rate-table">
+                const half = Math.ceil(firing.length / 2);
+                const cols = [firing.slice(0, half), firing.slice(half)];
+                const renderCol = (items: typeof firing, offset: number) => (
+                  <table className="rate-table" style={{ width: 'auto' }}>
                     <tbody>
-                      {firing.map((r, i) => {
-                        const isActive = i === activeIdx;
+                      {items.map((r, i) => {
+                        const isActive = offset + i === activeIdx;
                         return (
                           <tr key={r.id}>
                             <td style={{
@@ -509,6 +603,11 @@ export default function Rules({ isActive }: RulesProps) {
                     </tbody>
                   </table>
                 );
+                return (
+                  <div style={{ display: 'flex', gap: 32, alignItems: 'flex-start' }}>
+                    {cols.map((col, ci) => renderCol(col, ci * half))}
+                  </div>
+                );
               })()}
             </div>
           </div>
@@ -516,52 +615,41 @@ export default function Rules({ isActive }: RulesProps) {
 
         {/* Rules table */}
         <div className="rules-table-wrap">
-          <table className="rules-table">
-            <thead>
-              <tr>
-                <th>On</th>
-                <th>Name</th>
-                <th>Next Fire</th>
-                <th>Actions</th>
-                <th>Mode</th>
-                <th>Reserve</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rules.length === 0 ? (
-                <tr>
-                  <td colSpan={6} style={{ color: 'var(--very-dim)', padding: '20px' }}>
-                    No rules defined.
-                  </td>
-                </tr>
-              ) : (
-                rules.map((r) => (
-                  <tr key={r.id}>
-                    <td>
-                      <label className="toggle">
-                        <input
-                          type="checkbox"
-                          checked={r.enabled}
-                          onChange={(e) => toggleRule(r.id, e.target.checked)}
-                        />
-                        <span className="toggle-slider" />
-                      </label>
-                    </td>
-                    <td>{r.name}</td>
-                    <td className="next-fire">{nextFireForRule(r)}</td>
-                    <td>
-                      <div className="rule-actions">
-                        <button className="btn-icon" onClick={() => openModal(r.id)}>Edit</button>
-                        <button className="btn-icon btn-delete" onClick={() => deleteRule(r.id)}>Delete</button>
-                      </div>
-                    </td>
-                    <td style={{ color: 'var(--dim)', fontSize: '0.82rem' }}>{modeLabel(r.mode) || '\u2014'}</td>
-                    <td style={{ color: 'var(--dim)', fontSize: '0.82rem' }}>{r.reserve != null ? r.reserve + '%' : '\u2014'}</td>
+          <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <SortableContext items={rules.map((r) => r.id)} strategy={verticalListSortingStrategy}>
+              <table className="rules-table">
+                <thead>
+                  <tr>
+                    <th style={{ width: 28 }}></th>
+                    <th>Name</th>
+                    <th>Next Fire</th>
+                    <th>Actions</th>
+                    <th>Mode</th>
+                    <th>Reserve</th>
                   </tr>
-                ))
-              )}
-            </tbody>
-          </table>
+                </thead>
+                <tbody>
+                  {rules.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} style={{ color: 'var(--very-dim)', padding: '20px' }}>
+                        No rules defined.
+                      </td>
+                    </tr>
+                  ) : (
+                    rules.map((r) => (
+                      <SortableRow
+                        key={r.id}
+                        rule={r}
+                        nextFire={nextFireForRule(r)}
+                        onEdit={openModal}
+                        onDelete={deleteRule}
+                      />
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </SortableContext>
+          </DndContext>
         </div>
       </div>
 
@@ -612,7 +700,18 @@ export default function Rules({ isActive }: RulesProps) {
           onClick={(e) => { if (e.target === e.currentTarget) setModalOpen(false); }}
         >
           <div className="modal">
-            <div className="modal-title">{editId ? 'Edit Rule' : 'Add Rule'}</div>
+            <div className="modal-title" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <span>{editId ? 'Edit Rule' : 'Add Rule'}</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ color: fEnabled ? 'var(--text)' : 'var(--dim)', fontSize: '0.82rem', fontWeight: 400 }}>
+                  {fEnabled ? 'Enabled' : 'Disabled'}
+                </span>
+                <label className="toggle">
+                  <input type="checkbox" checked={fEnabled} onChange={(e) => setFEnabled(e.target.checked)} />
+                  <span className="toggle-slider" />
+                </label>
+              </div>
+            </div>
 
             <div className="form-grid">
               <div className="form-group full">
@@ -728,6 +827,22 @@ export default function Rules({ isActive }: RulesProps) {
                 </button>
               </div>
             </div>
+
+              <div className="form-group full" style={{ marginTop: 4 }}>
+                <label className="form-label">Intent notes</label>
+                <textarea
+                  rows={3}
+                  placeholder="What is this rule doing and why?"
+                  value={fNotes}
+                  onChange={(e) => setFNotes(e.target.value)}
+                  style={{
+                    width: '100%', marginTop: 4, background: 'var(--surface)',
+                    color: 'var(--text)', border: '1px solid var(--border)',
+                    borderRadius: 4, padding: '6px 8px', fontSize: '0.82rem',
+                    resize: 'vertical', fontFamily: 'inherit',
+                  }}
+                />
+              </div>
 
             <div className="modal-footer">
               <button className="btn-cancel" onClick={() => setModalOpen(false)}>Cancel</button>
