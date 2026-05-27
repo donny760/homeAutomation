@@ -10,3 +10,4 @@ rules.log
 .pypowerwall.auth
 __pycache__/
 frontend/tsconfig.tsbuildinfo
+static/frontend/

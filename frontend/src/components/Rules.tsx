@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { usePolling } from '@/lib/usePolling';
 import { modeLabel, settingsBadges, DAYS_LBL, fmtTime12 } from '@/lib/format';
 import { touPeriod } from '@/lib/tou';
 import { mdToHtml } from '@/lib/markdown';
@@ -174,10 +175,8 @@ export default function Rules({ isActive }: RulesProps) {
   // Re-tick `now` every minute so the rate-card "NOW" badge crosses TOU
   // boundaries (4 PM, 9 PM, midnight) without waiting for a rates refresh.
   const [nowTick, setNowTick] = useState(0);
-  useEffect(() => {
-    const id = setInterval(() => setNowTick((n) => n + 1), 60_000);
-    return () => clearInterval(id);
-  }, []);
+  const tickNow = useCallback(() => setNowTick((n) => n + 1), []);
+  usePolling(tickNow, 60_000);
 
   // Clean up the thinking interval on unmount even if a fetch is mid-flight.
   useEffect(() => {
@@ -808,6 +807,8 @@ export default function Rules({ isActive }: RulesProps) {
                       <select className="form-select" value={c.type} onChange={(e) => updateCondition(idx, 'type', e.target.value)}>
                         <option value="battery_pct">Battery %</option>
                         <option value="net_cost">Net Cost Today ($)</option>
+                        <option value="net_cost_ytd">Net Cost YTD ($)</option>
+                        <option value="tomorrow_solar_kwh">Tomorrow Solar Forecast (kWh)</option>
                       </select>
                       <select className="form-select" value={c.operator} onChange={(e) => updateCondition(idx, 'operator', e.target.value)}>
                         <option value="&gt;">&gt;</option>

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from 'react';
 import NetworkPinModal from './NetworkPinModal';
+import { usePolling } from '@/lib/usePolling';
 
 interface Device {
   mac: string;
@@ -98,12 +99,7 @@ export default function NetworkDevices({ isActive }: NetworkDevicesProps) {
     }
   }, []);
 
-  useEffect(() => {
-    if (!isActive) return;
-    refresh();
-    const id = setInterval(refresh, 15_000);
-    return () => clearInterval(id);
-  }, [isActive, refresh]);
+  usePolling(refresh, 15_000, isActive);
 
   useEffect(() => {
     if (editingMac && editInputRef.current) {

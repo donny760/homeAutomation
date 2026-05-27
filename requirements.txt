@@ -6,3 +6,4 @@ requests
 python-dotenv
 python-kasa
 tinytuya
+pywin32  # Windows service on server-04

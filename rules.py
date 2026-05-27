@@ -254,8 +254,10 @@ def load_rules_from_db(conn) -> list:
 # ── Condition evaluation ──────────────────────────────────────────────────────
 def _eval_single(cond: dict, live: dict) -> bool:
     ctype = cond['type']
-    if ctype in ('battery_pct', 'net_cost'):
-        actual = live.get(ctype, 0)
+    if ctype in ('battery_pct', 'net_cost', 'net_cost_ytd', 'tomorrow_solar_kwh'):
+        actual = live.get(ctype)
+        if actual is None:
+            return False  # data unavailable — condition fails safe
         op = cond['operator']
         v  = cond['value']
         if op == '>':  return actual >  v
@@ -364,6 +366,22 @@ def get_live_state(conn) -> dict:
         state['net_cost'] = float(row[0]) if row and row[0] is not None else 0.0
     except Exception:
         state['net_cost'] = 0.0
+    try:
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = 'tomorrow_solar_kwh'"
+        ).fetchone()
+        state['tomorrow_solar_kwh'] = float(row[0]) if row and row[0] is not None else None
+    except Exception:
+        state['tomorrow_solar_kwh'] = None
+    try:
+        year_start = f"{date.today().year}-01-01"
+        row = conn.execute(
+            'SELECT SUM(import_cost) - SUM(export_credit) FROM daily_costs WHERE date >= ?',
+            (year_start,)
+        ).fetchone()
+        state['net_cost_ytd'] = float(row[0]) if row and row[0] is not None else 0.0
+    except Exception:
+        state['net_cost_ytd'] = 0.0
     return state
 
 

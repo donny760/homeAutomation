@@ -1,7 +1,8 @@
-'use client';
+﻿'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { MONTHS_LBL, fmtTime12 } from '@/lib/format';
+import { usePolling } from '@/lib/usePolling';
 
 export type PageName = 'dashboard' | 'events' | 'rules' | 'costs' | 'network' | 'settings';
 
@@ -67,35 +68,27 @@ export default function Nav({ activePage, onPageChange, onOpenSwitches }: NavPro
     }
   }, []);
 
-  // Clock — update every 30s (no need for per-second in nav)
-  useEffect(() => {
-    function tick() {
-      const n = new Date();
-      const time = fmtTime12(n.getHours(), n.getMinutes());
-      const date = `${MONTHS_LBL[n.getMonth()]} ${n.getDate()}`;
-      setClock(`${time} \u00b7 ${date}`);
-    }
-    tick();
-    const id = setInterval(tick, 30_000);
-    return () => clearInterval(id);
+  const tick = useCallback(() => {
+    const n = new Date();
+    const time = fmtTime12(n.getHours(), n.getMinutes());
+    const date = `${MONTHS_LBL[n.getMonth()]} ${n.getDate()}`;
+    setClock(`${time} \u00b7 ${date}`);
   }, []);
 
-  // Weather + AQI
-  useEffect(() => {
-    async function refresh() {
-      try {
-        const w = await fetch('/api/weather').then((r) => r.json());
-        const icon = WMO_ICON[w.weathercode] || '';
-        const temp = w.temp_f != null ? `${w.temp_f}\u00b0F` : '';
-        setWx({ icon, temp, aqi: w.aqi ?? null });
-      } catch (e) {
-        console.warn('Weather:', e);
-      }
+  const refreshWeather = useCallback(async () => {
+    try {
+      const w = await fetch('/api/weather').then((r) => r.json());
+      const icon = WMO_ICON[w.weathercode] || '';
+      const temp = w.temp_f != null ? `${w.temp_f}\u00b0F` : '';
+      setWx({ icon, temp, aqi: w.aqi ?? null });
+    } catch (e) {
+      console.warn('Weather:', e);
     }
-    refresh();
-    const id = setInterval(refresh, 600_000);
-    return () => clearInterval(id);
   }, []);
+
+  // Clock every 30s; Weather + AQI every 10 min
+  usePolling(tick, 30_000);
+  usePolling(refreshWeather, 600_000);
 
   function toggleTheme() {
     const light = document.body.classList.toggle('light');

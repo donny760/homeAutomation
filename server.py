@@ -39,7 +39,7 @@ POLL_INTERVAL     = 10            # seconds between pypowerwall polls
 DB_WRITE_EVERY    = 30            # seconds between DB writes
 PURGE_DAYS        = 0             # disabled — keep all readings forever
 POOL_POLL_INTERVAL  = 30           # seconds between pool polls
-RACHIO_API_KEY      = 'dc3c7132-00c1-45dc-910c-0d8f06738b92'
+RACHIO_API_KEY      = os.environ.get('RACHIO_API_KEY', '')
 RACHIO_BASE         = 'https://api.rach.io/1/public'
 RACHIO_TTL          = 300          # 5-minute cache for Rachio schedule
 ABODE_EMAIL         = os.environ.get('ABODE_EMAIL', '')
@@ -47,6 +47,12 @@ ABODE_PASSWORD      = os.environ.get('ABODE_PASSWORD', '')
 
 app = Flask(__name__)
 app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # no browser caching of static files
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    import traceback
+    app.logger.error(traceback.format_exc())
+    return jsonify(error=str(e)), 500
 
 # Shared live-data cache
 _live: dict = {}
@@ -1121,7 +1127,7 @@ def _get_device_coords() -> tuple[float, float]:
                 return _device_coords
     except Exception as exc:
         print(f'Weather coord lookup error: {exc}')
-    _device_coords = (32.7157, -117.1611)
+    _device_coords = (33.09924225276156, -117.06278850408303)
     return _device_coords
 
 
@@ -1205,8 +1211,10 @@ def fetch_weather() -> dict:
 
 
 # ── Solar Forecast ────────────────────────────────────────────────────────────
-_sf_cache: dict = {}
-_sf_ts: float   = 0.0
+_sf_cache: dict  = {}
+_sf_ts: float    = 0.0
+_stf_cache: dict = {}
+_stf_ts: float   = 0.0
 SF_TTL = 3600  # 1 hour
 PEAK_RAD_WM2 = 950.0  # clear-sky noon shortwave radiation for San Diego
 
@@ -1231,7 +1239,7 @@ def fetch_solar_forecast() -> dict:
 
     url = (
         'https://api.open-meteo.com/v1/forecast'
-        '?latitude=32.7157&longitude=-117.1611'
+        '?latitude=33.09924225276156&longitude=-117.06278850408303'
         '&hourly=shortwave_radiation'
         '&forecast_days=1&timezone=America%2FLos_Angeles'
     )
@@ -1269,6 +1277,73 @@ def fetch_solar_forecast() -> dict:
             _sf_cache = {'date': today_str, 'hours': {}}
 
     return _sf_cache
+
+
+def fetch_tomorrow_solar_forecast() -> dict:
+    """Return tomorrow's hourly solar estimate and total kWh.
+
+    Result: {date, hours: {0..23: watts}, kwh_by_hour: {0..23: float}, total_kwh: float}
+    Each kwh_by_hour value is watts / 1000 (each slot = 1 hour).
+    Cached for 1 hour.
+    """
+    global _stf_cache, _stf_ts
+    tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
+
+    if _stf_cache.get('date') == tomorrow_str and time.time() - _stf_ts < SF_TTL:
+        return _stf_cache
+
+    url = (
+        'https://api.open-meteo.com/v1/forecast'
+        '?latitude=33.09924225276156&longitude=-117.06278850408303'
+        '&hourly=shortwave_radiation'
+        '&forecast_days=2&timezone=America%2FLos_Angeles'
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            data = json.loads(r.read())
+
+        hourly = data.get('hourly', {})
+        times  = hourly.get('time', [])
+        rads   = hourly.get('shortwave_radiation', [])
+
+        peak_solar = _peak_solar_w()
+        scale = peak_solar / PEAK_RAD_WM2
+
+        hours: dict[int, int] = {}
+        for t_str, rad in zip(times, rads):
+            day_part, hour_part = t_str.split('T')
+            if day_part != tomorrow_str:
+                continue
+            h = int(hour_part.split(':')[0])
+            hours[h] = round(max(0, (rad or 0) * scale))
+
+        kwh_by_hour = {h: round(w / 1000, 2) for h, w in hours.items()}
+        total_kwh   = round(sum(kwh_by_hour.values()), 2)
+
+        _stf_cache = {
+            'date':        tomorrow_str,
+            'hours':       hours,         # watts per hour
+            'kwh_by_hour': kwh_by_hour,   # kWh per hour
+            'total_kwh':   total_kwh,     # estimated day total
+        }
+        _stf_ts = time.time()
+
+        # Persist so rules.py can use it as a condition without calling the API
+        try:
+            with sqlite3.connect(DB_PATH) as c:
+                c.execute(
+                    "INSERT OR REPLACE INTO settings (key, value) VALUES ('tomorrow_solar_kwh', ?)",
+                    (str(total_kwh),)
+                )
+        except Exception:
+            pass
+
+    except Exception as exc:
+        print(f'Tomorrow solar forecast error: {exc}')
+        if _stf_cache.get('date') != tomorrow_str:
+            _stf_cache = {'date': tomorrow_str, 'hours': {}, 'kwh_by_hour': {}, 'total_kwh': 0.0}
+
+    return _stf_cache
 
 
 # ── Pool (screenlogicpy) ─────────────────────────────────────────────────────
@@ -1933,6 +2008,11 @@ def api_solar_forecast():
         if w > 0:
             points.append({'ts': base_ts + int(h) * 3600, 'solar_w': w})
     return jsonify(points)
+
+
+@app.route('/api/solar-forecast/tomorrow')
+def api_solar_forecast_tomorrow():
+    return jsonify(fetch_tomorrow_solar_forecast())
 
 
 @app.route('/api/pool')
