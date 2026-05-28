@@ -76,13 +76,10 @@ REM ----- Step 3/3: Copy files -----
 echo.
 echo [3/3] Copying files to server...
 
-REM Python source
+REM Python entry points (service targets — stay at root)
 for %%f in (
     server.py
     rules.py
-    fetch_rates.py
-    backfill.py
-    network_devices.py
     requirements.txt
 ) do (
     if exist "%LOCAL_ROOT%\%%f" (
@@ -94,6 +91,16 @@ for %%f in (
         echo       %%f
     )
 )
+
+REM Python lib/ modules — mirror so removed files are cleaned up
+echo       lib\ mirroring...
+robocopy "%LOCAL_ROOT%\lib" "%SERVER_PATH%\lib" /MIR /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+set LIB_RC=!ERRORLEVEL!
+if !LIB_RC! GEQ 8 (
+    echo [FAIL] robocopy lib\ returned !LIB_RC! - codes 8 or higher indicate errors
+    goto :fail
+)
+echo       lib\ mirrored OK - robocopy rc=!LIB_RC!
 
 REM Config files (holidays, rates)
 for %%f in (

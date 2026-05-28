@@ -4,6 +4,7 @@ import { useEffect, useRef, useCallback, useState } from 'react';
 import { Chart, registerables } from 'chart.js';
 import 'chartjs-adapter-date-fns';
 import { fmtW } from '@/lib/format';
+import { usePolling } from '@/lib/usePolling';
 
 Chart.register(...registerables);
 
@@ -215,65 +216,65 @@ export default function DayChart() {
     };
   }, [syncChartTheme]);
 
-  // Fetch chart data when viewedDate changes; auto-refresh every 60s only when viewing today
-  useEffect(() => {
-    let cancelled = false;
-    async function refreshChart() {
-      try {
-        const url = isToday ? '/api/today' : `/api/day?date=${isoDate(viewedDate)}`;
-        const rows = await fetch(url).then((r) => r.json());
-        if (cancelled) return;
-        const chart = chartRef.current;
-        if (!chart) return;
-        solarDataRef.current = rows.filter((r: any) => r.solar_w > 0).map((r: any) => ({ x: r.ts * 1000, y: r.solar_w }));
-        homeDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.home_w) }));
-        gridDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.grid_w ?? 0) }));
-        if (visibilityRef.current[0]) chart.data.datasets[0].data = solarDataRef.current;
-        if (visibilityRef.current[1]) chart.data.datasets[1].data = homeDataRef.current;
-        if (visibilityRef.current[3]) chart.data.datasets[3].data = gridDataRef.current;
-        chart.update('none');
-      } catch (e) {
-        console.warn('Chart:', e);
-      }
+  // Fetch chart data — lifted so usePolling can reference it
+  const chartAbortRef = useRef<AbortController | null>(null);
+  const refreshChart = useCallback(async () => {
+    chartAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    chartAbortRef.current = ctrl;
+    try {
+      const url = isToday ? '/api/today' : `/api/day?date=${isoDate(viewedDate)}`;
+      const rows = await fetch(url, { signal: ctrl.signal }).then((r) => r.json());
+      const chart = chartRef.current;
+      if (!chart) return;
+      solarDataRef.current = rows.filter((r: any) => r.solar_w > 0).map((r: any) => ({ x: r.ts * 1000, y: r.solar_w }));
+      homeDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.home_w) }));
+      gridDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.grid_w ?? 0) }));
+      if (visibilityRef.current[0]) chart.data.datasets[0].data = solarDataRef.current;
+      if (visibilityRef.current[1]) chart.data.datasets[1].data = homeDataRef.current;
+      if (visibilityRef.current[3]) chart.data.datasets[3].data = gridDataRef.current;
+      chart.update('none');
+    } catch (e) {
+      if ((e as Error).name !== 'AbortError') console.warn('Chart:', e);
     }
+  }, [isToday, viewedDate]);
 
-    refreshChart();
-    if (!isToday) return () => { cancelled = true; };
-    const id = setInterval(refreshChart, 60_000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [viewedDate, isToday]);
-
-  // Solar Forecast — only meaningful for today; clear when navigating away
+  // Initial fetch + refetch whenever date or isToday changes
   useEffect(() => {
-    let cancelled = false;
-    const chart = chartRef.current;
+    refreshChart();
+    return () => { chartAbortRef.current?.abort(); };
+  }, [refreshChart]);
+
+  // Recurring 60s poll — paused for historical dates and hidden tabs
+  usePolling(refreshChart, 60_000, isToday);
+
+  // Solar Forecast — only meaningful for today
+  const refreshForecast = useCallback(async () => {
+    try {
+      const points = await fetch('/api/solar-forecast').then((r) => r.json());
+      const c = chartRef.current;
+      if (!c) return;
+      forecastRef.current = points.map((p: any) => ({ x: p.ts * 1000, y: p.solar_w }));
+      if (visibilityRef.current[2]) {
+        c.data.datasets[2].data = forecastRef.current;
+        c.update('none');
+      }
+    } catch (e) {
+      console.warn('Solar forecast:', e);
+    }
+  }, []);
+
+  // Clear forecast data when navigating to a historical date
+  useEffect(() => {
     if (!isToday) {
       forecastRef.current = [];
-      if (chart) {
-        chart.data.datasets[2].data = [];
-        chart.update('none');
-      }
-      return;
+      const c = chartRef.current;
+      if (c) { c.data.datasets[2].data = []; c.update('none'); }
     }
-    async function refreshForecast() {
-      try {
-        const points = await fetch('/api/solar-forecast').then((r) => r.json());
-        if (cancelled) return;
-        const c = chartRef.current;
-        if (!c) return;
-        forecastRef.current = points.map((p: any) => ({ x: p.ts * 1000, y: p.solar_w }));
-        if (visibilityRef.current[2]) {
-          c.data.datasets[2].data = forecastRef.current;
-          c.update('none');
-        }
-      } catch (e) {
-        console.warn('Solar forecast:', e);
-      }
-    }
-    refreshForecast();
-    const id = setInterval(refreshForecast, 3_600_000);
-    return () => { cancelled = true; clearInterval(id); };
   }, [isToday]);
+
+  // Fetch + poll forecast — paused for historical dates and hidden tabs
+  usePolling(refreshForecast, 3_600_000, isToday);
 
   return (
     <div className="card chart-card">

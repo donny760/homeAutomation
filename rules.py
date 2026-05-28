@@ -17,7 +17,7 @@ import pypowerwall
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
-from fetch_rates import is_sdge_holiday, holiday_name
+from lib.fetch_rates import is_sdge_holiday, holiday_name
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PW_EMAIL      = 'don@nsdsolutions.com'

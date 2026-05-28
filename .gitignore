@@ -8,6 +8,8 @@ powerwall.db
 rates.json
 rules.log
 .pypowerwall.auth
+abode.pickle
+holidays.json
 __pycache__/
 frontend/tsconfig.tsbuildinfo
 static/frontend/

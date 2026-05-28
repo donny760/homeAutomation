@@ -10,7 +10,7 @@ import requests
 import pdfplumber
 from datetime import datetime, date, timedelta
 
-BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RATES_PATH    = os.path.join(BASE_DIR, 'rates.json')
 HOLIDAYS_PATH = os.path.join(BASE_DIR, 'holidays.json')
 
