@@ -95,7 +95,6 @@ from lib.switches import (
     switch_set_brightness, switch_update_meta,
 )
 from lib.powerwall import poller, backfill_history
-from lib.powerwall import PW_EMAIL, POLL_INTERVAL, DB_WRITE_EVERY
 import lib.ai_insights as ai_insights
 from lib.ai_insights import (
     _ai_cache, _azure_configured, _build_ai_context, _gemini_system_prompt,
@@ -118,8 +117,10 @@ app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0  # no browser caching of static file
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    import traceback
-    app.logger.error(traceback.format_exc())
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return jsonify(error=e.description), e.code
+    app.logger.exception(e)
     return jsonify(error=str(e)), 500
 
 
@@ -1425,6 +1426,149 @@ def api_debug_network_all():
             ap['raw'] = {k: f'<{len(v)} chars>' for k, v in ap.get('raw', {}).items()}
     return jsonify(res)
 
+
+
+# ── Network device CRUD routes ────────────────────────────────────────────────
+@app.route('/api/network/devices')
+def api_network_devices():
+    online_only  = request.args.get('online') == '1'
+    ap_filter    = request.args.get('ap')
+    unnamed_only = request.args.get('unnamed') == '1'
+    with _network_state_lock:
+        items = _network_state_to_list(_network_state)
+    if online_only:
+        items = [d for d in items if d['online']]
+    if ap_filter:
+        items = [d for d in items if d['last_ap'] == ap_filter]
+    if unnamed_only:
+        items = [d for d in items if not d['friendly_name']]
+    aps = sorted({d['last_ap'] for d in items if d['last_ap']})
+    return jsonify({
+        'devices': items,
+        'total': len(items),
+        'aps': aps,
+        'last_poll_ts': network_mod._network_last_poll_ts,
+        'last_poll': network_mod._network_last_poll_result,
+        'enabled': get_setting_bool('network_enabled', False),
+        'quarantined_aps': [
+            {'name': n, 'until': t}
+            for n, t in network_mod._network_ap_quarantine.items()
+            if t > time.time()
+        ],
+    })
+
+
+@app.route('/api/network/devices/<mac>', methods=['PUT'])
+def api_network_device_update(mac):
+    mac  = mac.lower()
+    body = request.get_json() or {}
+    with _network_state_lock:
+        cur = _network_state.get(mac)
+        if cur is None:
+            cur = {'first_seen': int(time.time())}
+            _network_state[mac] = cur
+        for field in ('friendly_name', 'notes'):
+            if field in body:
+                cur[field] = str(body[field])[:500]
+        if 'hidden' in body:
+            cur['hidden'] = bool(body['hidden'])
+        try:
+            _netdev.save_state(NETWORK_STATE_PATH, _network_state)
+        except Exception as exc:
+            return jsonify({'error': f'save failed: {exc}'}), 500
+    return jsonify({'ok': True, 'mac': mac, 'device': cur})
+
+
+@app.route('/api/network/devices/<mac>', methods=['DELETE'])
+def api_network_device_remove(mac):
+    mac = mac.lower()
+    with _network_state_lock:
+        cur = _network_state.get(mac)
+        if cur is None:
+            return jsonify({'error': 'unknown mac'}), 404
+        last_seen = cur.get('last_seen') or 0
+        age_days = (time.time() - last_seen) / 86400 if last_seen else None
+        if last_seen and age_days < _NETWORK_REMOVE_MIN_OFFLINE_DAYS:
+            return jsonify({
+                'error': 'device too recent to remove',
+                'last_seen': last_seen,
+                'offline_days': age_days,
+                'min_offline_days': _NETWORK_REMOVE_MIN_OFFLINE_DAYS,
+            }), 400
+        _network_state.pop(mac, None)
+        try:
+            _netdev.save_state(NETWORK_STATE_PATH, _network_state)
+        except Exception as exc:
+            return jsonify({'error': f'save failed: {exc}'}), 500
+    return jsonify({'ok': True, 'mac': mac})
+
+
+@app.route('/api/network/rediscover', methods=['POST'])
+def api_network_rediscover():
+    try:
+        result = _network_poll_once()
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+    return jsonify({'ok': True, 'result': result})
+
+
+@app.route('/api/network/ap_filters')
+def api_network_ap_filters():
+    out = []
+    for ap in _network_ap_cfgs():
+        if not ap.get('url'):
+            continue
+        res = _netdev.fetch_ddwrt_ap(ap['url'], ap.get('user', ''),
+                                     ap.get('pass', ''),
+                                     ap.get('name', ap['url']))
+        out.append({
+            'ap': ap.get('name'),
+            'filters': res.get('filters', {}),
+            'errors': res.get('errors', []),
+        })
+    return jsonify({'aps': out})
+
+
+@app.route('/api/network/devices/<mac>/filters', methods=['PUT'])
+def api_network_device_filters(mac):
+    mac  = mac.lower()
+    body = request.get_json() or {}
+    desired = {
+        'wl0': dict(body.get('wl0') or {}),
+        'wl1': dict(body.get('wl1') or {}),
+    }
+    return jsonify(_apply_filter_ban_map(mac, desired))
+
+
+@app.route('/api/network/devices/<mac>/pin', methods=['POST'])
+def api_network_device_pin(mac):
+    body         = request.get_json() or {}
+    target_ap    = body.get('ap', '')
+    target_radio = body.get('radio', 'either')
+    if not target_ap:
+        return jsonify({'error': 'ap is required'}), 400
+    if target_radio not in ('wl0', 'wl1', 'either'):
+        return jsonify({'error': 'radio must be wl0/wl1/either'}), 400
+    aps = [a.get('name') for a in _network_ap_cfgs() if a.get('name')]
+    if target_ap not in aps:
+        return jsonify({'error': f'unknown ap {target_ap!r}', 'available': aps}), 400
+    desired = {'wl0': {}, 'wl1': {}}
+    for ap_name in aps:
+        for radio in ('wl0', 'wl1'):
+            if ap_name == target_ap and (target_radio == 'either'
+                                         or target_radio == radio):
+                desired[radio][ap_name] = False
+            else:
+                desired[radio][ap_name] = True
+    return jsonify(_apply_filter_ban_map(mac.lower(), desired))
+
+
+@app.route('/api/network/devices/<mac>/unpin', methods=['POST'])
+def api_network_device_unpin(mac):
+    aps     = [a.get('name') for a in _network_ap_cfgs() if a.get('name')]
+    desired = {'wl0': {n: False for n in aps},
+               'wl1': {n: False for n in aps}}
+    return jsonify(_apply_filter_ban_map(mac.lower(), desired))
 
 
 # ── Event Log endpoint ────────────────────────────────────────────────────────

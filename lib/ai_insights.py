@@ -1029,35 +1029,29 @@ def _extract_api_error(resp, max_len: int = 200) -> str:
 
 
 def _call_gemini(system_prompt: str, user_msg: str, model: str, api_key: str) -> str:
-    """Call Gemini once. Returns response text or raises _ProviderError."""
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}'
-    payload = {
-        'system_instruction': {'parts': [{'text': system_prompt}]},
-        'contents': [{'parts': [{'text': user_msg}]}],
-        'generationConfig': {
-            'temperature': 0.2,
-            'maxOutputTokens': 65536,
-            'thinkingConfig': {'thinkingBudget': 0},
-        },
-    }
+    """Call Gemini once via google-genai SDK. Returns response text or raises _ProviderError."""
     try:
-        resp = _requests.post(url, json=payload, timeout=300)
-    except _requests.exceptions.Timeout:
-        raise _ProviderError('Timeout', status=504, transient=True)
-    except _requests.exceptions.ConnectionError as exc:
-        raise _ProviderError(f'Connection error: {exc}', status=None, transient=True)
-
-    if resp.status_code == 429 or resp.status_code >= 500:
-        raise _ProviderError(_extract_api_error(resp), status=resp.status_code, transient=True)
-    if resp.status_code >= 400:
-        raise _ProviderError(_extract_api_error(resp), status=resp.status_code, transient=False)
-
-    data = resp.json()
-    text = ''
-    candidates = data.get('candidates', [])
-    if candidates:
-        parts = candidates[0].get('content', {}).get('parts', [])
-        text = '\n'.join(p.get('text', '') for p in parts)
+        from google import genai
+        from google.genai import types as _gtypes
+    except ImportError as exc:
+        raise _ProviderError(f'google-genai not installed: {exc}', transient=False)
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model,
+            contents=user_msg,
+            config=_gtypes.GenerateContentConfig(
+                system_instruction=system_prompt,
+                temperature=0.2,
+                max_output_tokens=65536,
+                thinking_config=_gtypes.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        text = response.text or ''
+    except Exception as exc:
+        msg = str(exc)
+        transient = any(k in msg.lower() for k in ('timeout', 'rate', '429', '500', '503'))
+        raise _ProviderError(msg, transient=transient)
     if not text:
         raise _ProviderError('Empty response', status=200, transient=True)
     return text

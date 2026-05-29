@@ -6,4 +6,7 @@ requests
 python-dotenv
 python-kasa
 tinytuya
+google-genai
+pysnmp
+mac-vendor-lookup
 pywin32  # Windows service on server-04

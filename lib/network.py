@@ -39,24 +39,25 @@ def _network_poll_once() -> dict:
 
     now = time.time()
     all_aps = _network_ap_cfgs()
+    with _network_state_lock:
+        quarantine_snapshot = dict(_network_ap_quarantine)
     live_aps = [a for a in all_aps
-                if _network_ap_quarantine.get(a.get('name', ''), 0) <= now]
+                if quarantine_snapshot.get(a.get('name', ''), 0) <= now]
 
     res = _netdev.fetch_all(
         _network_router_cfg(), live_aps,
         local_subnet=get_setting('network_local_subnet', '10.0.0.0/24'),
     )
 
-    for ap_res in res.get('aps', []):
-        name = ap_res.get('ap', '')
-        if not name:
-            continue
-        if ap_res.get('errors'):
-            _network_ap_quarantine[name] = now + _NETWORK_QUARANTINE_SECS
-        else:
-            _network_ap_quarantine.pop(name, None)
-
     with _network_state_lock:
+        for ap_res in res.get('aps', []):
+            name = ap_res.get('ap', '')
+            if not name:
+                continue
+            if ap_res.get('errors'):
+                _network_ap_quarantine[name] = now + _NETWORK_QUARANTINE_SECS
+            else:
+                _network_ap_quarantine.pop(name, None)
         _netdev.merge_into_state(_network_state, res.get('merged', []),
                                  now_ts=int(now))
         try:
@@ -186,7 +187,8 @@ def _apply_filter_ban_map(mac: str, desired: dict) -> dict:
                 'errors': wr.get('errors', []),
             })
         if ap_changed:
-            _network_ap_quarantine.pop(ap_name, None)
+            with _network_state_lock:
+                _network_ap_quarantine.pop(ap_name, None)
 
     return {'mac': mac, 'results': results,
             'all_ok': all(r.get('ok', True) for r in results)}
