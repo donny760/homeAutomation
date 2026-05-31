@@ -471,6 +471,8 @@ def api_rules_put(rid):
     gc_val = None if gc is None else (1 if gc else 0)
     with sqlite3.connect(DB_PATH) as c:
         c.execute('PRAGMA foreign_keys = ON')
+        if not c.execute('SELECT 1 FROM rules WHERE id=?', (rid,)).fetchone():
+            return jsonify({'error': 'not found'}), 404
         c.execute(
             'UPDATE rules SET name=?,enabled=?,days=?,months=?,hour=?,minute=?,mode=?,reserve=?,grid_charging=?,grid_export=?,notes=? WHERE id=?',
             (body['name'], 1 if body.get('enabled', True) else 0,
@@ -488,8 +490,6 @@ def api_rules_put(rid):
             'SELECT id,name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export,notes FROM rules WHERE id=?', (rid,)
         ).fetchone()
         conds = c.execute('SELECT rule_id,logic,type,operator,value FROM rule_conditions WHERE rule_id=?', (rid,)).fetchall()
-    if not row:
-        return jsonify({'error': 'not found'}), 404
     cond_list = [{'logic': r[1], 'type': r[2], 'operator': r[3], 'value': r[4]} for r in conds]
     _ai_cache['ts'] = 0  # invalidate AI insights cache
     return jsonify(_rule_row_to_dict(row, cond_list))
@@ -521,12 +521,12 @@ def api_rules_reorder():
 @app.route('/api/rules/<int:rid>/toggle', methods=['PUT'])
 def api_rules_toggle(rid):
     with sqlite3.connect(DB_PATH) as c:
+        if not c.execute('SELECT 1 FROM rules WHERE id=?', (rid,)).fetchone():
+            return jsonify({'error': 'not found'}), 404
         c.execute('UPDATE rules SET enabled = 1 - enabled WHERE id=?', (rid,))
         row = c.execute(
-            'SELECT id,name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export FROM rules WHERE id=?', (rid,)
+            'SELECT id,name,enabled FROM rules WHERE id=?', (rid,)
         ).fetchone()
-    if not row:
-        return jsonify({'error': 'not found'}), 404
     return jsonify({'id': rid, 'enabled': bool(row[2])})
 
 
@@ -662,45 +662,15 @@ def api_rules_ai_insights_debug():
     # Try Gemini first (single attempt — debug doesn't retry)
     if gemini_key:
         try:
-            url = f'https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}'
-            payload = {
-                'system_instruction': {'parts': [{'text': system_prompt}]},
-                'contents': [{'parts': [{'text': user_msg}]}],
-                'generationConfig': {
-                    'temperature': 0.2,
-                    'maxOutputTokens': 65536,
-                    'thinkingConfig': {'thinkingBudget': 0},
-                },
-            }
-            resp = _requests.post(url, json=payload, timeout=300)
-            raw = resp.json()
-
-            if resp.status_code == 200:
-                text = ''
-                candidates = raw.get('candidates', [])
-                finish_reason = None
-                if candidates:
-                    parts = candidates[0].get('content', {}).get('parts', [])
-                    text = '\n'.join(p.get('text', '') for p in parts)
-                    finish_reason = candidates[0].get('finishReason')
-                usage = raw.get('usageMetadata', {})
-                result.update({
-                    'ok': True,
-                    'provider': 'gemini',
-                    'model': gemini_model,
-                    'finish_reason': finish_reason,
-                    'usage': {
-                        'prompt_tokens': usage.get('promptTokenCount'),
-                        'output_tokens': usage.get('candidatesTokenCount'),
-                        'thinking_tokens': usage.get('thoughtsTokenCount'),
-                        'total_tokens': usage.get('totalTokenCount'),
-                    },
-                    'response_chars': len(text),
-                    'response_text': text,
-                })
-                return jsonify(result)
-            else:
-                result['gemini_error'] = f'{resp.status_code}: {raw.get("error", {}).get("message", resp.text[:200])}'
+            text = _call_gemini(system_prompt, user_msg, gemini_model, gemini_key)
+            result.update({
+                'ok': True,
+                'provider': 'gemini',
+                'model': gemini_model,
+                'response_chars': len(text),
+                'response_text': text,
+            })
+            return jsonify(result)
         except Exception as exc:
             result['gemini_error'] = str(exc)
 

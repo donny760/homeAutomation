@@ -62,7 +62,7 @@ interface RulesProps {
   isActive: boolean;
 }
 
-function nextFireForRule(rule: Rule): string {
+function nextFireForRule(rule: Rule, holidays: Set<string> = new Set()): string {
   const now = new Date();
   const days = new Set(rule.days);
   const months = new Set(rule.months);
@@ -70,11 +70,13 @@ function nextFireForRule(rule: Rule): string {
     const d = new Date(now);
     d.setDate(d.getDate() + delta);
     d.setHours(rule.hour, rule.minute, 0, 0);
-    const weekday = (d.getDay() + 6) % 7;
-    if (d > now && days.has(weekday) && months.has(d.getMonth() + 1)) {
-      const day = DAYS_LBL[d.getDay()].slice(0, 3);
-      return `${day} ${fmtTime12(d.getHours(), d.getMinutes())}`;
-    }
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    const isHoliday = holidays.has(iso);
+    const weekday = (d.getDay() + 6) % 7; // 0=Mon \u2026 5=Sat, 6=Sun
+    // Holidays treated as weekends: rule fires only if it includes Sat(5) or Sun(6)
+    const fires = d > now && months.has(d.getMonth() + 1) &&
+      (isHoliday ? (days.has(5) || days.has(6)) : days.has(weekday));
+    if (fires) return `${DAYS_LBL[d.getDay()].slice(0, 3)} ${fmtTime12(d.getHours(), d.getMinutes())}`;
   }
   return '\u2014';
 }
@@ -639,7 +641,7 @@ export default function Rules({ isActive }: RulesProps) {
                       <SortableRow
                         key={r.id}
                         rule={r}
-                        nextFire={nextFireForRule(r)}
+                        nextFire={nextFireForRule(r, new Set(rates?.holidays ?? []))}
                         onEdit={openModal}
                         onDelete={deleteRule}
                       />

@@ -187,13 +187,13 @@ def init_db() -> None:
         _seed_settings(c)
         _seed_rate_history(c)
         _migrate(c)
-        # Force tou_periods to year-round weekday super off-peak (effective 2026-05-01)
+        # Seed default tou_periods (SDG&E EV-TOU-2 effective 2026-05-01) — INSERT OR IGNORE
+        # so user changes via Settings are preserved across restarts.
         correct_tou = json.dumps({
             'weekday':         {'on_peak': [[16, 21]], 'super_off_peak': [[0, 6], [10, 14]]},
             'weekend_holiday': {'on_peak': [[16, 21]], 'super_off_peak': [[0, 14]]},
         })
-        c.execute("INSERT INTO settings (key,value) VALUES ('tou_periods',?) ON CONFLICT(key) DO UPDATE SET value=?",
-                  (correct_tou, correct_tou))
+        c.execute("INSERT OR IGNORE INTO settings (key,value) VALUES ('tou_periods',?)", (correct_tou,))
 
 
 def write_reading(solar_w, home_w, battery_w, grid_w, battery_pct) -> None:

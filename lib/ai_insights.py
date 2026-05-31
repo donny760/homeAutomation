@@ -881,8 +881,10 @@ def _build_ai_context():
         'pv_only': 'battery export disabled (solar-only export)',
     }
     _COND_LABELS = {
-        'battery_pct': 'battery %',
-        'net_cost': 'net cost today $',
+        'battery_pct':        'battery %',
+        'net_cost':           'net cost today $',
+        'net_cost_ytd':       'YTD net cost $',
+        'tomorrow_solar_kwh': 'tomorrow solar forecast kWh',
     }
 
     def _fmt_days(days):
