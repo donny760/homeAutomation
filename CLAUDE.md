@@ -1,5 +1,5 @@
-﻿# homeAutomation — Powerwall Dashboard
-> Last indexed: 2026-05-30
+# homeAutomation — Powerwall Dashboard
+> Last indexed: 2026-05-31
 
 ## What This Is
 Home automation dashboard for a San Diego home with 3x Powerwall 2 (40.5 kWh), solar, pool, and smart home devices. Tracks energy, runs TOU-aware automation rules, and integrates Abode security, Nest thermostats, Rachio irrigation, Kasa/Tuya plugs, and network device discovery.
@@ -15,10 +15,10 @@ Home automation dashboard for a San Diego home with 3x Powerwall 2 (40.5 kWh), s
 Flask (`server.py`) is the backend entry point: it imports from `lib/` modules and registers all API routes, but the core logic lives in the `lib/` package (20 modules). The main poller (`lib/powerwall.py`) runs every 10s/30s to fetch Powerwall + device state and write to SQLite. The Next.js frontend is built to a static export (`static/frontend/`), which Flask serves directly — no separate Node server in production. Dev mode proxies `/api/*` to `localhost:5001`. The rules engine (`rules.py`) runs as a separate process/service, importing from `lib/`, evaluating Powerwall mode rules every 60s and writing to `event_log`. AI insights use Gemini (primary) or Azure OpenAI (fallback), both configured through the `settings` DB table.
 
 ## Key Files
-- `server.py` — Flask backend entry point: registers all API routes, imports from `lib.*`; network device CRUD routes (`GET/PUT/DELETE /api/network/devices`, `/api/network/rediscover`, `/api/network/ap_filters`, per-MAC filter/pin/unpin); `HTTPException` passes through with its own status code; `PUT /api/rules/<id>/toggle` and `POST /api/rules/reorder` endpoints
+- `server.py` — Flask backend entry point: registers all API routes, imports from `lib.*`; network device CRUD routes (`GET/PUT/DELETE /api/network/devices`, `/api/network/rediscover`, `/api/network/ap_filters`, per-MAC filter/pin/unpin); `HTTPException` passes through with its own status code; `PUT /api/rules/<id>/toggle` and `POST /api/rules/reorder` endpoints; 404 guard runs before UPDATE in `api_rules_put` / `api_rules_toggle`; debug insights endpoint uses `_call_gemini` helper
 - `rules.py` — Powerwall automation rules engine, Windows-service-capable; imports from `lib.*`; `rules.log` via RotatingFileHandler (10 MB, 3 backups); `_rule_fires_at` treats holidays as weekends; `apply_settings` has no `first_run` param
 - `lib/powerwall.py` — main `poller` loop: fetches Powerwall + all device data every 10s/30s, logs readings and events, triggers periodic cost rebuilds and rate/holiday refreshes
-- `lib/db.py` — SQLite schema init, migrations, default rule/settings seeding, raw readings read/write
+- `lib/db.py` — SQLite schema init, migrations, default rule/settings seeding, raw readings read/write; `tou_periods` seed uses `INSERT OR IGNORE` to preserve user-edited TOU settings across restarts
 - `lib/state.py` — global `_live` dict + `_lock` for thread-safe real-time Powerwall data; defines `BASE_DIR` and `DB_PATH`
 - `lib/costs.py` — calculates/stores daily import/export costs by TOU tier; rebuilds historical data from readings; `rebuild_daily_costs` accepts `from_date`
 - `lib/rule_helpers.py` — loads rules from DB, computes upcoming fire times, validates rule bodies, provides schedule insights
@@ -26,7 +26,7 @@ Flask (`server.py`) is the backend entry point: it imports from `lib/` modules a
 - `lib/events.py` — utility functions for writing to `event_log`; tracks device failure counts for all integrations
 - `lib/fetch_rates.py` — SDG&E EV-TOU-2 rate fetching from PDF, TOU period classification, writes `rates.json` + `rate_history` table
 - `lib/abode.py` — Abode security integration: event logging, backfill, event listener lifecycle, mode get/set
-- `lib/ai_insights.py` — builds JSON context (true-up projections, rule analysis, daily data) and calls Gemini (via google-genai SDK `Client.models.generate_content`) or Azure OpenAI (fallback) for energy advice; simplified transient-error detection
+- `lib/ai_insights.py` — builds JSON context (true-up projections, rule analysis, daily data) and calls Gemini (via google-genai SDK `Client.models.generate_content`) or Azure OpenAI (fallback) for energy advice; simplified transient-error detection; condition label map includes `net_cost_ytd` and `tomorrow_solar_kwh`
 - `lib/kasa.py` — Kasa smart device discovery, polling, and control via persistent asyncio loop (`_kasa_loop`); use `_kasa_submit()`, never `asyncio.run()`
 - `lib/nest.py` — Nest SDM integration: OAuth token management, device state, Pub/Sub event polling, thermostat control
 - `lib/pool.py` — ScreenLogic pool integration: status polling, circuit control, daily gallon accumulation; `_accumulate_pool_gallons`, `_recalc_pool_target`
@@ -52,7 +52,7 @@ Flask (`server.py`) is the backend entry point: it imports from `lib/` modules a
 - `frontend/src/components/BottomTiles.tsx` — pool tile showing RPM + GPM from Pentair gateway
 - `frontend/src/components/DayChart.tsx` — historical power chart (Solar/Home/Battery/Grid); uses `usePolling` hook with AbortController
 - `frontend/src/components/SwitchesDrawer.tsx` — nav drawer for Kasa/Pool/Nest thermostat tiles
-- `frontend/src/components/Rules.tsx` — rules management + today's firing timeline; drag-and-drop reordering via `@dnd-kit`; `notes` field; `enabled` toggle
+- `frontend/src/components/Rules.tsx` — rules management + today's firing timeline; drag-and-drop reordering via `@dnd-kit`; `notes` field; `enabled` toggle; `nextFireForRule` mirrors server-side holiday-as-weekend logic
 - `frontend/src/components/EnergyCosts.tsx` — YTD and daily cost breakdown
 - `frontend/src/components/NetworkDevices.tsx` — network client table with PIN-protected name editing
 - `frontend/src/lib/tou.ts` — TOU period classification (client-side, mirrors server logic)
@@ -116,7 +116,7 @@ Gemini API key and Azure OpenAI credentials are stored in the `settings` DB tabl
 - rules.py: pypowerwall connection is only reset on `apply_settings` failure — DB/logic errors in rule evaluation are caught separately and do not trigger a reconnect
 - rules.py: `cond_cache` stores condition results keyed by `(rule_id, fire_dt_iso)`; passed into `current_target_state`; pruned when older than 3 days
 - rules.py: `load_rules_from_db` uses a JOIN to fetch conditions only for enabled rules — disabled rules have no conditions loaded
-- rules.py/server.py: `_rule_fires_at` treats SDG&E holidays as weekends — only rules with Sat(5) or Sun(6) in their days set fire on holidays
+- rules.py/server.py: `_rule_fires_at` treats SDG&E holidays as weekends — only rules with Sat(5) or Sun(6) in their days set fire on holidays; this logic is mirrored client-side in `Rules.tsx` `nextFireForRule`
 - rules.py: STATE transitions and next-fire-time updates are logged only when the value changes (not every eval loop)
 - rules.py: `apply_settings` has no `first_run` parameter — startup settings changes are always written to event_log
 - Rules drag reorder: `PUT /api/rules/reorder` accepts `{ids: [...]}` ordered list; `sort_order` column updated; frontend uses `@dnd-kit/sortable`
@@ -128,11 +128,15 @@ Gemini API key and Azure OpenAI credentials are stored in the `settings` DB tabl
 3. Restart Windows service on server-04 manually after deploy
 4. Live at `http://server-04:5001`
 
-## Recent Focus (as of 2026-05-30)
-- `lib/ai_insights.py`: Gemini call migrated from raw HTTP requests to google-genai SDK (`Client.models.generate_content`); simplified transient-error detection
-- `lib/network.py`: race condition fix — quarantine dict snapshot-read before iterating APs; writes to `_network_ap_quarantine` inside `_network_state_lock`
-- `server.py`: 9 new network device API routes (`GET/PUT/DELETE /api/network/devices`, `/api/network/rediscover`, `/api/network/ap_filters`, per-MAC filter/pin/unpin); `HTTPException` passes through with its own status code; 3 unused imports removed
-- `requirements.txt`: added `google-genai`, `pysnmp`, `mac-vendor-lookup`
+## Recent Focus (as of 2026-05-31)
+- `frontend/src/components/Rules.tsx`: `nextFireForRule` now mirrors server-side holiday-as-weekend logic — holiday dates treated as Sunday for rule day-matching in the UI
+- `lib/db.py`: `tou_periods` seed changed to `INSERT OR IGNORE` — prevents overwriting user-edited TOU settings on every server restart
+- `server.py`: 404 guard moved before UPDATE in `api_rules_put` / `api_rules_toggle`; debug insights endpoint refactored to use `_call_gemini` helper
+- `lib/ai_insights.py`: condition label map extended with `net_cost_ytd` and `tomorrow_solar_kwh`
+- Earlier (2026-05-30): `lib/ai_insights.py`: Gemini call migrated from raw HTTP requests to google-genai SDK (`Client.models.generate_content`); simplified transient-error detection
+- Earlier (2026-05-30): `lib/network.py`: race condition fix — quarantine dict snapshot-read before iterating APs; writes to `_network_ap_quarantine` inside `_network_state_lock`
+- Earlier (2026-05-30): `server.py`: 9 new network device API routes (`GET/PUT/DELETE /api/network/devices`, `/api/network/rediscover`, `/api/network/ap_filters`, per-MAC filter/pin/unpin); `HTTPException` passes through with its own status code; 3 unused imports removed
+- Earlier (2026-05-30): `requirements.txt`: added `google-genai`, `pysnmp`, `mac-vendor-lookup`
 - Earlier (2026-05-27): **Major refactor:** `server.py` split into 20 modules under `lib/`; `fetch_rates.py`, `network_devices.py`, `backfill.py` moved to `lib/` and deleted from root; `deploy.bat` updated to mirror `lib/` to server-04
 - Earlier: `DayChart.tsx` refactored to use `usePolling` hook with AbortController; `.gitignore` updated (abode.pickle, holidays.json)
 - Earlier: rules page drag-and-drop reorder (`@dnd-kit/sortable`), `notes` field, pause/resume toggle
@@ -147,5 +151,3 @@ Gemini API key and Azure OpenAI credentials are stored in the `settings` DB tabl
 - @security-expert — credentials, Abode/Nest OAuth, API key storage
 - @git-commit — pre-commit checks and commit messages
 - @project-indexer — update this file when major structural changes land
-
-
