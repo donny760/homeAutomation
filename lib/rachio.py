@@ -9,6 +9,7 @@ from datetime import datetime, date, timedelta, timezone
 import lib.state as state
 from lib.events import _log_system_error
 from lib.settings import get_setting_bool, get_setting_int
+from lib.db import connect
 
 
 RACHIO_API_KEY = os.environ.get('RACHIO_API_KEY', '')
@@ -161,7 +162,7 @@ def fetch_rachio_events() -> int:
                     continue
 
         if rows:
-            with sqlite3.connect(state.DB_PATH, timeout=30) as c:
+            with connect() as c:
                 existing = set(
                     c.execute(
                         'SELECT ts, title FROM event_log WHERE system = ?', ('rachio',)
@@ -283,7 +284,7 @@ def evaluate_rain_skip() -> None:
 
             today_ts = int(datetime.now().replace(hour=0, minute=0, second=0).timestamp())
             title    = f'Rain skip: {skip_days} days ({dname})'
-            with sqlite3.connect(state.DB_PATH, timeout=10) as c:
+            with connect() as c:
                 exists = c.execute(
                     'SELECT 1 FROM event_log WHERE system=? AND ts=? AND title=?',
                     ('rachio', today_ts, title)

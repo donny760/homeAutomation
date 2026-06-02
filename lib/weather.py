@@ -31,7 +31,7 @@ def fetch_weather() -> dict:
     url = (
         'https://api.open-meteo.com/v1/forecast'
         f'?latitude={lat}&longitude={lng}'
-        '&current_weather=true'
+        '&current=temperature_2m,relative_humidity_2m,weathercode,windspeed_10m,winddirection_10m,is_day'
         '&daily=precipitation_sum,cloudcover_mean'
         f'&past_days={lookback}'
         '&forecast_days=3&timezone=America%2FLos_Angeles'
@@ -39,7 +39,7 @@ def fetch_weather() -> dict:
     try:
         with urllib.request.urlopen(url, timeout=10) as r:
             data = json.loads(r.read())
-        cw    = data.get('current_weather', {})
+        cw    = data.get('current', {})
         daily = data.get('daily', {})
         dates    = daily.get('time', [])
         precip   = daily.get('precipitation_sum', [])
@@ -63,7 +63,8 @@ def fetch_weather() -> dict:
                 rain_forecast[dates[i]] = precip[i] or 0
 
         _wx_cache = {
-            'temp_f':          round(cw.get('temperature', 0) * 9 / 5 + 32, 1),
+            'temp_f':          round(cw.get('temperature_2m', 0) * 9 / 5 + 32, 1),
+            'humidity':        cw.get('relative_humidity_2m'),
             'desc':            WMO.get(cw.get('weathercode', 0), ''),
             'weathercode':     cw.get('weathercode', 0),
             'tomorrow_cloud':  clouds_tm,

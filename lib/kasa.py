@@ -5,6 +5,7 @@ import time
 
 import lib.state as state
 from lib.events import _log_system_error, _device_mark_failure, _switches_lock
+from lib.db import connect
 
 
 _kasa_devices: dict     = {}
@@ -42,7 +43,7 @@ def _kasa_submit(coro, timeout: float = 30.0):
 
 def _log_kasa_reachability(name: str, event: str, detail: str = None) -> None:
     try:
-        with sqlite3.connect(state.DB_PATH) as c:
+        with connect() as c:
             c.execute(
                 'INSERT INTO event_log '
                 '(ts, system, event_type, title, detail, result, source) '
@@ -165,7 +166,7 @@ def _kasa_refresh_devices() -> int:
     with _switches_lock:
         _kasa_devices = {mac: {**info, 'last_seen': now} for mac, info in devices.items()}
         _kasa_ts = now
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         for mac, info in devices.items():
             kind = 'dimmer' if info.get('dimmable') else 'plug'
             existing = c.execute(
@@ -185,7 +186,7 @@ def _kasa_refresh_devices() -> int:
 
 def _log_kasa_external_change(name: str, new_on: bool, detail: str = None) -> None:
     try:
-        with sqlite3.connect(state.DB_PATH) as c:
+        with connect() as c:
             c.execute(
                 'INSERT INTO event_log '
                 '(ts, system, event_type, title, detail, result, source) '

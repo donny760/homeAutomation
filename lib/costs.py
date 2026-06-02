@@ -7,13 +7,14 @@ from datetime import datetime, date
 import lib.state as state
 from lib.fetch_rates import load_rates, tou_period, RATES_PATH
 from lib.settings import _load_tou_periods
+from lib.db import connect
 
 
 _cost_rebuild_lock = threading.Lock()
 
 
 def _load_rate_history() -> list:
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         return c.execute(
             'SELECT effective_date, end_date, '
             '       summer_on_peak, summer_off_peak, summer_super_off_peak, '
@@ -76,7 +77,7 @@ def _backfill_rates_event_url() -> None:
             src_url = json.load(f).get('source_url')
         if not src_url:
             return
-        with sqlite3.connect(state.DB_PATH) as c:
+        with connect() as c:
             c.execute(
                 "UPDATE event_log SET detail = detail || '  ' || ? "
                 "WHERE system='rates' AND event_type='rates_updated' "
@@ -101,7 +102,7 @@ def _rebuild_today() -> None:
     tou_cfg = _load_tou_periods()
     day_rate = (_rate_for_date(rate_periods, today_str) if rate_periods else None) or fallback_rates or {}
 
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         rows = c.execute(
             'SELECT timestamp, grid_w FROM readings '
             'WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp',
@@ -163,7 +164,7 @@ def rebuild_daily_costs(year: int = None, from_date=None) -> None:
 
     tou_cfg = _load_tou_periods()
 
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         rows = c.execute(
             'SELECT timestamp, grid_w FROM readings '
             'WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp',

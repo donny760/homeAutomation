@@ -7,6 +7,7 @@ from datetime import datetime
 import lib.state as state
 from lib.settings import get_setting, get_setting_bool, get_setting_int
 from lib.events import _log_system_error
+from lib.db import connect
 
 
 POOL_POLL_INTERVAL = 30
@@ -176,7 +177,7 @@ def _log_pool_changes(new: dict) -> None:
         return
     now = int(time.time())
     try:
-        with sqlite3.connect(state.DB_PATH) as c:
+        with connect() as c:
             for field, (event_type, label) in _POOL_EVENT_FIELDS.items():
                 confirmed_val = _pool_prev.get(field)
                 new_val = new.get(field)
@@ -242,7 +243,7 @@ def _accumulate_pool_gallons(pool: dict) -> None:
             gpm_updates.append(('pool_cached_edge_gpm', str(_pool_edge_gpm)))
     if gpm_updates:
         try:
-            with sqlite3.connect(state.DB_PATH) as conn:
+            with connect() as conn:
                 conn.execute('PRAGMA busy_timeout=5000')
                 conn.executemany(
                     'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
@@ -270,7 +271,7 @@ def _recalc_pool_target() -> None:
     MAX_SEG_SECS = _MAX_SEGMENT_HOURS * 3600
 
     try:
-        with sqlite3.connect(state.DB_PATH) as conn:
+        with connect() as conn:
             conn.execute('PRAGMA journal_mode=WAL')
             conn.execute('PRAGMA busy_timeout=5000')
             rows = conn.execute(
@@ -375,7 +376,7 @@ def _recalc_pool_target() -> None:
     target_we = _avg(weekend_vals[-2:], target_wd)
 
     try:
-        with sqlite3.connect(state.DB_PATH) as conn:
+        with connect() as conn:
             conn.execute('PRAGMA busy_timeout=5000')
             conn.executemany(
                 'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
@@ -415,7 +416,7 @@ def fetch_pool() -> dict:
 
 
 def _pool_discover_circuits() -> int:
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         for ext_id, _, default_name, _ in POOL_CIRCUITS:
             row = c.execute(
                 'SELECT id FROM switches_meta WHERE provider=? AND external_id=?',

@@ -41,7 +41,7 @@ def backfill_readings(start=None):
     skipped  = 0
     cutoff   = int(start.timestamp())
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect()
     try:
         today   = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         current = start
@@ -160,7 +160,7 @@ def backfill_rate_history():
     matches = pattern.findall(html)
     print(f'Found {len(matches)} EV-TOU-2 rate PDFs')
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = connect()
     imported = 0
 
     for url, label in matches:
@@ -224,7 +224,7 @@ def rebuild_costs():
     sys.path.insert(0, BASE_DIR)
     try:
         from server import rebuild_daily_costs
-        conn = sqlite3.connect(DB_PATH)
+        conn = connect()
         years = conn.execute(
             'SELECT DISTINCT CAST(strftime("%Y", datetime(timestamp, "unixepoch")) AS INTEGER) '
             'FROM readings ORDER BY 1'

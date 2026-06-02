@@ -126,6 +126,7 @@ def _network_state_to_list(state: dict) -> list[dict]:
             'last_ap': d.get('last_ap'),
             'last_signal': d.get('last_signal'),
             'last_iface': d.get('last_iface'),
+            'has_bans': bool(d.get('has_bans')),
             'first_seen': d.get('first_seen'),
             'last_seen': last_seen,
             'online': bool(last_seen and (now - last_seen) <= online_window),
@@ -189,6 +190,15 @@ def _apply_filter_ban_map(mac: str, desired: dict) -> dict:
         if ap_changed:
             with _network_state_lock:
                 _network_ap_quarantine.pop(ap_name, None)
+
+    # Persist ban state so the frontend can show the pin button even when
+    # last_ap is null (e.g. device is mid-reconnect after a ban change).
+    has_bans = any(bool(desired[r].get(ap)) for r in desired for ap in desired[r])
+    with _network_state_lock:
+        entry = _network_state.get(mac)
+        if entry is not None:
+            entry['has_bans'] = has_bans
+            _netdev.save_state(NETWORK_STATE_PATH, _network_state)
 
     return {'mac': mac, 'results': results,
             'all_ok': all(r.get('ok', True) for r in results)}

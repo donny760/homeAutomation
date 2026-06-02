@@ -1,12 +1,13 @@
 'use client';
 
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { usePolling } from '@/lib/usePolling';
 
 interface Switch {
   id: number;
   provider: 'kasa' | 'pool' | 'nest' | 'tuya' | 'abode';
   external_id: string;
-  kind: 'plug' | 'dimmer' | 'routine' | 'circuit' | 'thermostat' | 'alarm';
+  kind: 'plug' | 'dimmer' | 'routine' | 'circuit' | 'thermostat' | 'alarm' | 'sensor';
   name: string;
   room: string;
   sort_order: number;
@@ -28,6 +29,9 @@ interface Switch {
     // Abode alarm fields
     mode_display?: string;
     connected?: boolean;
+    // Tuya sensor fields
+    temp_f?: number | null;
+    battery_state?: string | null;
     [key: string]: unknown;
   };
 }
@@ -75,6 +79,39 @@ function AlarmTile({ sw, cls, onArmHome, onEdit }: AlarmTileProps) {
       <button className="switch-tile-gear" onClick={onEdit} aria-label="Edit">
         &#9881;
       </button>
+    </div>
+  );
+}
+
+interface SensorTileProps {
+  sw: Switch;
+  cls: string;
+  onEdit: () => void;
+}
+
+function SensorTile({ sw, cls, onEdit }: SensorTileProps) {
+  const temp    = sw.detail?.temp_f != null ? `${sw.detail.temp_f}°F` : '--';
+  const humid   = sw.detail?.humidity != null ? `${sw.detail.humidity}%` : '--';
+  const battery = sw.detail?.battery_state;
+  return (
+    <div className={cls}>
+      <span className="switch-tile-badge tuya">tuya</span>
+      <div className="thermostat-header">
+        <div>
+          <span className="switch-tile-icon" style={{ marginRight: 6 }}>{ICON.sensor}</span>
+          <span className="switch-tile-name" style={{ display: 'inline' }}>{sw.name}</span>
+        </div>
+        <div>
+          <span className="thermostat-ambient">{temp}</span>
+          <span className="thermostat-ambient-sub">{humid} RH</span>
+        </div>
+      </div>
+      {battery === 'low' && (
+        <div style={{ fontSize: '0.78rem', color: 'var(--amber)', marginTop: 4 }}>
+          &#9888; Low battery
+        </div>
+      )}
+      <button className="switch-tile-gear" onClick={onEdit} aria-label="Edit">&#9881;</button>
     </div>
   );
 }
@@ -255,6 +292,7 @@ const ICON: Record<Switch['kind'], string> = {
   circuit:    '\u{1F4A7}',  // 💧
   thermostat: '\u{1F321}',  // 🌡
   alarm:      '\u{1F6E1}',  // 🛡
+  sensor:     '\u{1F321}',  // 🌡
 };
 
 // Pool circuits get per-circuit icons since they're all kind='circuit'
@@ -313,7 +351,6 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
       return next;
     });
   }, []);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const brightnessTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
   const setpointTimers = useRef<Record<number, ReturnType<typeof setTimeout>>>({});
 
@@ -329,22 +366,10 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
   }, []);
 
   useEffect(() => {
-    if (!open) {
-      if (pollRef.current) {
-        clearInterval(pollRef.current);
-        pollRef.current = null;
-      }
-      setLocalBrightness({});
-      return;
-    }
-    setLoading(true);
-    load();
-    pollRef.current = setInterval(load, 10_000);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-      pollRef.current = null;
-    };
-  }, [open, load]);
+    if (!open) setLocalBrightness({});
+    else setLoading(true);
+  }, [open]);
+  usePolling(load, 10_000, open);
 
   useEffect(() => {
     if (!open) return;
@@ -665,6 +690,16 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
                           localSetpoint={localSetpoint[sw.id]}
                           onMode={(m) => setThermostatMode(sw.id, m)}
                           onSet={(which, value) => setSetpoint(sw.id, which, value)}
+                          onEdit={() => startEdit(sw)}
+                        />
+                      );
+                    }
+                    if (sw.kind === 'sensor' && editingId !== sw.id) {
+                      return (
+                        <SensorTile
+                          key={sw.id}
+                          sw={sw}
+                          cls={cls}
                           onEdit={() => startEdit(sw)}
                         />
                       );

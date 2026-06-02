@@ -80,9 +80,83 @@ def _seed_rate_history(conn):
     print(f'rate_history: seeded from rates.json (effective {eff_date})')
 
 
+def connect() -> sqlite3.Connection:
+    """Open a DB connection with WAL mode, 10s busy_timeout, and foreign_keys ON.
+    Use this everywhere instead of bare sqlite3.connect(DB_PATH)."""
+    conn = sqlite3.connect(state.DB_PATH, timeout=10)
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=10000')
+    conn.execute('PRAGMA foreign_keys = ON')
+    return conn
+
+
+# ── Default rules (seed data) ─────────────────────────────────────────────────
+DEFAULT_RULES = [
+    {'name': 'Midnight – Time-Based Control',
+     'days': [0,1,2,3,4,5,6], 'months': [1,2,3,4,5,6,7,8,9,10,11,12],
+     'hour': 0, 'minute': 0, 'mode': 'autonomous', 'reserve': None,
+     'grid_charging': None, 'grid_export': None},
+    {'name': 'Weekday 6am – Self-Powered reserve 10%',
+     'days': [0,1,2,3,4], 'months': [1,2,3,4,5,6,7,8,9,10,11,12],
+     'hour': 6, 'minute': 0, 'mode': 'self_consumption', 'reserve': 10,
+     'grid_charging': None, 'grid_export': None},
+    {'name': 'Weekend 2pm – Self-Powered reserve 10%',
+     'days': [5,6], 'months': [1,2,3,4,5,6,7,8,9,10,11,12],
+     'hour': 14, 'minute': 0, 'mode': 'self_consumption', 'reserve': 10,
+     'grid_charging': None, 'grid_export': None},
+    {'name': 'Mar/Apr 10am – Time-Based Control (super off-peak starts)',
+     'days': [0,1,2,3,4], 'months': [3,4],
+     'hour': 10, 'minute': 0, 'mode': 'autonomous', 'reserve': None,
+     'grid_charging': None, 'grid_export': None},
+    {'name': 'Mar/Apr 2pm – Self-Powered (super off-peak ends)',
+     'days': [0,1,2,3,4], 'months': [3,4],
+     'hour': 14, 'minute': 0, 'mode': 'self_consumption', 'reserve': None,
+     'grid_charging': None, 'grid_export': None},
+    {'name': 'Non-Mar/Apr Mon–Sat 4am – Backup + grid charge ON',
+     'days': [0,1,2,3,4,5], 'months': [1,2,5,6,7,8,9,10,11,12],
+     'hour': 4, 'minute': 0, 'mode': 'backup', 'reserve': None,
+     'grid_charging': True, 'grid_export': None},
+    {'name': 'Non-Mar/Apr 5am – Time-Based Control, reserve 20%, grid charge OFF',
+     'days': [0,1,2,3,4,5,6], 'months': [1,2,5,6,7,8,9,10,11,12],
+     'hour': 5, 'minute': 0, 'mode': 'autonomous', 'reserve': 20,
+     'grid_charging': False, 'grid_export': None},
+    {'name': 'Summer Mon–Fri+Sun 7:15pm – reserve 1%, export solar+battery',
+     'days': [0,1,2,3,4,6], 'months': [6,7,8,9,10,11],
+     'hour': 19, 'minute': 15, 'mode': None, 'reserve': 1,
+     'grid_charging': None, 'grid_export': 'battery_ok'},
+    {'name': 'Summer Mon–Fri+Sun 7:55pm – export solar only',
+     'days': [0,1,2,3,4,6], 'months': [6,7,8,9,10,11],
+     'hour': 19, 'minute': 55, 'mode': None, 'reserve': None,
+     'grid_charging': None, 'grid_export': 'pv_only'},
+    {'name': 'Summer Sat 7pm – reserve 1%, export solar+battery',
+     'days': [5], 'months': [6,7,8,9,10,11],
+     'hour': 19, 'minute': 0, 'mode': None, 'reserve': 1,
+     'grid_charging': None, 'grid_export': 'battery_ok'},
+    {'name': 'Summer Sat 9pm – export solar only',
+     'days': [5], 'months': [6,7,8,9,10,11],
+     'hour': 21, 'minute': 0, 'mode': None, 'reserve': None,
+     'grid_charging': None, 'grid_export': 'pv_only'},
+]
+
+
+def _seed_rules(conn):
+    """Insert default rules if rules table is empty."""
+    if conn.execute('SELECT COUNT(*) FROM rules').fetchone()[0] > 0:
+        return
+    logging.info('db: seeding %d default rules', len(DEFAULT_RULES))
+    for r in DEFAULT_RULES:
+        conn.execute(
+            'INSERT INTO rules (name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export) '
+            'VALUES (?,1,?,?,?,?,?,?,?,?)',
+            (r['name'], json.dumps(r['days']), json.dumps(r['months']),
+             r['hour'], r['minute'], r['mode'], r['reserve'],
+             None if r['grid_charging'] is None else (1 if r['grid_charging'] else 0),
+             r['grid_export']),
+        )
+    conn.commit()
+
+
 def init_db() -> None:
-    # Deferred imports to avoid circular deps at module load time
-    from rules import seed_default_rules as _seed_rules
     from lib.settings import _seed_settings
 
     with sqlite3.connect(state.DB_PATH) as c:
@@ -197,7 +271,7 @@ def init_db() -> None:
 
 
 def write_reading(solar_w, home_w, battery_w, grid_w, battery_pct) -> None:
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         c.execute(
             'INSERT OR IGNORE INTO readings VALUES (?,?,?,?,?,?)',
             (int(time.time()), solar_w, home_w, battery_w, grid_w, battery_pct)
@@ -210,7 +284,7 @@ def purge_old() -> None:
 
 
 def _fetch_rows(since_ts: int) -> list:
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         return c.execute(
             'SELECT timestamp, solar_w, home_w, battery_w, grid_w '
             'FROM readings WHERE timestamp >= ? ORDER BY timestamp',
@@ -219,7 +293,7 @@ def _fetch_rows(since_ts: int) -> list:
 
 
 def _fetch_rows_range(start_ts: int, end_ts: int) -> list:
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         return c.execute(
             'SELECT timestamp, solar_w, home_w, battery_w, grid_w '
             'FROM readings WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp',

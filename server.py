@@ -22,7 +22,6 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 from flask import Flask, jsonify, send_file, send_from_directory, request, redirect
 import pypowerwall
-from rules import seed_default_rules as _seed_rules
 from lib.fetch_rates import (
     load_rates, rates_are_stale, fetch_ev_tou2_rates,
     tou_period, load_or_generate_holidays, SDGE_HOLIDAYS,
@@ -31,7 +30,7 @@ from lib.fetch_rates import (
 )
 from lib.state import BASE_DIR, DB_PATH, _live, _lock
 from lib.db import (
-    init_db, write_reading, purge_old,
+    connect, init_db, write_reading, purge_old,
     _fetch_rows, _fetch_rows_range, today_rows, day_rows, month_rows,
 )
 from lib.settings import (
@@ -403,7 +402,7 @@ def api_debug_rachio_full():
 def api_schedule():
     with _lock:
         live = dict(_live)
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         rules = _load_all_rules(c)
     pw_events     = _upcoming_firings(rules)
     rachio_events = fetch_rachio_schedule()
@@ -417,7 +416,7 @@ def api_schedule():
 
 @app.route('/api/rules', methods=['GET'])
 def api_rules_get():
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         return jsonify(_load_all_rules(c))
 
 
@@ -433,7 +432,7 @@ def api_rules_post():
     months_j = json.dumps(body['months'])
     gc = body.get('grid_charging')
     gc_val = None if gc is None else (1 if gc else 0)
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         c.execute('PRAGMA foreign_keys = ON')
         max_order = c.execute('SELECT COALESCE(MAX(sort_order), 0) FROM rules').fetchone()[0]
         cur = c.execute(
@@ -469,7 +468,7 @@ def api_rules_put(rid):
     months_j = json.dumps(body['months'])
     gc = body.get('grid_charging')
     gc_val = None if gc is None else (1 if gc else 0)
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         c.execute('PRAGMA foreign_keys = ON')
         if not c.execute('SELECT 1 FROM rules WHERE id=?', (rid,)).fetchone():
             return jsonify({'error': 'not found'}), 404
@@ -497,7 +496,7 @@ def api_rules_put(rid):
 
 @app.route('/api/rules/<int:rid>', methods=['DELETE'])
 def api_rules_delete(rid):
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         c.execute('PRAGMA foreign_keys = ON')
         c.execute('DELETE FROM rules WHERE id=?', (rid,))
     _ai_cache['ts'] = 0
@@ -511,7 +510,7 @@ def api_rules_reorder():
     ids = body.get('ids') if body else None
     if not ids or not isinstance(ids, list):
         return jsonify({'error': 'ids list required'}), 400
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         for pos, rid in enumerate(ids):
             c.execute('UPDATE rules SET sort_order=? WHERE id=?', (pos, rid))
     _ai_cache['ts'] = 0
@@ -520,7 +519,7 @@ def api_rules_reorder():
 
 @app.route('/api/rules/<int:rid>/toggle', methods=['PUT'])
 def api_rules_toggle(rid):
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         if not c.execute('SELECT 1 FROM rules WHERE id=?', (rid,)).fetchone():
             return jsonify({'error': 'not found'}), 404
         c.execute('UPDATE rules SET enabled = 1 - enabled WHERE id=?', (rid,))
@@ -533,7 +532,7 @@ def api_rules_toggle(rid):
 
 @app.route('/api/rules/insights')
 def api_rules_insights():
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         rules = _load_all_rules(c)
     rates    = load_rates() or {}
     holidays = SDGE_HOLIDAYS
@@ -575,11 +574,12 @@ def api_rules_ai_insights():
                 _ai_cache['text'] = text
                 _ai_cache['model'] = gemini_model
                 _ai_cache['table'] = table_md
-                _ai_cache['optimized'] = opt_md
+                _ai_cache['optimized'] = opt_md if opt_md != table_md else None
                 _ai_cache['provider'] = 'gemini'
                 _ai_cache['ts'] = time.time()
                 return jsonify({'ok': True, 'insights': text, 'model': gemini_model,
-                                'projection_table': table_md, 'optimized_table': opt_md,
+                                'projection_table': table_md,
+                                'optimized_table': opt_md if opt_md != table_md else None,
                                 'provider': 'gemini'})
             except _ProviderError as exc:
                 last_err = str(exc)
@@ -605,12 +605,13 @@ def api_rules_ai_insights():
             _ai_cache['text'] = text
             _ai_cache['model'] = f'azure:{deployment}'
             _ai_cache['table'] = table_md
-            _ai_cache['optimized'] = opt_md
+            _ai_cache['optimized'] = opt_md if opt_md != table_md else None
             _ai_cache['provider'] = 'azure_openai'
             _ai_cache['ts'] = time.time()
             print(f'Gemini failed, Azure OpenAI ({deployment}) succeeded as fallback')
             return jsonify({'ok': True, 'insights': text, 'model': f'azure:{deployment}',
-                            'projection_table': table_md, 'optimized_table': opt_md,
+                            'projection_table': table_md,
+                            'optimized_table': opt_md if opt_md != table_md else None,
                             'provider': 'azure_openai'})
         except _ProviderError as exc:
             azure_err = f'Azure: {exc} (status {exc.status})'
@@ -706,7 +707,7 @@ def api_costs_ytd():
     year = date.today().year
     jan1 = f'{year}-01-01'
     today = date.today().isoformat()
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         row = c.execute(
             'SELECT SUM(import_kwh), SUM(export_kwh), '
             '       SUM(import_cost), SUM(export_credit) '
@@ -748,7 +749,7 @@ def api_costs_daily():
     if err: return err
     offset, err = _arg_int('offset', 0)
     if err: return err
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         # Total count for pagination
         total = c.execute(
             'SELECT COUNT(*) FROM daily_costs WHERE date >= ? AND date <= ?',
@@ -865,13 +866,13 @@ def api_debug_abode_backfill():
         pass
 
     # Check existing row count before
-    with sqlite3.connect(DB_PATH, timeout=10) as c:
+    with connect() as c:
         before = c.execute(
             "SELECT COUNT(*) FROM event_log WHERE system='abode'").fetchone()[0]
 
     inserted = abode_backfill(abode_mod._abode_instance, days=days)
 
-    with sqlite3.connect(DB_PATH, timeout=10) as c:
+    with connect() as c:
         after = c.execute(
             "SELECT COUNT(*) FROM event_log WHERE system='abode'").fetchone()[0]
 
@@ -880,7 +881,7 @@ def api_debug_abode_backfill():
     try:
         sample_ts = int(diag.get('api_sample', [{}])[0].get('event_utc', 0))
         sample_title = diag.get('api_sample', [{}])[0].get('event_name', '')
-        with sqlite3.connect(DB_PATH, timeout=10) as c:
+        with connect() as c:
             spot_check['ts'] = sample_ts
             spot_check['title'] = sample_title
             spot_check['exact_match'] = c.execute(
@@ -916,7 +917,7 @@ def api_debug_abode_backfill():
 @app.route('/api/debug/abode/dedup', methods=['POST'])
 def api_debug_abode_dedup():
     """Remove duplicate abode events from event_log."""
-    with sqlite3.connect(DB_PATH, timeout=30) as c:
+    with connect() as c:
         before = c.execute("SELECT COUNT(*) FROM event_log WHERE system='abode'").fetchone()[0]
         c.execute('''DELETE FROM event_log WHERE system='abode' AND id NOT IN (
             SELECT MIN(id) FROM event_log WHERE system='abode'
@@ -941,7 +942,7 @@ def api_debug_abode_test_event():
     ]
     evt, title = random.choice(samples)
     ts = int(time.time())
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         c.execute(
             'INSERT INTO event_log '
             '(ts, system, event_type, title, detail, result, source) '
@@ -1588,7 +1589,7 @@ def api_events():
     params.append(limit + 1)   # fetch one extra to detect has_more
     params.append(offset)
 
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         rows = c.execute(query, params).fetchall()
 
     has_more = len(rows) > limit
@@ -1790,7 +1791,7 @@ def api_settings():
 def api_settings_update():
     data = request.get_json() or {}
     valid_keys = set(_SETTINGS_DEFAULTS.keys())
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         for key, value in data.items():
             if key in valid_keys:
                 c.execute(

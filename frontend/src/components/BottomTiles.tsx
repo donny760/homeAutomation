@@ -270,6 +270,74 @@ function PoolTile() {
   );
 }
 
+// ── Temperature tile ──
+interface TempRow { label: string; temp_f: number | null; humidity: number | null; }
+
+function TemperatureTile() {
+  const [outside, setOutside] = useState<{ temp_f: number | null; humidity: number | null } | null>(null);
+  const [rows, setRows] = useState<TempRow[]>([]);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [wx, switches] = await Promise.all([
+        fetch('/api/weather').then((r) => r.json()),
+        fetch('/api/switches').then((r) => r.json()),
+      ]);
+      setOutside({ temp_f: wx.temp_f ?? null, humidity: wx.humidity ?? null });
+      const newRows: TempRow[] = [];
+      for (const sw of switches) {
+        if (sw.kind === 'thermostat' && sw.reachable) {
+          const label = sw.name.replace(/^Nest Thermostat\s*/i, '');
+          newRows.push({ label, temp_f: sw.detail?.ambient_f ?? null, humidity: sw.detail?.humidity ?? null });
+        }
+        if (sw.kind === 'sensor' && sw.reachable) {
+          newRows.push({ label: 'Attic', temp_f: sw.detail?.temp_f ?? null, humidity: sw.detail?.humidity ?? null });
+        }
+      }
+      setRows(newRows);
+    } catch (e) {
+      console.warn('Temperature tile:', e);
+    }
+  }, []);
+  usePolling(refresh, 60_000);
+
+  const fmt = (t: number | null) => t != null ? `${t}°` : '--';
+  const fmtH = (h: number | null) => h != null ? `${h}%` : '';
+  const tempColor = (t: number | null) =>
+    t == null ? undefined
+    : t >= 80  ? 'var(--amber)'
+    : t >= 68  ? undefined
+    : 'var(--blue)';
+
+  return (
+    <div className="tile">
+      <div className="tile-title">Temperature</div>
+      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: '5px', marginTop: '4px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+          <span style={{ fontSize: '0.82rem', color: 'var(--dim)' }}>Outside</span>
+          <span style={{ fontSize: '0.95rem', display: 'flex', gap: '6px', alignItems: 'baseline' }}>
+            <span className={outside?.temp_f == null ? 'tile-na' : ''} style={{ color: tempColor(outside?.temp_f ?? null) }}>{fmt(outside?.temp_f ?? null)}</span>
+            {outside?.humidity != null && (
+              <span style={{ fontSize: '0.75rem', color: 'var(--dim)' }}>{fmtH(outside.humidity)}</span>
+            )}
+          </span>
+        </div>
+        {rows.map((row) => (
+          <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
+            <span style={{ fontSize: '0.82rem', color: 'var(--dim)' }}>{row.label}</span>
+            <span style={{ fontSize: '0.95rem', display: 'flex', gap: '6px', alignItems: 'baseline' }}>
+              <span className={row.temp_f == null ? 'tile-na' : ''} style={{ color: tempColor(row.temp_f) }}>{fmt(row.temp_f)}</span>
+              {row.humidity != null && (
+                <span style={{ fontSize: '0.75rem', color: 'var(--dim)' }}>{fmtH(row.humidity)}</span>
+              )}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Security tile ──
 function SecurityTile() {
   const [d, setD] = useState<SecurityData | null>(null);
@@ -309,7 +377,7 @@ function SecurityTile() {
             : !hasIssues
               ? 'All secure'
               : issues.map((i, idx) => (
-                  <div key={idx}>{i.name} {i.type}</div>
+                  <div key={idx}>{i.name}</div>
                 ))}
         </div>
       </div>
@@ -322,6 +390,7 @@ export default function BottomTiles() {
     <div className="bottom-row">
       <EnergyYTDTile />
       <CurrentRateTile />
+      <TemperatureTile />
       <PoolTile />
       <SecurityTile />
     </div>

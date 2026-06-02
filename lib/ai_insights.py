@@ -11,6 +11,7 @@ from lib.settings import get_setting, get_setting_int, get_setting_bool, _load_t
 from lib.fetch_rates import load_rates, tou_period, SDGE_HOLIDAYS, holiday_name, is_sdge_holiday
 from lib.costs import _load_rate_history, _rate_for_date
 from lib.rule_helpers import _load_all_rules, _fmt_hour, _analyze_rules
+from lib.db import connect
 
 def _gemini_system_prompt(tou_periods=None):
     """Build the Gemini system prompt with TOU times derived from settings."""
@@ -128,6 +129,10 @@ The rules are the homeowner's deliberate automation design. Your job is to under
 what they do by reading the rules array — not to assume what they "should" do. Read
 rules in firing order (by hour/minute within each day-type) to understand daily behavior.
 
+Before recommending adding a rule that sets a mode or value, verify that an earlier
+rule hasn't already set the same value without a subsequent rule changing it back.
+Recommending a redundant rule creates confusion and must not be suggested.
+
 INFER the homeowner's strategy from the rules — do not impose a strategy. Common
 patterns you may see:
 - TBC (autonomous) during super off-peak: home draws ALL power from the grid at the cheapest
@@ -171,26 +176,29 @@ Instead, reference the numbers directly in your analysis (e.g., "June shows -$23
 Analyze:
 - Report the full-year projected Net with correct sign interpretation (positive = deficit,
   negative = credit).
-- **If Net is between -$500 and -$100 (projected credit in the $100-$500 target range),
-  explicitly state "the projection is within target" and do NOT frame this as a problem
-  requiring intervention.**
-- If Net is outside target (overshoot >$500 credit, undershoot <$100 credit, or deficit),
-  identify the main drivers.
+- Classify the full-year Net into exactly one bucket and state it clearly:
+  - **DEFICIT** (Net > 0): homeowner owes SDG&E at true-up. Flag clearly.
+  - **UNDERSHOOT** (-$100 < Net ≤ 0): credit below the $100 minimum; near-breakeven risk.
+    Do NOT call this "within target" — it's below the minimum goal.
+  - **WITHIN TARGET** (-$500 ≤ Net ≤ -$100): state "the projection is within target"
+    and do NOT frame this as a problem.
+  - **OVERSHOOT** (Net < -$500): credit exceeds SDG&E's payout cap; wasted energy. Flag.
 - Which months drive the most credit? Which are the biggest costs?
 - Flag real risks (data quality issues, unusual month patterns) — not hypothetical ones.
+- In one sentence, state what the projected months are based on. Use the
+  `projection_basis` in Data Quality Notes. Example: "July through December are
+  projected from last year's actual usage, scaled by X% to reflect this year's
+  home consumption pattern." If weights_source is 'default', note that the
+  import/export split is estimated, not measured.
 
 The table MUST appear before any rule change recommendations.
 
 **2. Seasonal transition impact**
 Based on the current season and when the next season starts:
-- Walk through what happens on a typical day in the upcoming season based on the
-  current rules — what mode is the system in at each key time of day? Describe this
-  in plain English (e.g., "Around 4:00 AM the battery charges from the grid...").
-  Do not quote rule names directly — describe what the system does, not which rule fires.
 - How will the season shift affect solar production, electricity rates, and the
   opportunity to sell power back to the grid?
-- What rule changes should be made BEFORE the transition?
-- Address the battery export window timing given longer summer daylight hours.
+- What rule changes, if any, should be made before the transition?
+- Address the battery export window timing if the season change affects daylight hours.
 
 **3. Rule review (not "optimization" by default)**
 **ONLY discuss rules where you have identified an actual issue — name-vs-value
@@ -279,13 +287,18 @@ values and cost figures from the data — no generic estimates.
 Do not repeat findings already listed in rule_based_insights.
 
 CRITICAL — Write for a homeowner, not an engineer:
-- Use plain English terms like "solar production", "grid imports", "battery level",
-  "on-peak credits" — NOT technical or code-like identifiers.
+- Use plain English terms: "solar production", "grid imports", "battery level",
+  "on-peak credits". Never use internal field names — not even in prose.
+  Banned terms: grid_charging, battery_ok, pv_only, autonomous, self_consumption,
+  optimized_identical, and any snake_case identifier.
+- Translate rule conditions to plain English: "if the battery is above 70%" not
+  "if battery % >= 70.0". Never copy condition strings verbatim from the rules data.
 - Use 12-hour time: "5:00 PM" — never "hour: 17" or "19:15".
+- Rate values: round to 2 decimal places ($0.78/kWh). Never cite 4+ decimal rates.
 - For rule recommendations: explain WHY the change helps and the expected dollar impact.
   Do NOT walk the user through how to create or edit a rule — they know how.
   Use actual times from the current rules and rate periods; never invent times.
-- Never output JSON, arrays, code blocks, underscore_identifiers, or field syntax in recommendations.
+- Never output JSON, arrays, code blocks, or field syntax in recommendations.
 - Use dollar amounts to justify every recommendation.
 
 Keep the total response focused — depth over breadth.
@@ -451,26 +464,32 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
             'import_kwh': row[1] or 0, 'export_kwh': row[2] or 0,
         }
 
-    # Home consumption ratio — only use months where both CY and PY have readings data.
-    # This prevents ratio explosion when CY is missing future months (e.g. Nov/Dec
-    # haven't happened yet) while PY has full-year data.
+    # Import ratio — compare this year's actual grid imports to prior year's for the
+    # same completed months. Uses daily_costs (not readings) so it captures real behavioral
+    # differences (rule changes, new EV charging patterns, etc.), not just home load.
+    # Only completed months (before current month) contribute.
     # Winter = Nov–May (SDG&E), summer = Jun–Oct.
     winter_months = {1, 2, 3, 4, 5, 11, 12}
     summer_months = {6, 7, 8, 9, 10}
 
-    def _ratio_for_season(months):
+    def _import_ratio_for_season(months):
         cy_tot = py_tot = 0.0
         for m in months:
-            cy_h = cy_power.get(m, {}).get('home_kwh', 0)
-            py_h = py_power.get(m, {}).get('home_kwh', 0)
-            if cy_h > 0 and py_h > 0:
-                cy_tot += cy_h
-                py_tot += py_h
-        return cy_tot / py_tot if py_tot > 0 else 1.0
+            if m >= now.month:
+                continue  # skip current and future months (partial data distorts ratio)
+            m_key = f'{this_year}-{m:02d}'
+            py_key = f'{prior_year}-{m:02d}'
+            cy_imp = cy_data.get(m_key, {}).get('import_kwh', 0)
+            py_imp = py_dc_data.get(py_key, {}).get('import_kwh', 0)
+            if cy_imp > 0 and py_imp > 0:
+                cy_tot += cy_imp
+                py_tot += py_imp
+        return min(cy_tot / py_tot, 2.0) if py_tot > 0 else 1.0  # cap at 2× to prevent outliers
 
-    winter_home_ratio = _ratio_for_season(winter_months)
-    raw_summer_ratio = _ratio_for_season(summer_months)
-    summer_home_ratio = raw_summer_ratio if raw_summer_ratio != 1.0 else min(winter_home_ratio, 1.10)
+    winter_home_ratio = _import_ratio_for_season(winter_months)
+    raw_summer_ratio = _import_ratio_for_season(summer_months)
+    # No summer CY data yet — fall back to winter ratio (same rules apply cross-season)
+    summer_home_ratio = raw_summer_ratio if raw_summer_ratio != 1.0 else winter_home_ratio
 
     # Rate periods
     rate_periods = c.execute(
@@ -574,19 +593,59 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
 
         if m_key in cy_data:
             d = cy_data[m_key]
-            # Use calendar days for complete past months; recorded days for current month
             is_current_month = (month_num == now.month and this_year == now.year)
-            base_days = d['days'] if is_current_month else days_in_month
-            baseline.append({
-                'month': m_key, 'label': 'actual',
-                'import_kwh': round(d['import_kwh'], 1),
-                'export_kwh': round(d['export_kwh'], 1),
-                'import_cost': round(d['import_cost'], 2),
-                'export_credit': round(d['export_credit'], 2),
-                'base_charge': round(month_base_per_day * base_days, 2),
-                'net': round(d['import_cost'] - d['export_credit']
-                             + month_base_per_day * base_days, 2),
-            })
+            remaining_days = days_in_month - d['days'] if is_current_month else 0
+
+            if not is_current_month or remaining_days <= 0:
+                # Complete past month or fully-recorded current month
+                base_days = d['days'] if is_current_month else days_in_month
+                baseline.append({
+                    'month': m_key, 'label': 'actual',
+                    'import_kwh': round(d['import_kwh'], 1),
+                    'export_kwh': round(d['export_kwh'], 1),
+                    'import_cost': round(d['import_cost'], 2),
+                    'export_credit': round(d['export_credit'], 2),
+                    'base_charge': round(month_base_per_day * base_days, 2),
+                    'net': round(d['import_cost'] - d['export_credit'], 2),
+                })
+            else:
+                # Current month: blend actual days + project remaining days
+                py_key = f'{prior_year}-{month_num:02d}'
+                py_dc = py_dc_data.get(py_key, {'import_kwh': 0, 'export_kwh': 0})
+                py_days_in_month = calendar.monthrange(prior_year, month_num)[1]
+
+                if py_dc.get('import_kwh', 0) > 0 and py_days_in_month > 0:
+                    scale = summer_home_ratio if is_summer else winter_home_ratio
+                    daily_imp = py_dc['import_kwh'] / py_days_in_month * scale
+                    daily_exp = py_dc['export_kwh'] / py_days_in_month
+                elif d['days'] > 0:
+                    daily_imp = d['import_kwh'] / d['days']
+                    daily_exp = d['export_kwh'] / d['days']
+                else:
+                    daily_imp = daily_exp = 0
+
+                r = month_rates or rates
+                season = 'summer' if is_summer else 'winter'
+                w = period_weights[season]
+                avg_imp_rate = sum(r[f'{season}_{p}'] * w['import'][p] for p in _PERIODS)
+                avg_exp_rate = sum(r[f'{season}_{p}'] * w['export'][p] for p in _PERIODS)
+
+                proj_imp_kwh = daily_imp * remaining_days
+                proj_exp_kwh = daily_exp * remaining_days
+                total_imp_kwh = d['import_kwh'] + proj_imp_kwh
+                total_exp_kwh = d['export_kwh'] + proj_exp_kwh
+                total_imp_cost = d['import_cost'] + proj_imp_kwh * avg_imp_rate
+                total_exp_credit = d['export_credit'] + proj_exp_kwh * avg_exp_rate
+
+                baseline.append({
+                    'month': m_key, 'label': 'partial',
+                    'import_kwh': round(total_imp_kwh, 1),
+                    'export_kwh': round(total_exp_kwh, 1),
+                    'import_cost': round(total_imp_cost, 2),
+                    'export_credit': round(total_exp_credit, 2),
+                    'base_charge': round(month_base_per_day * days_in_month, 2),
+                    'net': round(total_imp_cost - total_exp_credit, 2),
+                })
             actual_months.append(m_key)
         else:
             # Use prior year's actual import/export from daily_costs as the baseline
@@ -613,7 +672,7 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
 
             proj_imp_cost = round(proj_imp_kwh * avg_imp_rate, 2)
             proj_exp_credit = round(proj_exp_kwh * avg_exp_rate, 2)
-            net = round(proj_imp_cost - proj_exp_credit + base_charge, 2)
+            net = round(proj_imp_cost - proj_exp_credit, 2)
 
             baseline.append({
                 'month': m_key, 'label': 'projected',
@@ -708,7 +767,7 @@ def _build_trueup_projection(c, rates, base_charge_per_day):
             new_exp_kwh = bp['export_kwh'] + add_export_kwh
             new_imp_cost = round(bp['import_cost'] + charge_cost, 2)
             new_exp_credit = round(bp['export_credit'] + credit_gain, 2)
-            new_net = round(new_imp_cost - new_exp_credit + bp['base_charge'], 2)
+            new_net = round(new_imp_cost - new_exp_credit, 2)
 
             optimized.append({
                 'month': bp['month'], 'label': 'optimized',
@@ -778,7 +837,7 @@ def _build_ai_context():
     rates = load_rates() or {}
     holidays = sorted(d.isoformat() for d in SDGE_HOLIDAYS if d >= today)
 
-    with sqlite3.connect(DB_PATH) as c:
+    with connect() as c:
         rules = _load_all_rules(c)
 
         # Current year monthly summaries

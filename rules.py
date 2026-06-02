@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 from lib.fetch_rates import is_sdge_holiday, holiday_name
+from lib.db import init_db
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PW_EMAIL      = 'don@nsdsolutions.com'
@@ -41,142 +42,6 @@ logging.basicConfig(
 )
 log = logging.getLogger('rules')
 
-# ── Default rules (v1 seed data) ─────────────────────────────────────────────
-# days: JSON array of weekday ints (0=Mon … 6=Sun)
-# months: JSON array of month ints (1–12)
-DEFAULT_RULES = [
-    {
-        'name': 'Midnight – Time-Based Control',
-        'days': [0,1,2,3,4,5,6], 'months': [1,2,3,4,5,6,7,8,9,10,11,12],
-        'hour': 0, 'minute': 0,
-        'mode': 'autonomous', 'reserve': None,
-        'grid_charging': None, 'grid_export': None,
-    },
-    {
-        'name': 'Weekday 6am – Self-Powered reserve 10%',
-        'days': [0,1,2,3,4], 'months': [1,2,3,4,5,6,7,8,9,10,11,12],
-        'hour': 6, 'minute': 0,
-        'mode': 'self_consumption', 'reserve': 10,
-        'grid_charging': None, 'grid_export': None,
-    },
-    {
-        'name': 'Weekend 2pm – Self-Powered reserve 10%',
-        'days': [5,6], 'months': [1,2,3,4,5,6,7,8,9,10,11,12],
-        'hour': 14, 'minute': 0,
-        'mode': 'self_consumption', 'reserve': 10,
-        'grid_charging': None, 'grid_export': None,
-    },
-    {
-        'name': 'Mar/Apr 10am – Time-Based Control (super off-peak starts)',
-        'days': [0,1,2,3,4], 'months': [3,4],
-        'hour': 10, 'minute': 0,
-        'mode': 'autonomous', 'reserve': None,
-        'grid_charging': None, 'grid_export': None,
-    },
-    {
-        'name': 'Mar/Apr 2pm – Self-Powered (super off-peak ends)',
-        'days': [0,1,2,3,4], 'months': [3,4],
-        'hour': 14, 'minute': 0,
-        'mode': 'self_consumption', 'reserve': None,
-        'grid_charging': None, 'grid_export': None,
-    },
-    {
-        'name': 'Non-Mar/Apr Mon–Sat 4am – Backup + grid charge ON',
-        'days': [0,1,2,3,4,5], 'months': [1,2,5,6,7,8,9,10,11,12],
-        'hour': 4, 'minute': 0,
-        'mode': 'backup', 'reserve': None,
-        'grid_charging': True, 'grid_export': None,
-    },
-    {
-        'name': 'Non-Mar/Apr 5am – Time-Based Control, reserve 20%, grid charge OFF',
-        'days': [0,1,2,3,4,5,6], 'months': [1,2,5,6,7,8,9,10,11,12],
-        'hour': 5, 'minute': 0,
-        'mode': 'autonomous', 'reserve': 20,
-        'grid_charging': False, 'grid_export': None,
-    },
-    {
-        'name': 'Summer Mon–Fri+Sun 7:15pm – reserve 1%, export solar+battery',
-        'days': [0,1,2,3,4,6], 'months': [6,7,8,9,10,11],
-        'hour': 19, 'minute': 15,
-        'mode': None, 'reserve': 1,
-        'grid_charging': None, 'grid_export': 'battery_ok',
-    },
-    {
-        'name': 'Summer Mon–Fri+Sun 7:55pm – export solar only',
-        'days': [0,1,2,3,4,6], 'months': [6,7,8,9,10,11],
-        'hour': 19, 'minute': 55,
-        'mode': None, 'reserve': None,
-        'grid_charging': None, 'grid_export': 'pv_only',
-    },
-    {
-        'name': 'Summer Sat 7pm – reserve 1%, export solar+battery',
-        'days': [5], 'months': [6,7,8,9,10,11],
-        'hour': 19, 'minute': 0,
-        'mode': None, 'reserve': 1,
-        'grid_charging': None, 'grid_export': 'battery_ok',
-    },
-    {
-        'name': 'Summer Sat 9pm – export solar only',
-        'days': [5], 'months': [6,7,8,9,10,11],
-        'hour': 21, 'minute': 0,
-        'mode': None, 'reserve': None,
-        'grid_charging': None, 'grid_export': 'pv_only',
-    },
-]
-
-
-# ── Database helpers ──────────────────────────────────────────────────────────
-def init_db(conn):
-    conn.executescript('''
-        CREATE TABLE IF NOT EXISTS readings (
-            timestamp   INTEGER PRIMARY KEY,
-            solar_w     REAL,
-            home_w      REAL,
-            battery_w   REAL,
-            grid_w      REAL,
-            battery_pct REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_ts ON readings(timestamp);
-
-        CREATE TABLE IF NOT EXISTS rules (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            name          TEXT NOT NULL,
-            enabled       INTEGER NOT NULL DEFAULT 1,
-            days          TEXT NOT NULL,
-            months        TEXT NOT NULL,
-            hour          INTEGER NOT NULL,
-            minute        INTEGER NOT NULL,
-            mode          TEXT,
-            reserve       INTEGER,
-            grid_charging INTEGER,
-            grid_export   TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS rule_conditions (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            rule_id   INTEGER NOT NULL REFERENCES rules(id) ON DELETE CASCADE,
-            logic     TEXT NOT NULL DEFAULT 'AND',
-            type      TEXT NOT NULL,
-            operator  TEXT NOT NULL,
-            value     REAL NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS event_log (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts          INTEGER NOT NULL,
-            system      TEXT NOT NULL,
-            event_type  TEXT NOT NULL,
-            title       TEXT NOT NULL,
-            detail      TEXT,
-            result      TEXT,
-            source      TEXT DEFAULT 'live',
-            battery_pct REAL
-        );
-        CREATE INDEX IF NOT EXISTS idx_event_log_ts     ON event_log(ts);
-        CREATE INDEX IF NOT EXISTS idx_event_log_system ON event_log(system);
-    ''')
-    conn.commit()
-
 
 def log_event(conn, system, event_type, title, detail=None,
               result=None, source='live', battery_pct=None):
@@ -188,30 +53,6 @@ def log_event(conn, system, event_type, title, detail=None,
          detail, result, source, battery_pct)
     )
     conn.commit()
-
-
-def seed_default_rules(conn):
-    """Insert v1 rules if rules table is empty."""
-    count = conn.execute('SELECT COUNT(*) FROM rules').fetchone()[0]
-    if count > 0:
-        return
-    log.info('Seeding default rules into DB…')
-    for r in DEFAULT_RULES:
-        conn.execute(
-            'INSERT INTO rules (name,enabled,days,months,hour,minute,mode,reserve,grid_charging,grid_export) '
-            'VALUES (?,1,?,?,?,?,?,?,?,?)',
-            (
-                r['name'],
-                json.dumps(r['days']),
-                json.dumps(r['months']),
-                r['hour'], r['minute'],
-                r['mode'], r['reserve'],
-                None if r['grid_charging'] is None else (1 if r['grid_charging'] else 0),
-                r['grid_export'],
-            )
-        )
-    conn.commit()
-    log.info('Seeded %d default rules.', len(DEFAULT_RULES))
 
 
 def load_rules_from_db(conn) -> list:
@@ -465,13 +306,13 @@ def main_loop(stop_fn=None):
     conn.execute('PRAGMA journal_mode=WAL')
     conn.execute('PRAGMA busy_timeout=10000')
     conn.execute('PRAGMA foreign_keys = ON')
-    init_db(conn)
-    seed_default_rules(conn)
+    init_db()  # lib/db handles schema + seeding via its own connection
 
-    pw         = None
-    last_eval  = 0.0
-    last_state = {}
-    last_holiday_logged = None   # date — log holiday override once per day
+    pw               = None
+    last_eval        = 0.0
+    last_state       = {}
+    pw_retry_after   = 0.0   # epoch — don't call apply_settings until this time
+    last_holiday_logged = None
     last_nxt         = None
     last_state_sig   = None
     cond_cache: dict = {}  # {(rule_id, fire_dt_iso): bool} — conditions evaluated once at fire time
@@ -540,13 +381,18 @@ def main_loop(stop_fn=None):
             except Exception as exc:
                 log.exception('Evaluation error: %s: %s', type(exc).__name__, exc)
 
-            if target is not None:
+            if target is not None and now >= pw_retry_after:
                 try:
                     apply_settings(pw, target, last_state,
                                    conn=conn, battery_pct=live.get('battery_pct'))
                 except Exception as exc:
-                    log.error('Powerwall apply error: %s — reconnecting', exc)
-                    pw = None
+                    if '429' in str(exc):
+                        pw_retry_after = now + 300
+                        log.warning('Tesla rate limit (429) — pausing apply for 5 min')
+                    else:
+                        log.error('Powerwall apply error: %s — reconnecting', exc)
+                        pw = None
+                        pw_retry_after = now + 60
 
         time.sleep(LOOP_SLEEP)
 

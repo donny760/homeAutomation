@@ -6,6 +6,7 @@ import time
 import lib.state as state
 from lib.events import _log_system_error
 from lib.settings import get_setting_bool, get_setting_int
+from lib.db import connect
 
 
 ABODE_EMAIL    = os.environ.get('ABODE_EMAIL', '')
@@ -75,7 +76,7 @@ def _abode_write_event(event):
         raw_ts = _abode_event_val(event, 'event_utc')
         ts = int(raw_ts) if raw_ts else int(time.time())
 
-        with sqlite3.connect(state.DB_PATH, timeout=10) as c:
+        with connect() as c:
             c.execute(
                 'INSERT OR IGNORE INTO event_log '
                 '(ts, system, event_type, title, detail, result, source) '
@@ -136,7 +137,7 @@ def abode_backfill(abode, days=30):
             if oldest_ts is not None and oldest_ts < cutoff:
                 break
             page += 1
-        with sqlite3.connect(state.DB_PATH, timeout=30) as c:
+        with connect() as c:
             existing = set(
                 (r[0], r[1]) for r in c.execute(
                     'SELECT ts, title FROM event_log WHERE system = ?', ('abode',)
@@ -292,7 +293,7 @@ def fetch_security() -> dict:
 
 
 def _abode_seed_alarm_row() -> int:
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         row = c.execute(
             'SELECT id FROM switches_meta WHERE provider=? AND external_id=?',
             ('abode', 'alarm')

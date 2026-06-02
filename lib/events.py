@@ -3,6 +3,7 @@ import threading
 import time
 
 import lib.state as state
+from lib.db import connect
 
 
 _switches_lock = threading.Lock()
@@ -22,7 +23,7 @@ _HOME_CONTROL_TITLE_SUFFIX = {
 
 def _log_system_error(system: str, title: str, detail: str = None) -> None:
     try:
-        with sqlite3.connect(state.DB_PATH) as c:
+        with connect() as c:
             c.execute(
                 'INSERT INTO event_log '
                 '(ts, system, event_type, title, detail, result, source) '
@@ -35,7 +36,7 @@ def _log_system_error(system: str, title: str, detail: str = None) -> None:
 
 def _log_success(system: str, event_type: str, title: str, detail: str = None) -> None:
     try:
-        with sqlite3.connect(state.DB_PATH) as c:
+        with connect() as c:
             c.execute(
                 'INSERT INTO event_log '
                 '(ts, system, event_type, title, detail, result, source) '
@@ -56,7 +57,7 @@ def _switches_log_event(provider: str, event_type: str, title: str, detail: str 
     suffix = _HOME_CONTROL_TITLE_SUFFIX.get(event_type)
     composed_title = f'{title} {suffix}' if suffix else title
     try:
-        with sqlite3.connect(state.DB_PATH) as c:
+        with connect() as c:
             c.execute(
                 'INSERT INTO event_log (ts, system, event_type, title, detail, result, source) '
                 'VALUES (?,?,?,?,?,?,?)',

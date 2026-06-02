@@ -5,6 +5,7 @@ import urllib.request
 from datetime import datetime, date, timedelta
 
 import lib.state as state
+from lib.db import connect
 
 
 _sf_cache: dict  = {}
@@ -18,7 +19,7 @@ PEAK_RAD_WM2 = 950.0
 def _peak_solar_w() -> float:
     cutoff = int((datetime.combine(date.today(), datetime.min.time())
                   - timedelta(days=14)).timestamp())
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         row = c.execute('SELECT MAX(solar_w) FROM readings WHERE timestamp >= ?',
                         (cutoff,)).fetchone()
     return float(row[0]) if row and row[0] else 8100.0
@@ -118,7 +119,7 @@ def fetch_tomorrow_solar_forecast() -> dict:
         _stf_ts = time.time()
 
         try:
-            with sqlite3.connect(state.DB_PATH) as c:
+            with connect() as c:
                 c.execute(
                     "INSERT OR REPLACE INTO settings (key, value) VALUES ('tomorrow_solar_kwh', ?)",
                     (str(total_kwh),)

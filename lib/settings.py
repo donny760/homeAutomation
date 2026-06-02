@@ -3,6 +3,7 @@ import os
 import sqlite3
 
 import lib.state as state
+from lib.db import connect
 
 
 _SETTINGS_DEFAULTS = {
@@ -70,6 +71,10 @@ _SETTINGS_DEFAULTS = {
     'pool_control_enabled':        '0',
     'tuya_enabled':                '0',
     'tuya_poll_interval':          '15',
+    'tuya_api_key':                '',
+    'tuya_api_secret':             '',
+    'tuya_region':                 'us',
+    'tuya_cloud_poll_interval':    '300',
     'network_enabled':             '0',
     'network_poll_interval':       '60',
     'network_router_url':          '',
@@ -93,13 +98,13 @@ def _seed_settings(conn):
 
 
 def load_settings() -> dict:
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         rows = c.execute('SELECT key, value FROM settings').fetchall()
     return {k: v for k, v in rows}
 
 
 def get_setting(key: str, default=None):
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         row = c.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
     return row[0] if row else default
 

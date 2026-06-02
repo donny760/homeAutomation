@@ -8,6 +8,7 @@ import requests as _requests
 import lib.state as state
 from lib.events import _log_system_error
 from lib.settings import get_setting, get_setting_bool, get_setting_int
+from lib.db import connect
 
 
 _nest_event_ts: float   = 0.0
@@ -61,7 +62,7 @@ def _nest_save_tokens(tokens: dict, *, save_refresh: bool) -> None:
     ]
     if save_refresh:
         rows.append(('nest_refresh_token', tokens.get('refresh_token', '')))
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         c.executemany(
             'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', rows
         )
@@ -159,7 +160,7 @@ def _nest_refresh_devices(token):
         _nest_thermostats = thermostats
         _nest_devices_ts = time.time()
         if thermostats:
-            with sqlite3.connect(state.DB_PATH) as c:
+            with connect() as c:
                 for dev_path, info in thermostats.items():
                     new_name = info['display_name']
                     row = c.execute(
@@ -348,7 +349,7 @@ def fetch_nest_events() -> int:
                 continue
 
         if rows:
-            with sqlite3.connect(state.DB_PATH, timeout=30) as c:
+            with connect() as c:
                 existing = set(
                     c.execute(
                         'SELECT ts, title FROM event_log WHERE system = ?', ('nest',)

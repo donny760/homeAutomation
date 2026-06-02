@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import NetworkPinModal from './NetworkPinModal';
 import { usePolling } from '@/lib/usePolling';
+import { relativeTime } from '@/lib/format';
 
 interface Device {
   mac: string;
@@ -16,6 +17,7 @@ interface Device {
   last_ap: string | null;
   last_signal: number | null;
   last_iface: string | null;
+  has_bans: boolean;
   first_seen: number | null;
   last_seen: number | null;
   online: boolean;
@@ -36,14 +38,6 @@ interface NetworkDevicesProps {
   isActive: boolean;
 }
 
-function relativeTime(ts: number | null): string {
-  if (!ts) return '—';
-  const diff = Math.floor(Date.now() / 1000 - ts);
-  if (diff < 60) return `${diff}s ago`;
-  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
-  return `${Math.floor(diff / 86400)}d ago`;
-}
 
 function shortDate(ts: number | null): string {
   if (!ts) return '—';
@@ -356,13 +350,14 @@ export default function NetworkDevices({ isActive }: NetworkDevicesProps) {
                     {relativeTime(d.last_seen)}
                   </td>
                   <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}>
-                    {wireless && (
+                    {(wireless || d.has_bans) && (
                       <button
                         onClick={() => setPinDevice(d)}
-                        title="Pin to AP / band"
+                        title={wireless ? 'Pin to AP / band' : 'Manage AP bans'}
                         style={{
                           background: 'none', border: 'none', cursor: 'pointer',
-                          fontSize: 14, padding: '2px 6px', color: 'var(--dim)',
+                          fontSize: 14, padding: '2px 6px',
+                          color: wireless ? 'var(--dim)' : 'var(--muted, #555)',
                         }}
                       >
                         📌

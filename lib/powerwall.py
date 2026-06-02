@@ -10,7 +10,7 @@ import pypowerwall
 from lib.state import BASE_DIR, DB_PATH, _live, _lock
 from lib.settings import get_setting, get_setting_int, get_setting_bool
 from lib.events import _log_system_error, _log_success
-from lib.db import write_reading, purge_old
+from lib.db import write_reading, purge_old, connect
 from lib.costs import _spawn_rebuild_daily_costs, _rebuild_today, _is_refresh_due, _read_year_from_json
 from lib.fetch_rates import (
     load_or_generate_holidays, HOLIDAYS_PATH, RATES_PATH, fetch_ev_tou2_rates,
@@ -21,7 +21,7 @@ from lib.pool import fetch_pool, POOL_POLL_INTERVAL
 import lib.kasa as kasa
 from lib.kasa import _kasa_refresh_devices, _kasa_poll_state
 import lib.tuya as tuya
-from lib.tuya import _tuya_refresh_devices, _tuya_poll_state
+from lib.tuya import _tuya_refresh_devices, _tuya_poll_state, _tuya_cloud_poll_sensors
 
 PW_EMAIL      = 'don@nsdsolutions.com'
 POLL_INTERVAL = 10   # seconds between pypowerwall polls
@@ -67,7 +67,7 @@ def backfill_history() -> None:
 
         cutoff = int(start_utc.timestamp())
         inserted = 0
-        with sqlite3.connect(DB_PATH) as c:
+        with connect() as c:
             for row in series:
                 raw_ts = row.get('timestamp', '')
                 try:
@@ -113,7 +113,8 @@ def poller() -> None:
     last_nest_event_poll = 0
     last_pool_poll = 0
     last_kasa_poll = 0
-    last_tuya_poll = 0
+    last_tuya_poll       = 0
+    last_tuya_cloud_poll = 0
 
     while True:
         poll_interval = get_setting_int('powerwall_poll_interval', POLL_INTERVAL)
@@ -312,6 +313,17 @@ def poller() -> None:
                         print(f'Tuya poll error: {exc}')
                         _log_system_error('tuya', 'State poll error', str(exc))
                 last_tuya_poll = now
+
+            # Tuya cloud polling for battery sensors (wsdcg)
+            tuya_cloud_interval = get_setting_int('tuya_cloud_poll_interval', 300)
+            if now - last_tuya_cloud_poll >= tuya_cloud_interval:
+                if get_setting_bool('tuya_enabled', False):
+                    try:
+                        _tuya_cloud_poll_sensors()
+                    except Exception as exc:
+                        print(f'Tuya cloud poll error: {exc}')
+                        _log_system_error('tuya', 'Cloud poll error', str(exc))
+                    last_tuya_cloud_poll = now
 
         except Exception as exc:
             print(f'Poller error: {type(exc).__name__}: {exc}')

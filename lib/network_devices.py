@@ -1127,7 +1127,9 @@ def merge_by_mac(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                   'ssdp_server', 'ssdp_location', 'iface'):
             if r.get(k) and not cur.get(k):
                 cur[k] = r[k]
-        if r.get('ap'):
+        # Only take ap from wireless client list entries (they have iface set).
+        # ARP table records set ap=ap_name but have no iface — ignore those.
+        if r.get('ap') and r.get('iface'):
             cur['ap'] = r['ap']
         if r.get('signal') is not None:
             cur['signal'] = r['signal']

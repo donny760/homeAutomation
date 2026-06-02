@@ -13,6 +13,7 @@ from lib.tuya import tuya_set, _tuya_refresh_devices
 from lib.abode import ABODE_MODE_DISPLAY, _abode_seed_alarm_row
 from lib.nest import nest_set_thermostat, _nest_ensure_token, _nest_refresh_devices, _c_to_f
 from lib.pool import POOL_EXT_TO_FIELD, _pool_discover_circuits, pool_set_circuit
+from lib.db import connect
 
 
 def _switches_rediscover_all() -> dict:
@@ -37,7 +38,7 @@ def _switches_rediscover_all() -> dict:
 def _get_all_switches() -> list:
     """Return merged switch list with DB metadata + live state per provider."""
     out = []
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         rows = c.execute(
             'SELECT id, provider, external_id, kind, name, room, sort_order, hidden '
             'FROM switches_meta ORDER BY room, sort_order, name'
@@ -88,9 +89,20 @@ def _get_all_switches() -> list:
             else:
                 dev_id, dp_idx = tuya._parse_tuya_ext_id(ext_id)
                 info = tuya._tuya_devices.get(dev_id)
-                if info is None or not info.get('ip'):
+                if info is None:
                     reachable = False
                     sw_state = None
+                elif kind == 'sensor':
+                    readings  = info.get('sensor_readings') or {}
+                    reachable = bool(readings)
+                    temp_c    = readings.get('temp_c')
+                    temp_f    = round(temp_c * 9 / 5 + 32, 1) if temp_c is not None else None
+                    detail = {
+                        'temp_f':        temp_f,
+                        'humidity':      readings.get('humidity'),
+                        'battery_state': readings.get('battery_state'),
+                        'online':        info.get('online', True),
+                    }
                 else:
                     dps = info.get('dp_state') or {}
                     val = dps.get(dp_idx)
@@ -138,7 +150,7 @@ def _get_all_switches() -> list:
 
 
 def _switches_lookup(row_id: int):
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         row = c.execute(
             'SELECT id, provider, external_id, kind, name FROM switches_meta WHERE id=?',
             (row_id,)
@@ -282,7 +294,7 @@ def switch_update_meta(row_id: int, fields: dict) -> dict:
             return {'error': 'sort_order must be int', 'code': 400}
     sets = ', '.join(f'{k}=?' for k in updates)
     vals = list(updates.values()) + [row_id]
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         cur = c.execute(f'UPDATE switches_meta SET {sets} WHERE id=?', vals)
         if cur.rowcount == 0:
             return {'error': 'not found', 'code': 404}

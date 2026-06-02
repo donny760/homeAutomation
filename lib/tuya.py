@@ -5,6 +5,8 @@ import time
 
 import lib.state as state
 from lib.events import _log_system_error, _device_mark_failure, _switches_lock
+from lib.db import connect
+from lib.settings import get_setting
 
 
 _TUYA_DEVICEFILE = os.path.join(state.BASE_DIR, 'devices.json')
@@ -79,7 +81,7 @@ def _tuya_close_all() -> None:
 
 def _log_tuya_reachability(name: str, event: str, detail: str = None) -> None:
     try:
-        with sqlite3.connect(state.DB_PATH) as c:
+        with connect() as c:
             c.execute(
                 'INSERT INTO event_log '
                 '(ts, system, event_type, title, detail, result, source) '
@@ -172,6 +174,9 @@ def _tuya_refresh_devices() -> int:
         }
 
     for dev_id, info in new.items():
+        if info.get('category') == 'wsdcg':
+            info['switch_dps'] = []  # sensor — no controllable DPs
+            continue
         if not info.get('ip'):
             continue
         dps = _tuya_probe_dps(dev_id, info)
@@ -190,8 +195,21 @@ def _tuya_refresh_devices() -> int:
         _tuya_ts = time.time()
 
     total_tiles = 0
-    with sqlite3.connect(state.DB_PATH) as c:
+    with connect() as c:
         for dev_id, info in new.items():
+            if info.get('category') == 'wsdcg':
+                ext_id = f'{dev_id}:sensor'
+                if not c.execute(
+                    'SELECT id FROM switches_meta WHERE provider=? AND external_id=?',
+                    ('tuya', ext_id)
+                ).fetchone():
+                    c.execute(
+                        'INSERT INTO switches_meta (provider, external_id, kind, name) '
+                        'VALUES (?,?,?,?)',
+                        ('tuya', ext_id, 'sensor', info['name'])
+                    )
+                total_tiles += 1
+                continue
             dps_list = info['switch_dps']
             for idx, dp_idx in enumerate(dps_list):
                 ext_id = f'{dev_id}:{dp_idx}'
@@ -243,9 +261,62 @@ def _tuya_poll_state() -> None:
             info['last_seen']   = time.time()
             info['online']      = True
             _tuya_failures.pop(dev_id, None)
+            if info.get('category') == 'wsdcg':
+                temp_raw = dps.get('va_temperature') or dps.get('2')
+                hum_raw  = dps.get('va_humidity')    or dps.get('3')
+                info['sensor_readings'] = {
+                    'temp_c':       (temp_raw / 10.0) if isinstance(temp_raw, (int, float)) else None,
+                    'humidity':     hum_raw if isinstance(hum_raw, (int, float)) else None,
+                    'battery_state': dps.get('battery_state') or dps.get('14'),
+                }
         except Exception as exc:
             _tuya_close_connection(dev_id)
             _tuya_mark_failure(dev_id, name, str(exc))
+
+
+def _tuya_cloud_poll_sensors() -> None:
+    """Fetch latest readings for wsdcg sensors from Tuya cloud."""
+    sensor_ids = [
+        dev_id for dev_id, info in _tuya_devices.items()
+        if info.get('category') == 'wsdcg'
+    ]
+    if not sensor_ids:
+        return
+
+    api_key    = get_setting('tuya_api_key', '')
+    api_secret = get_setting('tuya_api_secret', '')
+    region     = get_setting('tuya_region', 'us')
+    if not api_key or not api_secret:
+        print('Tuya cloud poll: no API credentials configured')
+        return
+
+    import tinytuya
+    cloud = tinytuya.Cloud(apiRegion=region, apiKey=api_key, apiSecret=api_secret)
+
+    for dev_id in sensor_ids:
+        info = _tuya_devices.get(dev_id)
+        if not info:
+            continue
+        name = info.get('name') or f'Tuya {dev_id[-5:]}'
+        try:
+            result = cloud.getstatus(dev_id)
+            if not isinstance(result, dict) or not result.get('success'):
+                print(f'Tuya cloud poll error for {name}: {result}')
+                continue
+            dps = {item['code']: item['value'] for item in result.get('result', [])}
+            temp_raw = dps.get('va_temperature')
+            hum_raw  = dps.get('va_humidity')
+            with _switches_lock:
+                info['sensor_readings'] = {
+                    'temp_c':        (temp_raw / 10.0) if isinstance(temp_raw, (int, float)) else None,
+                    'humidity':      hum_raw if isinstance(hum_raw, (int, float)) else None,
+                    'battery_state': dps.get('battery_state'),
+                }
+                info['online']    = True
+                info['last_seen'] = time.time()
+        except Exception as exc:
+            print(f'Tuya cloud poll error for {name}: {exc}')
+            _log_system_error('tuya', f'Cloud poll error: {name}', str(exc))
 
 
 def tuya_set(ext_id: str, on: bool) -> bool:
