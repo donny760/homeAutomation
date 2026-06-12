@@ -4,6 +4,7 @@ import urllib.request
 
 from lib.settings import get_setting_int
 from lib.rachio import get_device_coords
+from lib.events import _log_system_error
 
 
 _wx_cache: dict = {}
@@ -89,6 +90,7 @@ def fetch_weather() -> dict:
         _wx_ts = time.time()
     except Exception as exc:
         print(f'Weather error: {exc}')
+        _log_system_error('weather', 'Weather fetch failed', str(exc))
         if not _wx_cache:
             _wx_cache = {}
 

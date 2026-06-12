@@ -12,6 +12,9 @@ from lib.db import connect
 ABODE_EMAIL    = os.environ.get('ABODE_EMAIL', '')
 ABODE_PASSWORD = os.environ.get('ABODE_PASSWORD', '')
 
+ABODE_PICKLE_PATH = os.path.join(state.BASE_DIR, 'abode.pickle')
+_AUTO_REAUTH_THRESHOLD = 3  # consecutive failures before deleting stale session
+
 _security: dict     = {}
 _security_ts: float = 0.0
 
@@ -180,6 +183,25 @@ def abode_backfill(abode, days=30):
         return 0
 
 
+def _delete_abode_pickle():
+    try:
+        if os.path.exists(ABODE_PICKLE_PATH):
+            os.remove(ABODE_PICKLE_PATH)
+            msg = f'Deleted stale session ({ABODE_PICKLE_PATH}) after {_AUTO_REAUTH_THRESHOLD} consecutive failures — will re-authenticate'
+        else:
+            msg = f'Session file not found ({ABODE_PICKLE_PATH}) — will re-authenticate'
+        print(f'Abode: {msg}')
+        with connect() as c:
+            c.execute(
+                'INSERT INTO event_log (ts, system, event_type, title, detail, result, source) '
+                'VALUES (?,?,?,?,?,?,?)',
+                (int(time.time()), 'abode', 'reauth', 'Session reset', msg, 'info', 'auto')
+            )
+    except Exception as exc:
+        print(f'Abode: failed to delete pickle: {exc}')
+        _log_system_error('abode', 'Session reset error', str(exc))
+
+
 def start_abode_listener():
     global _abode_instance
 
@@ -195,6 +217,7 @@ def start_abode_listener():
             return
 
         retry_delay = 60
+        consecutive_failures = 0
         while True:
             if not get_setting_bool('abode_enabled', True):
                 if _abode_status['state'] != 'disabled':
@@ -217,6 +240,7 @@ def start_abode_listener():
                         abode_backfill(_abode_instance, days=1)
                     except Exception as exc:
                         print(f'Abode periodic backfill error: {exc}')
+                        _log_system_error('abode', 'Periodic backfill error', str(exc))
                 time.sleep(60)
                 continue
 
@@ -227,6 +251,7 @@ def start_abode_listener():
                 abode = Abode(username=ABODE_EMAIL, password=ABODE_PASSWORD,
                               auto_login=True, get_devices=True)
                 _abode_instance = abode
+                consecutive_failures = 0
                 with _abode_status_lock:
                     _abode_status['state'] = 'connected'
                 retry_delay = 60
@@ -242,6 +267,7 @@ def start_abode_listener():
 
             except Exception as exc:
                 _abode_instance = None
+                consecutive_failures += 1
                 with _abode_status_lock:
                     _abode_status['state'] = 'error'
                     _abode_status['last_error'] = str(exc)
@@ -250,6 +276,12 @@ def start_abode_listener():
                 is_429 = '429' in str(exc)
                 print(f'Abode listener error: {exc} — retrying in {retry_delay}s')
                 _log_system_error('abode', 'Listener error', f'{exc} — retrying in {retry_delay}s')
+
+                if consecutive_failures >= _AUTO_REAUTH_THRESHOLD:
+                    _delete_abode_pickle()
+                    consecutive_failures = 0
+                    retry_delay = 60
+
                 time.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2 if is_429 else retry_delay, 600)
 

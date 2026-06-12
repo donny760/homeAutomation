@@ -640,6 +640,7 @@ def api_rules_ai_insights():
         })
 
     # Phase 4: Hard error
+    _log_system_error('ai', 'AI insights failed', last_err or 'All providers unavailable')
     return jsonify({'ok': False, 'error': f'AI providers unavailable. {last_err}'}), 502
 
 
@@ -1787,11 +1788,48 @@ def api_settings():
     return jsonify({'settings': settings, 'connectors': connectors})
 
 
+def _record_tou_change(conn, new_tou_value):
+    """When TOU periods change, stamp a rate_history row for today so future
+    rebuilds use the correct periods for each date range."""
+    try:
+        new_json = new_tou_value if isinstance(new_tou_value, str) else json.dumps(new_tou_value)
+    except Exception:
+        return
+    # Skip if value hasn't actually changed
+    cur = conn.execute("SELECT value FROM settings WHERE key='tou_periods'").fetchone()
+    if cur:
+        try:
+            if json.loads(cur[0]) == json.loads(new_json):
+                return
+        except Exception:
+            pass
+    # Copy dollar rates from the most recent rate_history row
+    latest = conn.execute(
+        "SELECT summer_on_peak, summer_off_peak, summer_super_off_peak, "
+        "       winter_on_peak, winter_off_peak, winter_super_off_peak, "
+        "       COALESCE(base_services_charge_per_day, 0) "
+        "FROM rate_history ORDER BY effective_date DESC LIMIT 1"
+    ).fetchone()
+    if not latest:
+        return
+    today = date.today().isoformat()
+    conn.execute(
+        "INSERT OR REPLACE INTO rate_history "
+        "(effective_date, summer_on_peak, summer_off_peak, summer_super_off_peak, "
+        " winter_on_peak, winter_off_peak, winter_super_off_peak, "
+        " base_services_charge_per_day, tou_periods_json, fetched_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (today, *latest, new_json, datetime.now().isoformat())
+    )
+
+
 @app.route('/api/settings', methods=['PUT'])
 def api_settings_update():
     data = request.get_json() or {}
     valid_keys = set(_SETTINGS_DEFAULTS.keys())
     with connect() as c:
+        if 'tou_periods' in data and 'tou_periods' in valid_keys:
+            _record_tou_change(c, data['tou_periods'])
         for key, value in data.items():
             if key in valid_keys:
                 c.execute(

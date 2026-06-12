@@ -160,6 +160,98 @@ def tou_period(dt: datetime, periods: dict = None):
     return season, 'off_peak'
 
 
+# ── TOU period HTML parsing ───────────────────────────────────────────────────
+
+def _parse_time_str(s: str) -> int:
+    """Convert a time string like '4:00 p.m.' or 'Midnight' to a 24-hour hour int."""
+    s = s.strip()
+    if s.lower() in ('midnight', '12:00 a.m.'):
+        return 0
+    if s.lower() == 'noon':
+        return 12
+    m = re.match(r'(\d+)(?::\d+)?\s*(a\.m\.|p\.m\.)', s, re.IGNORECASE)
+    if not m:
+        raise ValueError(f'Cannot parse time: {s!r}')
+    hour = int(m.group(1))
+    ampm = m.group(2).lower().replace('.', '')
+    if ampm == 'pm' and hour != 12:
+        hour += 12
+    elif ampm == 'am' and hour == 12:
+        hour = 0
+    return hour
+
+
+def _parse_ev_tou2_tou_periods(html: str) -> dict | None:
+    """Parse EV-TOU-2 TOU windows from the SDG&E total-electric-rates page HTML.
+
+    Returns our standard tou_periods dict, or None if the panel can't be found/parsed.
+    Never raises — rate fetch must succeed regardless of TOU parse outcome.
+    """
+    try:
+        idx = html.find('EV-TOU2')
+        if idx < 0:
+            return None
+        panel_start = html.find('panel-collapse', idx)
+        if panel_start < 0:
+            return None
+        # Panel ends at the opening of the next sibling panel
+        panel_end = html.find('<div class="panel panel-default', panel_start)
+        panel_html = html[panel_start:panel_end if panel_end > 0 else panel_start + 6000]
+
+        tables = re.findall(r'<table[^>]*>(.*?)</table>', panel_html, re.DOTALL)
+        if len(tables) < 2:
+            return None
+
+        def parse_table(tbl: str) -> dict:
+            out = {}
+            for row in re.findall(r'<tr[^>]*>(.*?)</tr>', tbl, re.DOTALL):
+                cells = re.findall(r'<t[dh][^>]*>(.*?)</t[dh]>', row, re.DOTALL)
+                if len(cells) < 2:
+                    continue
+                name = re.sub(r'<[^>]+>', '', cells[0]).strip().lower()
+                if 'peak' not in name:
+                    continue
+                # Use summer column (cells[1]); summer == winter for EV-TOU-2
+                raw = re.sub(r'<br\s*/?>', '\n', cells[1], flags=re.IGNORECASE)
+                raw = re.sub(r'<[^>]+>', '', raw)
+                raw = re.sub(r'&[a-z]+;', ' ', raw)
+                ranges = []
+                for part in re.split(r'[\n;,]', raw):
+                    part = part.strip()
+                    m = re.match(r'(.+?)\s*[-–]\s*(.+)', part) or \
+                        re.match(r'(.+?)\s+to\s+(.+)', part, re.IGNORECASE)
+                    if not m:
+                        continue
+                    try:
+                        ranges.append([_parse_time_str(m.group(1)), _parse_time_str(m.group(2))])
+                    except ValueError:
+                        continue
+                if ranges:
+                    out[name] = ranges
+            return out
+
+        wd = parse_table(tables[0])
+        wk = parse_table(tables[1])
+
+        def get(data, key):
+            for k, v in data.items():
+                if key in k:
+                    return v
+            return []
+
+        result = {
+            'weekday':         {'on_peak': get(wd, 'on-peak'), 'super_off_peak': get(wd, 'super')},
+            'weekend_holiday': {'on_peak': get(wk, 'on-peak'), 'super_off_peak': get(wk, 'super')},
+        }
+        # Sanity: both day types must have both period types
+        for dt in ('weekday', 'weekend_holiday'):
+            if not result[dt]['on_peak'] or not result[dt]['super_off_peak']:
+                return None
+        return result
+    except Exception:
+        return None
+
+
 # ── Rate file helpers ─────────────────────────────────────────────────────────
 
 def load_rates() -> dict:
@@ -236,7 +328,7 @@ def _discover_current_pdf(page_url: str, schedule_name: str = 'EV-TOU') -> tuple
     else:
         eff_date = date.today().isoformat()
 
-    return current_url, eff_date, current_label
+    return current_url, eff_date, current_label, html
 
 
 def _parse_ev_tou2_pdf(pdf_content: bytes) -> dict:
@@ -288,8 +380,8 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
     if schedule_name is None:
         schedule_name = 'EV-TOU'
 
-    # Step 1: Discover the current PDF URL
-    pdf_url, eff_date, label = _discover_current_pdf(page_url, schedule_name)
+    # Step 1: Discover the current PDF URL (also returns the page HTML for TOU parsing)
+    pdf_url, eff_date, label, page_html = _discover_current_pdf(page_url, schedule_name)
     print(f'Rates: found "{label}" -> {pdf_url}')
 
     # Step 2: Download and parse the PDF
@@ -310,21 +402,57 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
     if db_path:
         import sqlite3
         with sqlite3.connect(db_path) as conn:
+            # Read the current tou_periods setting to stamp alongside the new rates
+            tou_row = conn.execute(
+                "SELECT value FROM settings WHERE key='tou_periods'"
+            ).fetchone()
+            tou_json = tou_row[0] if tou_row else None
             conn.execute(
                 'INSERT OR REPLACE INTO rate_history '
                 '(effective_date, summer_on_peak, summer_off_peak, summer_super_off_peak, '
                 ' winter_on_peak, winter_off_peak, winter_super_off_peak, '
-                ' base_services_charge_per_day, source_url, fetched_at) '
-                'VALUES (?,?,?,?,?,?,?,?,?,?)',
+                ' base_services_charge_per_day, source_url, fetched_at, tou_periods_json) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                 (eff_date,
                  rates.get('summer_on_peak', 0), rates.get('summer_off_peak', 0),
                  rates.get('summer_super_off_peak', 0),
                  rates.get('winter_on_peak', 0), rates.get('winter_off_peak', 0),
                  rates.get('winter_super_off_peak', 0),
                  rates.get('base_services_charge_per_day', 0),
-                 pdf_url, rates['updated'])
+                 pdf_url, rates['updated'], tou_json)
             )
             conn.commit()
+
+            # Step 4b: Check TOU periods against what the website currently shows
+            parsed_tou = _parse_ev_tou2_tou_periods(page_html)
+            if parsed_tou:
+                stored_row = conn.execute(
+                    "SELECT value FROM settings WHERE key='tou_periods'"
+                ).fetchone()
+                if stored_row:
+                    try:
+                        stored_tou = json.loads(stored_row[0])
+                        if stored_tou != parsed_tou:
+                            detail = (f'Website: {json.dumps(parsed_tou)}  |  '
+                                      f'Settings: {stored_row[0]}')
+                            conn.execute(
+                                "INSERT INTO event_log "
+                                "(ts, system, event_type, title, detail, source) "
+                                "VALUES (?, 'rates', 'tou_periods_changed', "
+                                "'SDG&E TOU periods changed — review and update settings', ?, 'live')",
+                                (int(datetime.now().timestamp()), detail)
+                            )
+                            conn.commit()
+                            print('WARNING: TOU periods on SDG&E website differ from stored settings!')
+                            print(f'  Website: {json.dumps(parsed_tou)}')
+                            print(f'  Stored:  {stored_row[0]}')
+                        else:
+                            print('TOU periods: confirmed match with SDG&E website')
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            else:
+                print('TOU periods: could not parse from website (panel not found)')
+
         print(f'Rates: stored in rate_history (effective {eff_date})')
 
     print(f'Rates updated from {pdf_url}')

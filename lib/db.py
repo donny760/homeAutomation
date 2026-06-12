@@ -32,7 +32,53 @@ def _migrate_v1(conn):
     conn.execute("PRAGMA user_version = 1")
 
 
-_MIGRATIONS = [(1, _migrate_v1)]
+def _migrate_v2(conn):
+    """Add tou_periods_json to rate_history; backfill historical TOU periods;
+    insert 2026-03-01 cutover row so the weekday 10AM-2PM change is date-stamped."""
+    OLD_TOU = json.dumps({
+        'weekday':         {'on_peak': [[16, 21]], 'super_off_peak': [[0, 6]]},
+        'weekend_holiday': {'on_peak': [[16, 21]], 'super_off_peak': [[0, 14]]},
+    })
+    NEW_TOU = json.dumps({
+        'weekday':         {'on_peak': [[16, 21]], 'super_off_peak': [[0, 6], [10, 14]]},
+        'weekend_holiday': {'on_peak': [[16, 21]], 'super_off_peak': [[0, 14]]},
+    })
+
+    _add_col(conn, 'rate_history', 'tou_periods_json', 'TEXT')
+
+    # Rows before March 2026: weekday super off-peak was midnight-6AM only
+    conn.execute(
+        "UPDATE rate_history SET tou_periods_json = ? WHERE effective_date < '2026-03-01'",
+        (OLD_TOU,)
+    )
+    # Rows from March 2026 onward: weekday also includes 10AM-2PM
+    conn.execute(
+        "UPDATE rate_history SET tou_periods_json = ? WHERE effective_date >= '2026-03-01'",
+        (NEW_TOU,)
+    )
+
+    # Insert the March 1, 2026 TOU cutover row if not already present.
+    # Dollar rates are identical to Jan 1 (rate change didn't happen until Apr 1).
+    jan_row = conn.execute(
+        "SELECT summer_on_peak, summer_off_peak, summer_super_off_peak, "
+        "       winter_on_peak, winter_off_peak, winter_super_off_peak, "
+        "       COALESCE(base_services_charge_per_day, 0) "
+        "FROM rate_history WHERE effective_date = '2026-01-01'"
+    ).fetchone()
+    if jan_row:
+        conn.execute(
+            "INSERT OR IGNORE INTO rate_history "
+            "(effective_date, summer_on_peak, summer_off_peak, summer_super_off_peak, "
+            " winter_on_peak, winter_off_peak, winter_super_off_peak, "
+            " base_services_charge_per_day, tou_periods_json) "
+            "VALUES ('2026-03-01',?,?,?,?,?,?,?,?)",
+            jan_row + (NEW_TOU,)
+        )
+
+    conn.execute("PRAGMA user_version = 2")
+
+
+_MIGRATIONS = [(1, _migrate_v1), (2, _migrate_v2)]
 
 
 def _migrate(conn) -> None:

@@ -302,6 +302,7 @@ def _tuya_cloud_poll_sensors() -> None:
             result = cloud.getstatus(dev_id)
             if not isinstance(result, dict) or not result.get('success'):
                 print(f'Tuya cloud poll error for {name}: {result}')
+                _log_system_error('tuya', f'Cloud poll error: {name}', str(result))
                 continue
             dps = {item['code']: item['value'] for item in result.get('result', [])}
             temp_raw = dps.get('va_temperature')

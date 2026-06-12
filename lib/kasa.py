@@ -28,6 +28,7 @@ def _kasa_start_loop() -> None:
             _kasa_loop.run_forever()
         except Exception as exc:
             print(f'Kasa loop crashed: {exc}')
+            _log_system_error('kasa', 'Kasa loop crashed', str(exc))
     _kasa_loop_thread = threading.Thread(
         target=_run, daemon=True, name='kasa-asyncio-loop'
     )
@@ -286,6 +287,7 @@ def _kasa_poll_state() -> None:
         _kasa_submit(_kasa_update_state_async(), timeout=60)
     except Exception as exc:
         print(f'Kasa poll error: {exc}')
+        _log_system_error('kasa', 'Poll error', str(exc))
 
 
 async def _kasa_set_async(mac: str, on: bool) -> bool:

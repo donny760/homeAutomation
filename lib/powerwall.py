@@ -26,6 +26,8 @@ from lib.tuya import _tuya_refresh_devices, _tuya_poll_state, _tuya_cloud_poll_s
 PW_EMAIL      = 'don@nsdsolutions.com'
 POLL_INTERVAL = 10   # seconds between pypowerwall polls
 DB_WRITE_EVERY = 30  # seconds between DB writes
+_cloud_unreachable: bool  = False  # True once outage threshold crossed
+_cloud_zero_since:  float = 0.0   # timestamp when all-zero streak started
 
 
 def backfill_history() -> None:
@@ -134,6 +136,23 @@ def poller() -> None:
 
             power = pw.power() or {}
             level = pw.level() or 0
+            global _cloud_unreachable, _cloud_zero_since
+            now_ts = time.time()
+            if not any(power.values()):
+                if _cloud_zero_since == 0.0:
+                    _cloud_zero_since = now_ts
+                elif not _cloud_unreachable and now_ts - _cloud_zero_since >= 120:
+                    down_min = int((now_ts - _cloud_zero_since) / 60)
+                    _log_system_error('powerwall', 'Tesla cloud unreachable',
+                                      f'No data for {down_min}+ min — likely 503 from Tesla API')
+                    _cloud_unreachable = True
+            else:
+                if _cloud_unreachable:
+                    down_min = max(1, int((now_ts - _cloud_zero_since) / 60))
+                    _log_success('powerwall', 'cloud_recovered',
+                                 f'Tesla cloud connection restored after {down_min} min')
+                _cloud_zero_since = 0.0
+                _cloud_unreachable = False
 
             solar_w     = float(power.get('solar',   0) or 0)
             battery_w   = -float(power.get('battery', 0) or 0)  # API: positive=discharging; flip to positive=charging

@@ -215,10 +215,14 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
                 year: 'numeric',
               });
               let mOn = 0, mOff = 0, mSuper = 0;
+              let mOnKwh = 0, mOffKwh = 0, mSuperKwh = 0;
               mDays.forEach((d) => {
                 mOn += d.on_peak_cost;
                 mOff += d.off_peak_cost;
                 mSuper += d.super_off_peak_cost;
+                mOnKwh += d.on_peak_kwh;
+                mOffKwh += d.off_peak_kwh;
+                mSuperKwh += d.super_off_peak_kwh;
               });
               const mNet = mOn + mOff + mSuper;
               const netColor = mNet <= 0 ? 'var(--green)' : 'var(--amber)';
@@ -232,11 +236,11 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
                       <span className="costs-chevron">{isCollapsed ? '\u25b6' : '\u25bc'}</span>
                       {monthLabel}
                     </div>
-                    <div className="cr-pkwh" />
+                    <div className="cr-pkwh">{fmtKwh(mOnKwh)}</div>
                     <div className="cr-pcost cr-period-on">{fmtNet(mOn)}</div>
-                    <div className="cr-pkwh" />
+                    <div className="cr-pkwh">{fmtKwh(mOffKwh)}</div>
                     <div className="cr-pcost cr-period-off">{fmtNet(mOff)}</div>
-                    <div className="cr-pkwh" />
+                    <div className="cr-pkwh">{fmtKwh(mSuperKwh)}</div>
                     <div className="cr-pcost cr-period-super">{fmtNet(mSuper)}</div>
                     <div className="cr-net" style={{ color: netColor }}>{fmtNet(mNet)}</div>
                   </div>

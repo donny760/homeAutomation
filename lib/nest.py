@@ -180,6 +180,7 @@ def _nest_refresh_devices(token):
                         )
     except Exception as exc:
         print(f'Nest device list error: {exc}')
+        _log_system_error('nest', 'Device list error', str(exc))
 
 
 def _nest_thermostat_command(device_path: str, command: str, params: dict) -> dict:
@@ -261,6 +262,7 @@ def nest_set_thermostat(device_path: str, *, mode: str = None,
             _nest_refresh_devices(token)
     except Exception as exc:
         print(f'Nest post-command refresh failed: {exc}')
+        _log_system_error('nest', 'Post-command refresh failed', str(exc))
     return dict(_nest_thermostats.get(device_path, info))
 
 

@@ -19,7 +19,8 @@ def _load_rate_history() -> list:
             'SELECT effective_date, end_date, '
             '       summer_on_peak, summer_off_peak, summer_super_off_peak, '
             '       winter_on_peak, winter_off_peak, winter_super_off_peak, '
-            '       COALESCE(base_services_charge_per_day, 0) '
+            '       COALESCE(base_services_charge_per_day, 0), '
+            '       tou_periods_json '
             'FROM rate_history ORDER BY effective_date'
         ).fetchall()
 
@@ -28,13 +29,20 @@ def _rate_for_date(rate_periods, d_iso: str) -> dict | None:
     for row in reversed(rate_periods):
         eff = row[0]
         if d_iso >= eff:
-            return {
+            result = {
                 'summer_on_peak': row[2], 'summer_off_peak': row[3],
                 'summer_super_off_peak': row[4],
                 'winter_on_peak': row[5], 'winter_off_peak': row[6],
                 'winter_super_off_peak': row[7],
                 'base_services_charge_per_day': row[8] if len(row) > 8 else 0,
             }
+            tou_json = row[9] if len(row) > 9 else None
+            if tou_json:
+                try:
+                    result['_tou_periods'] = json.loads(tou_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            return result
     return None
 
 
@@ -99,8 +107,9 @@ def _rebuild_today() -> None:
     if not rate_periods and not fallback_rates:
         return
 
-    tou_cfg = _load_tou_periods()
+    fallback_tou = _load_tou_periods()
     day_rate = (_rate_for_date(rate_periods, today_str) if rate_periods else None) or fallback_rates or {}
+    tou_cfg = day_rate.get('_tou_periods') or fallback_tou
 
     with connect() as c:
         rows = c.execute(
@@ -162,7 +171,7 @@ def rebuild_daily_costs(year: int = None, from_date=None) -> None:
     start_ts = max(jan1, int(datetime(from_date.year, from_date.month, from_date.day).timestamp())) \
                if from_date else jan1
 
-    tou_cfg = _load_tou_periods()
+    fallback_tou = _load_tou_periods()
 
     with connect() as c:
         rows = c.execute(
@@ -183,13 +192,15 @@ def rebuild_daily_costs(year: int = None, from_date=None) -> None:
             d    = dt.date().isoformat()
             avg_grid = ((g0 or 0) + (g1 or 0)) / 2
             kwh  = avg_grid * dt_h / 1000
-            season, period = tou_period(dt, tou_cfg)
             if d not in _rate_cache:
                 if rate_periods:
                     _rate_cache[d] = _rate_for_date(rate_periods, d) or fallback_rates or {}
                 else:
                     _rate_cache[d] = fallback_rates or {}
-            rate = _rate_cache[d].get(f'{season}_{period}', 0.0)
+            rate_info = _rate_cache[d]
+            tou_cfg = rate_info.get('_tou_periods') or fallback_tou
+            season, period = tou_period(dt, tou_cfg)
+            rate = rate_info.get(f'{season}_{period}', 0.0)
             if d not in day_data:
                 day_data[d] = {
                     'import_kwh': 0.0, 'export_kwh': 0.0,
@@ -241,7 +252,7 @@ def _spawn_rebuild_daily_costs(from_date=None) -> bool:
 def calc_stats(rows: list) -> tuple:
     rate_periods = _load_rate_history()
     fallback_rates = load_rates() if not rate_periods else None
-    tou_cfg = _load_tou_periods()
+    fallback_tou = _load_tou_periods()
     _rc: dict = {}
 
     solar_kwh = home_kwh = grid_import_kwh = savings = 0.0
@@ -252,9 +263,10 @@ def calc_stats(rows: list) -> tuple:
         grid_w  = rows[i][4] or 0
         dt      = datetime.fromtimestamp(rows[i][0])
         d       = dt.date().isoformat()
-        season, period = tou_period(dt, tou_cfg)
         if d not in _rc:
             _rc[d] = (_rate_for_date(rate_periods, d) or fallback_rates or {}) if rate_periods else (fallback_rates or {})
+        tou_cfg = _rc[d].get('_tou_periods') or fallback_tou
+        season, period = tou_period(dt, tou_cfg)
         rate = _rc[d].get(f'{season}_{period}', 0.0)
 
         solar_kwh      += solar_w * dt_h / 1000

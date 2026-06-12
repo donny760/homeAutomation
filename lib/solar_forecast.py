@@ -6,6 +6,7 @@ from datetime import datetime, date, timedelta
 
 import lib.state as state
 from lib.db import connect
+from lib.events import _log_system_error
 
 
 _sf_cache: dict  = {}
@@ -69,6 +70,7 @@ def fetch_solar_forecast() -> dict:
 
     except Exception as exc:
         print(f'Solar forecast error: {exc}')
+        _log_system_error('solar', 'Solar forecast fetch failed', str(exc))
         if not _sf_cache or _sf_cache.get('date') != today_str:
             _sf_cache = {'date': today_str, 'hours': {}}
 
@@ -129,6 +131,7 @@ def fetch_tomorrow_solar_forecast() -> dict:
 
     except Exception as exc:
         print(f'Tomorrow solar forecast error: {exc}')
+        _log_system_error('solar', 'Tomorrow solar forecast fetch failed', str(exc))
         if _stf_cache.get('date') != tomorrow_str:
             _stf_cache = {'date': tomorrow_str, 'hours': {}, 'kwh_by_hour': {}, 'total_kwh': 0.0}
 

@@ -330,6 +330,7 @@ def _rachio_device_forecast(device_id: str) -> dict:
             forecast_by_date[d] = float(precip_in or 0)
     except Exception as exc:
         print(f'Rachio device forecast error: {exc}')
+        _log_system_error('rachio', 'Device forecast error', str(exc))
     return forecast_by_date
 
 
@@ -379,6 +380,7 @@ def _rachio_wi_skip_info(device_id: str, lookback_hours: int = 48):
                     pass
     except Exception as exc:
         print(f'Rachio WI skip fetch error: {exc}')
+        _log_system_error('rachio', 'WI skip fetch error', str(exc))
     return skip_set, threshold_in
 
 

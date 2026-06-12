@@ -5,6 +5,7 @@ import threading
 import lib.network_devices as _netdev
 from lib.state import BASE_DIR
 from lib.settings import get_setting, get_setting_int, get_setting_bool
+from lib.events import _log_system_error
 
 NETWORK_STATE_PATH = os.path.join(BASE_DIR, 'network_devices.json')
 _NETWORK_QUARANTINE_SECS = 300
@@ -15,6 +16,7 @@ _network_state_lock = threading.Lock()
 _network_last_poll_ts: float = 0.0
 _network_last_poll_result: dict = {}
 _network_ap_quarantine: dict[str, float] = {}
+_last_network_error_log: float = 0.0
 
 
 def _network_router_cfg() -> dict[str, str]:
@@ -86,6 +88,10 @@ def _network_poll_loop():
                     _network_poll_once()
                 except Exception as exc:
                     print(f'network poll error: {exc}')
+                    global _last_network_error_log
+                    if time.time() - _last_network_error_log > 300:
+                        _log_system_error('network', 'Network poll error', str(exc))
+                        _last_network_error_log = time.time()
         except Exception as exc:
             print(f'network loop error: {exc}')
             interval = 60

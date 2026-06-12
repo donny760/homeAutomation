@@ -632,9 +632,10 @@ body {
 .costs-row:last-child { border-bottom: none; }
 .costs-row:hover { background: var(--bg); }
 .cr-date    { width: 68px;  flex-shrink: 0; color: var(--dim); }
-.cr-pkwh    { width: 62px;  flex-shrink: 0; text-align: right; color: var(--very-dim); font-size: 0.72rem; }
+.cr-pkwh    { width: 62px;  flex-shrink: 0; text-align: right; padding-left: 8px; color: var(--very-dim); font-size: 0.72rem; }
 .cr-pcost   { width: 58px;  flex-shrink: 0; text-align: right; }
 .cr-net     { width: 72px;  flex-shrink: 0; text-align: right; font-weight: 500; margin-left: 16px; }
+.costs-month-header .cr-date { width: 122px; }
 .cr-period-on    { color: var(--amber); }
 .cr-period-off   { color: var(--green); }
 .cr-period-super { color: var(--blue); }
