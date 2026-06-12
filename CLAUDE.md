@@ -1,5 +1,5 @@
 # homeAutomation — Powerwall Dashboard
-> Last indexed: 2026-05-31
+> Last indexed: 2026-06-11
 
 ## What This Is
 Home automation dashboard for a San Diego home with 3x Powerwall 2 (40.5 kWh), solar, pool, and smart home devices. Tracks energy, runs TOU-aware automation rules, and integrates Abode security, Nest thermostats, Rachio irrigation, Kasa/Tuya plugs, and network device discovery.
@@ -15,28 +15,28 @@ Home automation dashboard for a San Diego home with 3x Powerwall 2 (40.5 kWh), s
 Flask (`server.py`) is the backend entry point: it imports from `lib/` modules and registers all API routes, but the core logic lives in the `lib/` package (20 modules). The main poller (`lib/powerwall.py`) runs every 10s/30s to fetch Powerwall + device state and write to SQLite. The Next.js frontend is built to a static export (`static/frontend/`), which Flask serves directly — no separate Node server in production. Dev mode proxies `/api/*` to `localhost:5001`. The rules engine (`rules.py`) runs as a separate process/service, importing from `lib/`, evaluating Powerwall mode rules every 60s and writing to `event_log`. AI insights use Gemini (primary) or Azure OpenAI (fallback), both configured through the `settings` DB table.
 
 ## Key Files
-- `server.py` — Flask backend entry point: registers all API routes, imports from `lib.*`; network device CRUD routes (`GET/PUT/DELETE /api/network/devices`, `/api/network/rediscover`, `/api/network/ap_filters`, per-MAC filter/pin/unpin); `HTTPException` passes through with its own status code; `PUT /api/rules/<id>/toggle` and `POST /api/rules/reorder` endpoints; 404 guard runs before UPDATE in `api_rules_put` / `api_rules_toggle`; debug insights endpoint uses `_call_gemini` helper
-- `rules.py` — Powerwall automation rules engine, Windows-service-capable; imports from `lib.*`; `rules.log` via RotatingFileHandler (10 MB, 3 backups); `_rule_fires_at` treats holidays as weekends; `apply_settings` has no `first_run` param
-- `lib/powerwall.py` — main `poller` loop: fetches Powerwall + all device data every 10s/30s, logs readings and events, triggers periodic cost rebuilds and rate/holiday refreshes
-- `lib/db.py` — SQLite schema init, migrations, default rule/settings seeding, raw readings read/write; `tou_periods` seed uses `INSERT OR IGNORE` to preserve user-edited TOU settings across restarts
+- `server.py` — Flask backend entry point: registers all API routes, imports from `lib.*`; network device CRUD routes (`GET/PUT/DELETE /api/network/devices`, `/api/network/rediscover`, `/api/network/ap_filters`, per-MAC filter/pin/unpin); `HTTPException` passes through with its own status code; `PUT /api/rules/<id>/toggle` and `POST /api/rules/reorder` endpoints; 404 guard runs before UPDATE in `api_rules_put` / `api_rules_toggle`; debug insights endpoint uses `_call_gemini` helper; `_record_tou_change` helper stamps a new `rate_history` row when TOU periods saved via Settings; all DB calls use `connect()`; suppresses `optimized_table` when identical to projection; AI insights failure logged to `event_log`
+- `rules.py` — Powerwall automation rules engine, Windows-service-capable; imports from `lib.*`; `rules.log` via RotatingFileHandler (10 MB, 3 backups); `_rule_fires_at` treats holidays as weekends; `apply_settings` has no `first_run` param; duplicate schema/seed code removed; `pw_retry_after` backoff on Tesla 429 rate limits
+- `lib/powerwall.py` — main `poller` loop: fetches Powerwall + all device data every 10s/30s, logs readings and events, triggers periodic cost rebuilds and rate/holiday refreshes; detects all-zero power streak over 2 minutes and logs Tesla cloud outage event + recovery
+- `lib/db.py` — SQLite schema init, migrations, default rule/settings seeding, raw readings read/write; `tou_periods` seed uses `INSERT OR IGNORE` to preserve user-edited TOU settings across restarts; `connect()` helper returns a connection with WAL mode, busy_timeout, and FK enforcement; migration v2 adds `tou_periods_json` column to `rate_history` and backfills pre/post 2026-03-01 TOU windows; all `sqlite3.connect(DB_PATH)` calls across `lib/` migrated to `connect()`
 - `lib/state.py` — global `_live` dict + `_lock` for thread-safe real-time Powerwall data; defines `BASE_DIR` and `DB_PATH`
-- `lib/costs.py` — calculates/stores daily import/export costs by TOU tier; rebuilds historical data from readings; `rebuild_daily_costs` accepts `from_date`
+- `lib/costs.py` — calculates/stores daily import/export costs by TOU tier; rebuilds historical data from readings; `rebuild_daily_costs` accepts `from_date`; `rebuild_daily_costs`, `_rebuild_today`, and `calc_stats` use per-date `tou_periods_json` from `rate_history` instead of the global setting
 - `lib/rule_helpers.py` — loads rules from DB, computes upcoming fire times, validates rule bodies, provides schedule insights
 - `lib/settings.py` — loads all settings from SQLite `settings` table; typed getters (str/int/bool); default value definitions
 - `lib/events.py` — utility functions for writing to `event_log`; tracks device failure counts for all integrations
-- `lib/fetch_rates.py` — SDG&E EV-TOU-2 rate fetching from PDF, TOU period classification, writes `rates.json` + `rate_history` table
-- `lib/abode.py` — Abode security integration: event logging, backfill, event listener lifecycle, mode get/set
-- `lib/ai_insights.py` — builds JSON context (true-up projections, rule analysis, daily data) and calls Gemini (via google-genai SDK `Client.models.generate_content`) or Azure OpenAI (fallback) for energy advice; simplified transient-error detection; condition label map includes `net_cost_ytd` and `tomorrow_solar_kwh`
-- `lib/kasa.py` — Kasa smart device discovery, polling, and control via persistent asyncio loop (`_kasa_loop`); use `_kasa_submit()`, never `asyncio.run()`
-- `lib/nest.py` — Nest SDM integration: OAuth token management, device state, Pub/Sub event polling, thermostat control
+- `lib/fetch_rates.py` — SDG&E EV-TOU-2 rate fetching from PDF, TOU period classification, writes `rates.json` + `rate_history` table; stamps `tou_periods_json` when saving new rates; warns in `event_log` if TOU windows differ from stored settings
+- `lib/abode.py` — Abode security integration: event logging, backfill, event listener lifecycle, mode get/set; auto-deletes stale `abode.pickle` after 3 consecutive auth failures
+- `lib/ai_insights.py` — builds JSON context (true-up projections, rule analysis, daily data) and calls Gemini (via google-genai SDK `Client.models.generate_content`) or Azure OpenAI (fallback) for energy advice; projection uses `daily_costs` import ratio (not home kWh), partial-month blending, base_charge double-count removed; system prompt uses DEFICIT/UNDERSHOOT/WITHIN TARGET/OVERSHOOT buckets, bans snake_case output; condition label map includes `net_cost_ytd` and `tomorrow_solar_kwh`
+- `lib/kasa.py` — Kasa smart device discovery, polling, and control via persistent asyncio loop (`_kasa_loop`); use `_kasa_submit()`, never `asyncio.run()`; `_log_system_error` added at error sites
+- `lib/nest.py` — Nest SDM integration: OAuth token management, device state, Pub/Sub event polling, thermostat control; `_log_system_error` added at error sites
 - `lib/pool.py` — ScreenLogic pool integration: status polling, circuit control, daily gallon accumulation; `_accumulate_pool_gallons`, `_recalc_pool_target`
-- `lib/rachio.py` — Rachio irrigation API: schedules, recent events, rain-based smart skip logic
-- `lib/solar_forecast.py` — Open-Meteo solar forecast for today/tomorrow; scales radiation to local peak output; stores total kWh to DB
-- `lib/weather.py` — Open-Meteo current conditions + short-term forecast (rain history/forecast) using Rachio device coordinates
-- `lib/network.py` — DD-WRT/router polling for network device discovery, state merging, JSON persistence, MAC filtering; race condition fix: quarantine dict snapshot-read before iterating APs; writes to `_network_ap_quarantine` inside `_network_state_lock`
+- `lib/rachio.py` — Rachio irrigation API: schedules, recent events, rain-based smart skip logic; `_log_system_error` added at error sites
+- `lib/solar_forecast.py` — Open-Meteo solar forecast for today/tomorrow; scales radiation to local peak output; stores total kWh to DB; `_log_system_error` added at error sites
+- `lib/weather.py` — Open-Meteo current conditions + short-term forecast (rain history/forecast) using Rachio device coordinates; `_log_system_error` added at error sites
+- `lib/network.py` — DD-WRT/router polling for network device discovery, state merging, JSON persistence, MAC filtering; race condition fix: quarantine dict snapshot-read before iterating APs; writes to `_network_ap_quarantine` inside `_network_state_lock`; `_log_system_error` calls throttled (max once per 5 min) to avoid flooding `event_log`
 - `lib/network_devices.py` — Linksys LRT224 + DD-WRT scraping, ARP table scans, hostname/MAC vendor enrichment
 - `lib/switches.py` — unified interface for Kasa/Tuya/Pool/Abode/Nest switches: reads metadata from DB, dispatches commands
-- `lib/tuya.py` — Tuya LAN device discovery, state polling, on/off control; manages connection failures and logging
+- `lib/tuya.py` — Tuya LAN device discovery, state polling, on/off control; manages connection failures and logging; wsdcg sensor category support: skips LAN DPS probe, uses cloud polling via `_tuya_cloud_poll_sensors` every 5 min; `_log_system_error` added at error sites
 - `lib/backfill.py` — one-off utility: backfill Powerwall readings from Tesla cloud, scrape historical SDG&E rates from PDF, rebuild daily costs
 - `powerwall.db` — primary SQLite: readings, rules, rule_conditions, daily_costs, event_log, switches_meta, settings, rate_history
 - `rates.json` — cached SDG&E EV-TOU-2 rates (auto-refreshed monthly; excluded from git)
@@ -49,14 +49,14 @@ Flask (`server.py`) is the backend entry point: it imports from `lib/` modules a
 - `frontend/src/components/Dashboard.tsx` — main dashboard (powerflow, tiles)
 - `frontend/src/components/PowerflowSVG.tsx` — animated SVG power flow diagram; energy split computed from watt values; includes `flow-grid-battery` path
 - `frontend/src/components/AutomationsPanel.tsx` — upcoming automations list; pause/resume toggle per rule; "PAUSED" badge
-- `frontend/src/components/BottomTiles.tsx` — pool tile showing RPM + GPM from Pentair gateway
+- `frontend/src/components/BottomTiles.tsx` — 5 bottom tiles: pool (RPM + GPM from Pentair), plus new TemperatureTile (outside weather + Nest thermostat + Tuya wsdcg sensor)
 - `frontend/src/components/DayChart.tsx` — historical power chart (Solar/Home/Battery/Grid); uses `usePolling` hook with AbortController
-- `frontend/src/components/SwitchesDrawer.tsx` — nav drawer for Kasa/Pool/Nest thermostat tiles
+- `frontend/src/components/SwitchesDrawer.tsx` — nav drawer for Kasa/Pool/Nest thermostat tiles; SensorTile for Tuya wsdcg sensors; polling migrated to `usePolling` hook
 - `frontend/src/components/Rules.tsx` — rules management + today's firing timeline; drag-and-drop reordering via `@dnd-kit`; `notes` field; `enabled` toggle; `nextFireForRule` mirrors server-side holiday-as-weekend logic
-- `frontend/src/components/EnergyCosts.tsx` — YTD and daily cost breakdown
-- `frontend/src/components/NetworkDevices.tsx` — network client table with PIN-protected name editing
+- `frontend/src/components/EnergyCosts.tsx` — YTD and daily cost breakdown; month header rows show kWh totals per TOU tier
+- `frontend/src/components/NetworkDevices.tsx` — network client table with PIN-protected name editing; `has_bans` field enables pin button for wired devices with prior AP bans
 - `frontend/src/lib/tou.ts` — TOU period classification (client-side, mirrors server logic)
-- `frontend/src/lib/format.ts` — shared formatting utilities (fmtTime12 etc.)
+- `frontend/src/lib/format.ts` — shared formatting utilities: `fmtTime12`, `relativeTime` (moved here from `NetworkDevices.tsx`)
 - `frontend/src/lib/markdown.ts` — renders AI markdown: caps headings at ###, styles #### as h5 with `--purple`
 - `deploy.bat` — builds frontend, backs up server DBs, mirrors files + `lib/` to `\\server-04`
 - `install_dep.bat` — pip install from requirements.txt
@@ -89,7 +89,7 @@ deploy.bat
 - `event_log` — all system events: rules, abode, nest, pool, rachio, home_control; never purge
 - `switches_meta` — display config for Kasa/Tuya/Nest/Pool tiles in SwitchesDrawer
 - `settings` — all runtime config (API keys, poll intervals, TOU periods, feature flags, pool GPM baselines, weekday/weekend gallon targets)
-- `rate_history` — historical SDG&E rate records per effective date
+- `rate_history` — historical SDG&E rate records per effective date; `tou_periods_json` column (added migration v2) stores the TOU windows active at that effective date; used by `lib/costs.py` for historically-correct tier classification
 
 ## Environment Variables (.env)
 | Key | Purpose |
@@ -112,6 +112,8 @@ Gemini API key and Azure OpenAI credentials are stored in the `settings` DB tabl
 - `PURGE_DAYS = 0` — never auto-delete readings or event_log
 - No venv at project root — Python dependencies installed to system/user Python on server-04
 - Pool GPM baselines and daily gallon targets (weekday/weekend) derived from 30 days of event_log and persisted to `settings`
+- SQLite connections: always use `db.connect()` helper (not bare `sqlite3.connect(DB_PATH)`) — it sets WAL mode, busy_timeout, and FK enforcement
+- Error surfacing: use `_log_system_error` (from `lib/events.py`) at all `print()`-only error sites so failures appear in `event_log`; `lib/network.py` throttles these calls to max once per 5 min
 - rules.py: `battery_pct` is read from the `readings` table (latest row by timestamp), NOT from pypowerwall directly; `get_live_state` signature is `get_live_state(conn)` — no `pw` argument
 - rules.py: pypowerwall connection is only reset on `apply_settings` failure — DB/logic errors in rule evaluation are caught separately and do not trigger a reconnect
 - rules.py: `cond_cache` stores condition results keyed by `(rule_id, fire_dt_iso)`; passed into `current_target_state`; pruned when older than 3 days
@@ -128,21 +130,27 @@ Gemini API key and Azure OpenAI credentials are stored in the `settings` DB tabl
 3. Restart Windows service on server-04 manually after deploy
 4. Live at `http://server-04:5001`
 
-## Recent Focus (as of 2026-05-31)
-- `frontend/src/components/Rules.tsx`: `nextFireForRule` now mirrors server-side holiday-as-weekend logic — holiday dates treated as Sunday for rule day-matching in the UI
-- `lib/db.py`: `tou_periods` seed changed to `INSERT OR IGNORE` — prevents overwriting user-edited TOU settings on every server restart
-- `server.py`: 404 guard moved before UPDATE in `api_rules_put` / `api_rules_toggle`; debug insights endpoint refactored to use `_call_gemini` helper
-- `lib/ai_insights.py`: condition label map extended with `net_cost_ytd` and `tomorrow_solar_kwh`
-- Earlier (2026-05-30): `lib/ai_insights.py`: Gemini call migrated from raw HTTP requests to google-genai SDK (`Client.models.generate_content`); simplified transient-error detection
-- Earlier (2026-05-30): `lib/network.py`: race condition fix — quarantine dict snapshot-read before iterating APs; writes to `_network_ap_quarantine` inside `_network_state_lock`
-- Earlier (2026-05-30): `server.py`: 9 new network device API routes (`GET/PUT/DELETE /api/network/devices`, `/api/network/rediscover`, `/api/network/ap_filters`, per-MAC filter/pin/unpin); `HTTPException` passes through with its own status code; 3 unused imports removed
-- Earlier (2026-05-30): `requirements.txt`: added `google-genai`, `pysnmp`, `mac-vendor-lookup`
-- Earlier (2026-05-27): **Major refactor:** `server.py` split into 20 modules under `lib/`; `fetch_rates.py`, `network_devices.py`, `backfill.py` moved to `lib/` and deleted from root; `deploy.bat` updated to mirror `lib/` to server-04
-- Earlier: `DayChart.tsx` refactored to use `usePolling` hook with AbortController; `.gitignore` updated (abode.pickle, holidays.json)
-- Earlier: rules page drag-and-drop reorder (`@dnd-kit/sortable`), `notes` field, pause/resume toggle
-- Earlier: PowerflowSVG energy split rework, TOU `super_off_peak_winter_mar_apr` removal, holiday logic fix
-- Earlier: rules.py hardening (RotatingFileHandler, cond_cache, load_rules JOIN, battery_pct from readings table)
-- Earlier: pool tile GPM/RPM telemetry, daily gallon tracking, `net_cost` condition type
+## Recent Focus (as of 2026-06-11)
+- `lib/tuya.py`: wsdcg sensor category support — skips LAN DPS probe, polls via `_tuya_cloud_poll_sensors` every 5 min
+- `lib/db.py`: `connect()` helper (WAL + busy_timeout + FK); all `sqlite3.connect(DB_PATH)` calls across `lib/` migrated to it; migration v2 adds `tou_periods_json` to `rate_history` and backfills pre/post 2026-03-01 windows
+- `lib/costs.py`: `rebuild_daily_costs`, `_rebuild_today`, `calc_stats` now use per-date `tou_periods_json` from `rate_history` for historically-correct TOU tier classification
+- `lib/fetch_rates.py`: stamps `tou_periods_json` when saving new rates; warns in `event_log` if TOU windows differ from stored settings
+- `lib/abode.py`: auto-deletes stale `abode.pickle` after 3 consecutive auth failures
+- `lib/powerwall.py`: detects all-zero power streak over 2 minutes, logs Tesla cloud outage event + recovery to `event_log`
+- `lib/network.py`: `_log_system_error` calls throttled to max once per 5 min to avoid flooding `event_log`
+- `lib/kasa.py`, `lib/nest.py`, `lib/rachio.py`, `lib/solar_forecast.py`, `lib/tuya.py`, `lib/weather.py`: `_log_system_error` added at all `print()`-only error sites
+- `lib/ai_insights.py`: projection uses `daily_costs` import ratio (not home kWh), partial-month blending, base_charge double-count removed; system prompt uses DEFICIT/UNDERSHOOT/WITHIN TARGET/OVERSHOOT buckets, bans snake_case output
+- `server.py`: `_record_tou_change` stamps new `rate_history` row when TOU periods saved via Settings; all DB calls use `connect()`; suppresses `optimized_table` when identical to projection; AI insights failure logged to `event_log`
+- `rules.py`: duplicate schema/seed code removed; `pw_retry_after` backoff on Tesla 429 rate limits
+- `frontend/src/components/BottomTiles.tsx`: new TemperatureTile (outside weather + Nest + Tuya wsdcg sensor) as 5th bottom tile
+- `frontend/src/components/SwitchesDrawer.tsx`: SensorTile for Tuya wsdcg; polling migrated to `usePolling` hook
+- `frontend/src/components/NetworkDevices.tsx`: `has_bans` field enables pin button for wired devices with prior AP bans
+- `frontend/src/components/EnergyCosts.tsx` + `globals.css`: month header rows show kWh totals per TOU tier
+- `frontend/src/lib/format.ts`: `relativeTime` moved here from `NetworkDevices.tsx`
+- Earlier (2026-05-31): `Rules.tsx` `nextFireForRule` mirrors server-side holiday-as-weekend logic; `lib/db.py` `tou_periods` seed changed to `INSERT OR IGNORE`; `server.py` 404 guard before UPDATE; `lib/ai_insights.py` condition label map extended
+- Earlier (2026-05-30): Gemini migrated to google-genai SDK; `lib/network.py` race condition fix; 9 new network device API routes in `server.py`
+- Earlier (2026-05-27): Major refactor — `server.py` split into 20 modules under `lib/`
+- Earlier: rules page drag-and-drop reorder, `notes` field, pause/resume toggle; PowerflowSVG energy split rework; rules.py hardening; pool tile GPM/RPM telemetry
 
 ## Agents Available
 - @code-expert — general code quality, security, performance
