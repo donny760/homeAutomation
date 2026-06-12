@@ -326,8 +326,8 @@ def main_loop(stop_fn=None):
 
         if pw is None:
             try:
-                log.info('Connecting to Powerwall (cloud mode)…')
-                pw = pypowerwall.Powerwall('', cloudmode=True,
+                log.info('Connecting to Powerwall (Fleet API mode)…')
+                pw = pypowerwall.Powerwall('', fleetapi=True,
                                            email=PW_EMAIL, timeout=30,
                                            authpath=BASE_DIR)
                 log.info('Connected.')

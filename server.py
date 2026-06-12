@@ -135,6 +135,11 @@ def index():
     return send_file(os.path.join('static', 'frontend', 'index.html'))
 
 
+@app.route('/.well-known/appspecific/com.tesla.3p.public-key.pem')
+def tesla_public_key():
+    return send_from_directory(BASE_DIR, 'com.tesla.3p.public-key.pem', mimetype='application/x-pem-file')
+
+
 @app.route('/_next/<path:filename>')
 def next_static(filename):
     return send_from_directory(os.path.join('static', 'frontend', '_next'), filename)

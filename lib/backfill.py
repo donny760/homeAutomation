@@ -26,7 +26,7 @@ def backfill_readings(start=None):
     """Import power + SOE data from Tesla cloud API."""
     start = start or DEFAULT_START
     print(f'Connecting to Powerwall cloud...')
-    pw = pypowerwall.Powerwall('', cloudmode=True,
+    pw = pypowerwall.Powerwall('', fleetapi=True,
                                email=PW_EMAIL,
                                timeout=60, authpath=BASE_DIR)
     print('Connected.')

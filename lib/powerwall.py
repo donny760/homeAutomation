@@ -42,24 +42,19 @@ def backfill_history() -> None:
       grid_power    – positive = importing, negative = exporting
     home_w is derived: home = solar - battery - grid  (energy conservation)
     """
-    print('Backfill: fetching last 24 h of history from Tesla cloud…')
+    print('Backfill: fetching last 24 h of history from Tesla Fleet API…')
     try:
-        pw = pypowerwall.Powerwall('', cloudmode=True, email=PW_EMAIL, timeout=30, authpath=BASE_DIR)
-        sites = pw.client.getsites()
-        if not sites:
-            print('Backfill: no sites returned.')
-            return
-        battery = sites[0]
+        pw = pypowerwall.Powerwall('', fleetapi=True, email=PW_EMAIL, timeout=30, authpath=BASE_DIR)
 
         now_utc   = datetime.now(timezone.utc)
         start_utc = now_utc - timedelta(hours=24)
-        end_str   = now_utc.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+        end_str   = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-        data = battery.get_calendar_history_data(
+        data = pw.client.fleet.get_calendar_history(
             kind='power',
-            period='day',
-            end_date=end_str,
-            timezone='America/Los_Angeles',
+            start=start_str,
+            end=end_str,
         )
 
         series = (data or {}).get('time_series', [])
@@ -128,9 +123,9 @@ def poller() -> None:
 
         try:
             if pw is None:
-                print('Connecting to Powerwall (cloud mode)…')
+                print('Connecting to Powerwall (Fleet API mode)…')
                 pw = pypowerwall.Powerwall(
-                    '', cloudmode=True, email=PW_EMAIL, timeout=30
+                    '', fleetapi=True, email=PW_EMAIL, timeout=30, authpath=BASE_DIR
                 )
                 print('Connected.')
 
