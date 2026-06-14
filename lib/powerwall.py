@@ -31,70 +31,77 @@ _cloud_zero_since:  float = 0.0   # timestamp when all-zero streak started
 
 
 def backfill_history() -> None:
-    """On startup, fill gaps in the last 12 hours using Tesla cloud history.
+    """On startup, fill gaps in the last 72 h using Tesla Fleet API calendar history.
 
-    The API returns ~15-min interval data.  We use INSERT OR IGNORE so existing
-    30-second readings are never overwritten.
+    Uses INSERT OR REPLACE guarded by a WHERE clause so only all-zero rows
+    (written by the poller during a cloud outage) get overwritten with real data.
+    Existing non-zero readings are never touched.
 
     Sign convention from Tesla history API:
       solar_power   – positive = producing
       battery_power – positive = discharging, negative = charging
       grid_power    – positive = importing, negative = exporting
-    home_w is derived: home = solar - battery - grid  (energy conservation)
+    home_w is derived: home = solar + battery + grid  (energy conservation)
     """
-    print('Backfill: fetching last 24 h of history from Tesla Fleet API…')
     try:
         pw = pypowerwall.Powerwall('', fleetapi=True, email=PW_EMAIL, timeout=30, authpath=BASE_DIR)
 
         now_utc   = datetime.now(timezone.utc)
-        start_utc = now_utc - timedelta(hours=24)
-        end_str   = now_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
-        start_str = start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+        start_day = (now_utc - timedelta(hours=72)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        today_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
 
-        data = pw.client.fleet.get_calendar_history(
-            kind='power',
-            start=start_str,
-            end=end_str,
-        )
+        inserted   = 0
+        total_rows = 0
+        current    = start_day
+        while current <= today_day:
+            # end = next midnight UTC+7 (= 11:59 PM PDT) — covers full Pacific day
+            end_str = f'{(current + timedelta(days=1)).strftime("%Y-%m-%d")}T06:59:59Z'
+            data    = pw.client.fleet.get_calendar_history(
+                kind='power',
+                duration='day',
+                end=end_str,
+            )
+            series      = (data or {}).get('time_series', [])
+            total_rows += len(series)
 
-        series = (data or {}).get('time_series', [])
-        if not series:
-            print('Backfill: no time_series in response.')
-            return
+            with connect() as c:
+                for row in series:
+                    raw_ts = row.get('timestamp', '')
+                    try:
+                        dt = datetime.fromisoformat(raw_ts)
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        ts = int(dt.timestamp())
+                    except ValueError:
+                        continue
 
-        cutoff = int(start_utc.timestamp())
-        inserted = 0
-        with connect() as c:
-            for row in series:
-                raw_ts = row.get('timestamp', '')
-                try:
-                    dt = datetime.fromisoformat(raw_ts)
-                    if dt.tzinfo is None:
-                        dt = dt.replace(tzinfo=timezone.utc)
-                    ts = int(dt.timestamp())
-                except ValueError:
-                    continue
+                    solar_w     = float(row.get('solar_power',   0) or 0)
+                    batt_w      = float(row.get('battery_power', 0) or 0)
+                    grid_w      = float(row.get('grid_power',    0) or 0)
+                    home_w      = solar_w + batt_w + grid_w
+                    batt_stored = -batt_w  # flip: positive=charging
 
-                if ts < cutoff:
-                    continue
+                    # Insert new rows; overwrite existing rows only if all-zero
+                    # (poller writes zeros during cloud outages — replace with real data)
+                    c.execute(
+                        '''INSERT INTO readings VALUES (?,?,?,?,?,?)
+                           ON CONFLICT(timestamp) DO UPDATE SET
+                             solar_w=excluded.solar_w, home_w=excluded.home_w,
+                             battery_w=excluded.battery_w, grid_w=excluded.grid_w
+                           WHERE readings.solar_w=0 AND readings.home_w=0
+                             AND readings.battery_w=0 AND readings.grid_w=0''',
+                        (ts, solar_w, home_w, batt_stored, grid_w, None)
+                    )
+                    inserted += c.execute('SELECT changes()').fetchone()[0]
 
-                solar_w   = float(row.get('solar_power',   0) or 0)
-                batt_w    = float(row.get('battery_power', 0) or 0)
-                grid_w    = float(row.get('grid_power',    0) or 0)
-                # Tesla history: battery+ = discharging, battery- = charging, grid+ = importing
-                home_w      = solar_w + batt_w + grid_w
-                batt_stored = -batt_w  # flip to positive=charging, matching live poller
+            current += timedelta(days=1)
 
-                cur = c.execute(
-                    'INSERT OR IGNORE INTO readings VALUES (?,?,?,?,?,?)',
-                    (ts, solar_w, home_w, batt_stored, grid_w, None)
-                )
-                inserted += cur.rowcount
-
-        print(f'Backfill: inserted {inserted} rows ({len(series)} returned by API).')
+        _log_success('powerwall', 'backfill_complete',
+                     f'Backfill: updated {inserted} readings ({total_rows} returned by API)')
 
     except Exception as exc:
-        print(f'Backfill error: {exc}')
+        _log_system_error('powerwall', 'Backfill failed', str(exc))
 
 
 def poller() -> None:
@@ -139,13 +146,15 @@ def poller() -> None:
                 elif not _cloud_unreachable and now_ts - _cloud_zero_since >= 120:
                     down_min = int((now_ts - _cloud_zero_since) / 60)
                     _log_system_error('powerwall', 'Tesla cloud unreachable',
-                                      f'No data for {down_min}+ min — likely 503 from Tesla API')
+                                      f'No data for {down_min}+ min — forcing reconnect')
                     _cloud_unreachable = True
+                    pw = None  # force reconnect on next iteration
             else:
                 if _cloud_unreachable:
                     down_min = max(1, int((now_ts - _cloud_zero_since) / 60))
                     _log_success('powerwall', 'cloud_recovered',
                                  f'Tesla cloud connection restored after {down_min} min')
+                    threading.Thread(target=backfill_history, daemon=True).start()
                 _cloud_zero_since = 0.0
                 _cloud_unreachable = False
 

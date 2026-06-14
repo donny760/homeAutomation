@@ -1,5 +1,5 @@
 # homeAutomation — Powerwall Dashboard
-> Last indexed: 2026-06-11
+> Last indexed: 2026-06-14
 
 ## What This Is
 Home automation dashboard for a San Diego home with 3x Powerwall 2 (40.5 kWh), solar, pool, and smart home devices. Tracks energy, runs TOU-aware automation rules, and integrates Abode security, Nest thermostats, Rachio irrigation, Kasa/Tuya plugs, and network device discovery.
@@ -17,7 +17,7 @@ Flask (`server.py`) is the backend entry point: it imports from `lib/` modules a
 ## Key Files
 - `server.py` — Flask backend entry point: registers all API routes, imports from `lib.*`; network device CRUD routes (`GET/PUT/DELETE /api/network/devices`, `/api/network/rediscover`, `/api/network/ap_filters`, per-MAC filter/pin/unpin); `HTTPException` passes through with its own status code; `PUT /api/rules/<id>/toggle` and `POST /api/rules/reorder` endpoints; 404 guard runs before UPDATE in `api_rules_put` / `api_rules_toggle`; debug insights endpoint uses `_call_gemini` helper; `_record_tou_change` helper stamps a new `rate_history` row when TOU periods saved via Settings; all DB calls use `connect()`; suppresses `optimized_table` when identical to projection; AI insights failure logged to `event_log`
 - `rules.py` — Powerwall automation rules engine, Windows-service-capable; imports from `lib.*`; `rules.log` via RotatingFileHandler (10 MB, 3 backups); `_rule_fires_at` treats holidays as weekends; `apply_settings` has no `first_run` param; duplicate schema/seed code removed; `pw_retry_after` backoff on Tesla 429 rate limits
-- `lib/powerwall.py` — main `poller` loop: fetches Powerwall + all device data every 10s/30s, logs readings and events, triggers periodic cost rebuilds and rate/holiday refreshes; detects all-zero power streak over 2 minutes and logs Tesla cloud outage event + recovery
+- `lib/powerwall.py` — main `poller` loop: fetches Powerwall + all device data every 10s/30s, logs readings and events, triggers periodic cost rebuilds and rate/holiday refreshes; detects all-zero power streak over 2 minutes, logs Tesla cloud outage event + recovery, sets `pw=None` to force reconnect, and spawns `backfill_history` in a background thread on recovery; `backfill_history` iterates day-by-day over a 72h lookback (one API call per calendar day), uses `INSERT ... ON CONFLICT DO UPDATE WHERE` to overwrite zero-rows with real data without touching genuine readings; `home_w` derived as solar + battery + grid; all logging via `_log_system_error` / `_log_success` (no bare `print()`)
 - `lib/db.py` — SQLite schema init, migrations, default rule/settings seeding, raw readings read/write; `tou_periods` seed uses `INSERT OR IGNORE` to preserve user-edited TOU settings across restarts; `connect()` helper returns a connection with WAL mode, busy_timeout, and FK enforcement; migration v2 adds `tou_periods_json` column to `rate_history` and backfills pre/post 2026-03-01 TOU windows; all `sqlite3.connect(DB_PATH)` calls across `lib/` migrated to `connect()`
 - `lib/state.py` — global `_live` dict + `_lock` for thread-safe real-time Powerwall data; defines `BASE_DIR` and `DB_PATH`
 - `lib/costs.py` — calculates/stores daily import/export costs by TOU tier; rebuilds historical data from readings; `rebuild_daily_costs` accepts `from_date`; `rebuild_daily_costs`, `_rebuild_today`, and `calc_stats` use per-date `tou_periods_json` from `rate_history` instead of the global setting
@@ -130,23 +130,24 @@ Gemini API key and Azure OpenAI credentials are stored in the `settings` DB tabl
 3. Restart Windows service on server-04 manually after deploy
 4. Live at `http://server-04:5001`
 
-## Recent Focus (as of 2026-06-11)
-- `lib/tuya.py`: wsdcg sensor category support — skips LAN DPS probe, polls via `_tuya_cloud_poll_sensors` every 5 min
-- `lib/db.py`: `connect()` helper (WAL + busy_timeout + FK); all `sqlite3.connect(DB_PATH)` calls across `lib/` migrated to it; migration v2 adds `tou_periods_json` to `rate_history` and backfills pre/post 2026-03-01 windows
-- `lib/costs.py`: `rebuild_daily_costs`, `_rebuild_today`, `calc_stats` now use per-date `tou_periods_json` from `rate_history` for historically-correct TOU tier classification
-- `lib/fetch_rates.py`: stamps `tou_periods_json` when saving new rates; warns in `event_log` if TOU windows differ from stored settings
-- `lib/abode.py`: auto-deletes stale `abode.pickle` after 3 consecutive auth failures
-- `lib/powerwall.py`: detects all-zero power streak over 2 minutes, logs Tesla cloud outage event + recovery to `event_log`
-- `lib/network.py`: `_log_system_error` calls throttled to max once per 5 min to avoid flooding `event_log`
-- `lib/kasa.py`, `lib/nest.py`, `lib/rachio.py`, `lib/solar_forecast.py`, `lib/tuya.py`, `lib/weather.py`: `_log_system_error` added at all `print()`-only error sites
-- `lib/ai_insights.py`: projection uses `daily_costs` import ratio (not home kWh), partial-month blending, base_charge double-count removed; system prompt uses DEFICIT/UNDERSHOOT/WITHIN TARGET/OVERSHOOT buckets, bans snake_case output
-- `server.py`: `_record_tou_change` stamps new `rate_history` row when TOU periods saved via Settings; all DB calls use `connect()`; suppresses `optimized_table` when identical to projection; AI insights failure logged to `event_log`
-- `rules.py`: duplicate schema/seed code removed; `pw_retry_after` backoff on Tesla 429 rate limits
-- `frontend/src/components/BottomTiles.tsx`: new TemperatureTile (outside weather + Nest + Tuya wsdcg sensor) as 5th bottom tile
-- `frontend/src/components/SwitchesDrawer.tsx`: SensorTile for Tuya wsdcg; polling migrated to `usePolling` hook
-- `frontend/src/components/NetworkDevices.tsx`: `has_bans` field enables pin button for wired devices with prior AP bans
-- `frontend/src/components/EnergyCosts.tsx` + `globals.css`: month header rows show kWh totals per TOU tier
-- `frontend/src/lib/format.ts`: `relativeTime` moved here from `NetworkDevices.tsx`
+## Recent Focus (as of 2026-06-14)
+- `lib/powerwall.py`: `backfill_history` reworked — lookback extended from 24h to 72h; switched to day-by-day iteration (one API call per calendar day); upsert changed to `INSERT ... ON CONFLICT DO UPDATE WHERE` so cloud-outage zero-rows get overwritten with real data but genuine readings are never touched; on outage detection sets `pw=None` to force reconnect on next iteration; on cloud recovery spawns `backfill_history` in a background thread automatically; all `print()` calls replaced with `_log_system_error` / `_log_success`; `home_w` derivation comment fixed (solar + battery + grid)
+- Earlier (2026-06-11): `lib/tuya.py`: wsdcg sensor category support — skips LAN DPS probe, polls via `_tuya_cloud_poll_sensors` every 5 min
+- Earlier (2026-06-11): `lib/db.py`: `connect()` helper (WAL + busy_timeout + FK); all `sqlite3.connect(DB_PATH)` calls across `lib/` migrated to it; migration v2 adds `tou_periods_json` to `rate_history` and backfills pre/post 2026-03-01 windows
+- Earlier (2026-06-11): `lib/costs.py`: `rebuild_daily_costs`, `_rebuild_today`, `calc_stats` now use per-date `tou_periods_json` from `rate_history` for historically-correct TOU tier classification
+- Earlier (2026-06-11): `lib/fetch_rates.py`: stamps `tou_periods_json` when saving new rates; warns in `event_log` if TOU windows differ from stored settings
+- Earlier (2026-06-11): `lib/abode.py`: auto-deletes stale `abode.pickle` after 3 consecutive auth failures
+- Earlier (2026-06-11): `lib/powerwall.py`: detects all-zero power streak over 2 minutes, logs Tesla cloud outage event + recovery to `event_log`
+- Earlier (2026-06-11): `lib/network.py`: `_log_system_error` calls throttled to max once per 5 min to avoid flooding `event_log`
+- Earlier (2026-06-11): `lib/kasa.py`, `lib/nest.py`, `lib/rachio.py`, `lib/solar_forecast.py`, `lib/tuya.py`, `lib/weather.py`: `_log_system_error` added at all `print()`-only error sites
+- Earlier (2026-06-11): `lib/ai_insights.py`: projection uses `daily_costs` import ratio (not home kWh), partial-month blending, base_charge double-count removed; system prompt uses DEFICIT/UNDERSHOOT/WITHIN TARGET/OVERSHOOT buckets, bans snake_case output
+- Earlier (2026-06-11): `server.py`: `_record_tou_change` stamps new `rate_history` row when TOU periods saved via Settings; all DB calls use `connect()`; suppresses `optimized_table` when identical to projection; AI insights failure logged to `event_log`
+- Earlier (2026-06-11): `rules.py`: duplicate schema/seed code removed; `pw_retry_after` backoff on Tesla 429 rate limits
+- Earlier (2026-06-11): `frontend/src/components/BottomTiles.tsx`: new TemperatureTile (outside weather + Nest + Tuya wsdcg sensor) as 5th bottom tile
+- Earlier (2026-06-11): `frontend/src/components/SwitchesDrawer.tsx`: SensorTile for Tuya wsdcg; polling migrated to `usePolling` hook
+- Earlier (2026-06-11): `frontend/src/components/NetworkDevices.tsx`: `has_bans` field enables pin button for wired devices with prior AP bans
+- Earlier (2026-06-11): `frontend/src/components/EnergyCosts.tsx` + `globals.css`: month header rows show kWh totals per TOU tier
+- Earlier (2026-06-11): `frontend/src/lib/format.ts`: `relativeTime` moved here from `NetworkDevices.tsx`
 - Earlier (2026-05-31): `Rules.tsx` `nextFireForRule` mirrors server-side holiday-as-weekend logic; `lib/db.py` `tou_periods` seed changed to `INSERT OR IGNORE`; `server.py` 404 guard before UPDATE; `lib/ai_insights.py` condition label map extended
 - Earlier (2026-05-30): Gemini migrated to google-genai SDK; `lib/network.py` race condition fix; 9 new network device API routes in `server.py`
 - Earlier (2026-05-27): Major refactor — `server.py` split into 20 modules under `lib/`
