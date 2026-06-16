@@ -28,6 +28,7 @@ POLL_INTERVAL = 10   # seconds between pypowerwall polls
 DB_WRITE_EVERY = 30  # seconds between DB writes
 _cloud_unreachable: bool  = False  # True once outage threshold crossed
 _cloud_zero_since:  float = 0.0   # timestamp when all-zero streak started
+_backfill_running         = threading.Event()  # prevents overlapping backfill threads
 
 
 def backfill_history() -> None:
@@ -55,45 +56,53 @@ def backfill_history() -> None:
         total_rows = 0
         current    = start_day
         while current <= today_day:
-            # end = next midnight UTC+7 (= 11:59 PM PDT) — covers full Pacific day
-            end_str = f'{(current + timedelta(days=1)).strftime("%Y-%m-%d")}T06:59:59Z'
-            data    = pw.client.fleet.get_calendar_history(
-                kind='power',
-                duration='day',
-                end=end_str,
-            )
-            series      = (data or {}).get('time_series', [])
-            total_rows += len(series)
+            day_str = current.strftime('%Y-%m-%d')
+            # T08:59:59Z = just after midnight PST (UTC-8); covers PDT (UTC-7) too
+            end_str = f'{(current + timedelta(days=1)).strftime("%Y-%m-%d")}T08:59:59Z'
+            try:
+                data = pw.client.fleet.get_calendar_history(
+                    kind='power',
+                    duration='day',
+                    end=end_str,
+                )
+                series      = (data or {}).get('time_series', [])
+                total_rows += len(series)
 
-            with connect() as c:
-                for row in series:
-                    raw_ts = row.get('timestamp', '')
-                    try:
-                        dt = datetime.fromisoformat(raw_ts)
-                        if dt.tzinfo is None:
-                            dt = dt.replace(tzinfo=timezone.utc)
-                        ts = int(dt.timestamp())
-                    except ValueError:
-                        continue
+                with connect() as c:
+                    for row in series:
+                        raw_ts = row.get('timestamp', '')
+                        try:
+                            dt = datetime.fromisoformat(raw_ts)
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            ts = int(dt.timestamp())
+                        except ValueError:
+                            _log_system_error('powerwall', 'Backfill parse error',
+                                              f'Bad timestamp {raw_ts!r} on {day_str}')
+                            continue
 
-                    solar_w     = float(row.get('solar_power',   0) or 0)
-                    batt_w      = float(row.get('battery_power', 0) or 0)
-                    grid_w      = float(row.get('grid_power',    0) or 0)
-                    home_w      = solar_w + batt_w + grid_w
-                    batt_stored = -batt_w  # flip: positive=charging
+                        solar_w     = float(row.get('solar_power',   0) or 0)
+                        batt_w      = float(row.get('battery_power', 0) or 0)
+                        grid_w      = float(row.get('grid_power',    0) or 0)
+                        home_w      = solar_w + batt_w + grid_w
+                        batt_stored = -batt_w  # flip: positive=charging
 
-                    # Insert new rows; overwrite existing rows only if all-zero
-                    # (poller writes zeros during cloud outages — replace with real data)
-                    c.execute(
-                        '''INSERT INTO readings VALUES (?,?,?,?,?,?)
-                           ON CONFLICT(timestamp) DO UPDATE SET
-                             solar_w=excluded.solar_w, home_w=excluded.home_w,
-                             battery_w=excluded.battery_w, grid_w=excluded.grid_w
-                           WHERE readings.solar_w=0 AND readings.home_w=0
-                             AND readings.battery_w=0 AND readings.grid_w=0''',
-                        (ts, solar_w, home_w, batt_stored, grid_w, None)
-                    )
-                    inserted += c.execute('SELECT changes()').fetchone()[0]
+                        # Insert new rows; overwrite existing rows only if all-zero
+                        # (poller writes zeros during cloud outages — replace with real data)
+                        c.execute(
+                            '''INSERT INTO readings VALUES (?,?,?,?,?,?)
+                               ON CONFLICT(timestamp) DO UPDATE SET
+                                 solar_w=excluded.solar_w, home_w=excluded.home_w,
+                                 battery_w=excluded.battery_w, grid_w=excluded.grid_w
+                               WHERE readings.solar_w=0 AND readings.home_w=0
+                                 AND readings.battery_w=0 AND readings.grid_w=0''',
+                            (ts, solar_w, home_w, batt_stored, grid_w, None)
+                        )
+                        inserted += c.execute('SELECT changes()').fetchone()[0]
+
+            except Exception as exc:
+                _log_system_error('powerwall', 'Backfill day failed',
+                                  f'{day_str}: {exc}')
 
             current += timedelta(days=1)
 
@@ -102,6 +111,8 @@ def backfill_history() -> None:
 
     except Exception as exc:
         _log_system_error('powerwall', 'Backfill failed', str(exc))
+    finally:
+        _backfill_running.clear()
 
 
 def poller() -> None:
@@ -154,7 +165,9 @@ def poller() -> None:
                     down_min = max(1, int((now_ts - _cloud_zero_since) / 60))
                     _log_success('powerwall', 'cloud_recovered',
                                  f'Tesla cloud connection restored after {down_min} min')
-                    threading.Thread(target=backfill_history, daemon=True).start()
+                    if not _backfill_running.is_set():
+                        _backfill_running.set()
+                        threading.Thread(target=backfill_history, daemon=True).start()
                 _cloud_zero_since = 0.0
                 _cloud_unreachable = False
 

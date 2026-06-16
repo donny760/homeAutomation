@@ -8,13 +8,13 @@ Run: py backfill.py              # backfill from 2025-01-01
 """
 import os
 import sys
-import sqlite3
 import json
 import re
 from datetime import datetime, timezone, timedelta, date
 
 import pypowerwall
 import requests
+from db import connect
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH  = os.path.join(BASE_DIR, 'powerwall.db')
@@ -31,12 +31,6 @@ def backfill_readings(start=None):
                                timeout=60, authpath=BASE_DIR)
     print('Connected.')
 
-    sites = pw.client.getsites()
-    if not sites:
-        print('No sites returned — cannot backfill.')
-        return 0
-    battery = sites[0]
-
     inserted = 0
     skipped  = 0
     cutoff   = int(start.timestamp())
@@ -48,14 +42,13 @@ def backfill_readings(start=None):
 
         while current <= today:
             day_lbl  = current.strftime('%Y-%m-%d')
-            # end_date at midnight UTC of next day to get full 24h of data
-            end_str  = f'{(current + timedelta(days=1)).strftime("%Y-%m-%d")}T06:59:59.000Z'
+            # T08:59:59Z = just after midnight PST (UTC-8); also covers PDT (UTC-7 = 07:59:59Z)
+            end_str  = f'{(current + timedelta(days=1)).strftime("%Y-%m-%d")}T08:59:59Z'
 
             # ── Power data ──
             try:
-                data   = battery.get_calendar_history_data(
-                    kind='power', period='day',
-                    end_date=end_str, timezone='America/Los_Angeles',
+                data   = pw.client.fleet.get_calendar_history(
+                    kind='power', duration='day', end=end_str,
                 )
                 series = (data or {}).get('time_series', [])
             except Exception as e:
@@ -95,9 +88,8 @@ def backfill_readings(start=None):
 
             # ── SOE (battery %) data ──
             try:
-                soe_data = battery.get_calendar_history_data(
-                    kind='soe', period='day',
-                    end_date=end_str, timezone='America/Los_Angeles',
+                soe_data = pw.client.fleet.get_calendar_history(
+                    kind='soe', duration='day', end=end_str,
                 )
                 soe_series = (soe_data or {}).get('time_series', [])
             except Exception as e:

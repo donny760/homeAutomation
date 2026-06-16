@@ -192,21 +192,24 @@ def next_rule_fire(dt: datetime, rules: list) -> datetime | None:
 
 def get_live_state(conn) -> dict:
     state = {}
+    # battery_pct: skip NULL rows (backfill from Fleet API history has no SoC) and
+    # zero rows (written during cloud outages) — both would make < N conditions
+    # spuriously True.  None causes _eval_single to return False (fail safe).
     try:
         row = conn.execute(
-            'SELECT battery_pct FROM readings ORDER BY timestamp DESC LIMIT 1'
+            'SELECT battery_pct FROM readings WHERE battery_pct > 0 ORDER BY timestamp DESC LIMIT 1'
         ).fetchone()
-        state['battery_pct'] = float(row[0]) if row else 0.0
+        state['battery_pct'] = float(row[0]) if row else None
     except Exception:
-        state['battery_pct'] = 0.0
+        state['battery_pct'] = None
     try:
         today = date.today().isoformat()
         row = conn.execute(
             'SELECT import_cost - export_credit FROM daily_costs WHERE date = ?', (today,)
         ).fetchone()
-        state['net_cost'] = float(row[0]) if row and row[0] is not None else 0.0
+        state['net_cost'] = float(row[0]) if row and row[0] is not None else None
     except Exception:
-        state['net_cost'] = 0.0
+        state['net_cost'] = None
     try:
         row = conn.execute(
             "SELECT value FROM settings WHERE key = 'tomorrow_solar_kwh'"
@@ -220,9 +223,9 @@ def get_live_state(conn) -> dict:
             'SELECT SUM(import_cost) - SUM(export_credit) FROM daily_costs WHERE date >= ?',
             (year_start,)
         ).fetchone()
-        state['net_cost_ytd'] = float(row[0]) if row and row[0] is not None else 0.0
+        state['net_cost_ytd'] = float(row[0]) if row and row[0] is not None else None
     except Exception:
-        state['net_cost_ytd'] = 0.0
+        state['net_cost_ytd'] = None
     return state
 
 
