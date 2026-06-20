@@ -317,6 +317,12 @@ def init_db() -> None:
 
 
 def write_reading(solar_w, home_w, battery_w, grid_w, battery_pct) -> None:
+    # timestamp is a 1s-resolution PRIMARY KEY. INSERT OR IGNORE means a second
+    # write in the same second is silently dropped — possible only when the live
+    # poller and a startup backfill overlap (both keyed on the same second). The
+    # live poller writes every DB_WRITE_EVERY (30s), so live-vs-live collisions
+    # don't occur; the live row is kept and the backfill row for that second is
+    # the one dropped, which is the desired precedence.
     with connect() as c:
         c.execute(
             'INSERT OR IGNORE INTO readings VALUES (?,?,?,?,?,?)',

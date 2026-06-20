@@ -10,7 +10,7 @@ Usage:
   py rules.py remove
 """
 
-import os, sys, time, logging, logging.handlers, sqlite3, json
+import os, sys, time, logging, logging.handlers, json
 from datetime import datetime, date, timedelta
 
 import pypowerwall
@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 from lib.fetch_rates import is_sdge_holiday, holiday_name
-from lib.db import init_db
+from lib.db import init_db, connect
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PW_EMAIL      = 'don@nsdsolutions.com'
@@ -305,10 +305,6 @@ def main_loop(stop_fn=None):
     os.chdir(BASE_DIR)
     log.info('Powerwall Rules Engine v2 starting.')
 
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA busy_timeout=10000')
-    conn.execute('PRAGMA foreign_keys = ON')
     init_db()  # lib/db handles schema + seeding via its own connection
 
     pw               = None
@@ -342,60 +338,67 @@ def main_loop(stop_fn=None):
 
         if now - last_eval >= EVAL_INTERVAL:
             target = None
+            live   = {}
+            # Fresh connection per eval cycle — the 60s cadence makes open/close
+            # cheap, and not holding a long-lived handle avoids pinning the WAL.
+            conn = connect()
             try:
-                rules = load_rules_from_db(conn)
-                live  = get_live_state(conn)
-                dt    = datetime.now()
-
-                # Prune cond_cache entries older than 3 days to prevent unbounded growth
-                cutoff = (dt - timedelta(days=3)).isoformat()
-                cond_cache = {k: v for k, v in cond_cache.items() if k[1] >= cutoff}
-
-                target = current_target_state(dt, rules, live, cond_cache)
-                nxt    = next_rule_fire(dt, rules)
-
-                # Log holiday once per day
-                hol = target.pop('_holiday', None)
-                if hol and last_holiday_logged != dt.date():
-                    log.info('Holiday active: %s — weekend rules apply', hol)
-                    log_event(conn, 'powerwall', 'holiday_active',
-                              f'Holiday: {hol} — weekend rules apply',
-                              result='ok', battery_pct=live.get('battery_pct'))
-                    last_holiday_logged = dt.date()
-
-                state_sig = (target['mode'], target['reserve'], target['grid_charging'], target['grid_export'])
-                if state_sig != last_state_sig:
-                    log.info(
-                        'STATE  mode=%-16s reserve=%s  grid_charge=%-5s  grid_export=%s%s',
-                        target['mode'],
-                        f"{target['reserve']}%" if target['reserve'] is not None else 'none',
-                        target['grid_charging'], target['grid_export'],
-                        '  [HOLIDAY]' if hol else '',
-                    )
-                    last_state_sig = state_sig
-
-                if nxt != last_nxt:
-                    if nxt:
-                        log.info('Next rule fires at %s', nxt.strftime('%Y-%m-%d %H:%M'))
-                    last_nxt = nxt
-
-                last_eval = now
-
-            except Exception as exc:
-                log.exception('Evaluation error: %s: %s', type(exc).__name__, exc)
-
-            if target is not None and now >= pw_retry_after:
                 try:
-                    apply_settings(pw, target, last_state,
-                                   conn=conn, battery_pct=live.get('battery_pct'))
+                    rules = load_rules_from_db(conn)
+                    live  = get_live_state(conn)
+                    dt    = datetime.now()
+
+                    # Prune cond_cache entries older than 3 days to prevent unbounded growth
+                    cutoff = (dt - timedelta(days=3)).isoformat()
+                    cond_cache = {k: v for k, v in cond_cache.items() if k[1] >= cutoff}
+
+                    target = current_target_state(dt, rules, live, cond_cache)
+                    nxt    = next_rule_fire(dt, rules)
+
+                    # Log holiday once per day
+                    hol = target.pop('_holiday', None)
+                    if hol and last_holiday_logged != dt.date():
+                        log.info('Holiday active: %s — weekend rules apply', hol)
+                        log_event(conn, 'powerwall', 'holiday_active',
+                                  f'Holiday: {hol} — weekend rules apply',
+                                  result='ok', battery_pct=live.get('battery_pct'))
+                        last_holiday_logged = dt.date()
+
+                    state_sig = (target['mode'], target['reserve'], target['grid_charging'], target['grid_export'])
+                    if state_sig != last_state_sig:
+                        log.info(
+                            'STATE  mode=%-16s reserve=%s  grid_charge=%-5s  grid_export=%s%s',
+                            target['mode'],
+                            f"{target['reserve']}%" if target['reserve'] is not None else 'none',
+                            target['grid_charging'], target['grid_export'],
+                            '  [HOLIDAY]' if hol else '',
+                        )
+                        last_state_sig = state_sig
+
+                    if nxt != last_nxt:
+                        if nxt:
+                            log.info('Next rule fires at %s', nxt.strftime('%Y-%m-%d %H:%M'))
+                        last_nxt = nxt
+
+                    last_eval = now
+
                 except Exception as exc:
-                    if '429' in str(exc):
-                        pw_retry_after = now + 300
-                        log.warning('Tesla rate limit (429) — pausing apply for 5 min')
-                    else:
-                        log.error('Powerwall apply error: %s — reconnecting', exc)
-                        pw = None
-                        pw_retry_after = now + 60
+                    log.exception('Evaluation error: %s: %s', type(exc).__name__, exc)
+
+                if target is not None and now >= pw_retry_after:
+                    try:
+                        apply_settings(pw, target, last_state,
+                                       conn=conn, battery_pct=live.get('battery_pct'))
+                    except Exception as exc:
+                        if '429' in str(exc):
+                            pw_retry_after = now + 300
+                            log.warning('Tesla rate limit (429) — pausing apply for 5 min')
+                        else:
+                            log.error('Powerwall apply error: %s — reconnecting', exc)
+                            pw = None
+                            pw_retry_after = now + 60
+            finally:
+                conn.close()
 
         time.sleep(LOOP_SLEEP)
 

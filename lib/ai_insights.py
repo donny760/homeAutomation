@@ -1,6 +1,7 @@
 import json
 import math
 import sqlite3
+import threading
 import time
 from datetime import datetime, date, timedelta
 
@@ -1064,7 +1065,13 @@ def _build_ai_context():
     }, indent=None, default=str), baseline_md, optimized_md
 
 
-_ai_cache = {'text': None, 'model': None, 'ts': 0, 'table': None}
+# Full shape declared in one place. Mutated from concurrent Flask request
+# threads — guard multi-field reads/writes with _ai_cache_lock.
+_ai_cache = {
+    'text': None, 'model': None, 'ts': 0, 'table': None,
+    'optimized': None, 'provider': 'gemini',
+}
+_ai_cache_lock = threading.Lock()
 
 # Cache never auto-expires. Invalidated only on:
 #   - rule create/update/delete (sets ts=0)

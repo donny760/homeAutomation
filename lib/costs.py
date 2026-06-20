@@ -97,6 +97,18 @@ def _backfill_rates_event_url() -> None:
 
 
 def _rebuild_today() -> None:
+    # Serialize with full rebuilds via _cost_rebuild_lock — both write today's
+    # daily_costs row and contend on the WAL write lock. If a full rebuild is
+    # already running it covers today too, so skip rather than block.
+    if not _cost_rebuild_lock.acquire(blocking=False):
+        return
+    try:
+        _rebuild_today_locked()
+    finally:
+        _cost_rebuild_lock.release()
+
+
+def _rebuild_today_locked() -> None:
     today_dt = date.today()
     today_str = today_dt.isoformat()
     midnight = int(datetime(today_dt.year, today_dt.month, today_dt.day).timestamp())

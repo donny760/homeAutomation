@@ -36,6 +36,7 @@ from lib.db import (
 from lib.settings import (
     _SETTINGS_DEFAULTS, _seed_settings, load_settings,
     get_setting, get_setting_int, get_setting_bool, _load_tou_periods,
+    invalidate_settings_cache,
 )
 from lib.events import (
     _log_system_error, _log_success, _switches_log_event,
@@ -96,7 +97,7 @@ from lib.switches import (
 from lib.powerwall import poller, backfill_history
 import lib.ai_insights as ai_insights
 from lib.ai_insights import (
-    _ai_cache, _azure_configured, _build_ai_context, _gemini_system_prompt,
+    _ai_cache, _ai_cache_lock, _azure_configured, _build_ai_context, _gemini_system_prompt,
     _call_gemini, _call_azure_openai, _ProviderError,
 )
 from lib.rule_helpers import (
@@ -182,6 +183,12 @@ def api_live():
     solar_kwh, s_today, self_suff, grid_kwh = calc_stats(t_rows)
     _, s_month, _, _                = calc_stats(month_rows())
 
+    # Staleness guard: the poller updates _live every POLL_INTERVAL (10s). If the
+    # daemon thread dies, _live keeps serving its last values silently — flag it
+    # so the frontend can signal a stalled backend instead of showing stale data.
+    ts = d.get('ts', 0)
+    stale = (ts == 0) or (time.time() - ts > 60)
+
     return jsonify({
         'solar_w':         round(solar_w),
         'home_w':          round(home_w),
@@ -198,7 +205,8 @@ def api_live():
         'savings_month':   round(s_month, 2),
         'self_sufficiency': round(self_suff, 1),
         'mode':            mode,
-        'ts':              d.get('ts', 0),
+        'ts':              ts,
+        'stale':           stale,
     })
 
 
@@ -551,16 +559,19 @@ def api_rules_ai_insights():
     force_refresh = request.args.get('refresh') == '1'
 
     # Return cached response if available and not invalidated (ts > 0)
-    if not force_refresh and _ai_cache['text'] and _ai_cache['ts'] > 0:
-        return jsonify({'ok': True, 'insights': _ai_cache['text'], 'model': _ai_cache['model'],
-                        'projection_table': _ai_cache['table'],
-                        'optimized_table': _ai_cache.get('optimized'), 'cached': True,
-                        'provider': _ai_cache.get('provider', 'gemini')})
+    if not force_refresh:
+        with _ai_cache_lock:
+            cached = dict(_ai_cache) if (_ai_cache['text'] and _ai_cache['ts'] > 0) else None
+        if cached:
+            return jsonify({'ok': True, 'insights': cached['text'], 'model': cached['model'],
+                            'projection_table': cached['table'],
+                            'optimized_table': cached.get('optimized'), 'cached': True,
+                            'provider': cached.get('provider', 'gemini')})
 
     gemini_key = get_setting('gemini_api_key', '')
     gemini_model = get_setting('gemini_model', 'gemini-2.0-flash')
     if not gemini_key and not _azure_configured():
-        return jsonify({'ok': False, 'error': 'No AI provider configured. Add a Gemini or Azure OpenAI key in Settings.'}), 400
+        return jsonify({'error': 'No AI provider configured. Add a Gemini or Azure OpenAI key in Settings.'}), 400
 
     context, table_md, opt_md = _build_ai_context()
     system_prompt = _gemini_system_prompt(_load_tou_periods())
@@ -576,12 +587,12 @@ def api_rules_ai_insights():
                 time.sleep(2 ** attempt)
             try:
                 text = _call_gemini(system_prompt, user_msg, gemini_model, gemini_key)
-                _ai_cache['text'] = text
-                _ai_cache['model'] = gemini_model
-                _ai_cache['table'] = table_md
-                _ai_cache['optimized'] = opt_md if opt_md != table_md else None
-                _ai_cache['provider'] = 'gemini'
-                _ai_cache['ts'] = time.time()
+                with _ai_cache_lock:
+                    _ai_cache.update({
+                        'text': text, 'model': gemini_model, 'table': table_md,
+                        'optimized': opt_md if opt_md != table_md else None,
+                        'provider': 'gemini', 'ts': time.time(),
+                    })
                 return jsonify({'ok': True, 'insights': text, 'model': gemini_model,
                                 'projection_table': table_md,
                                 'optimized_table': opt_md if opt_md != table_md else None,
@@ -607,12 +618,12 @@ def api_rules_ai_insights():
         api_version = get_setting('azure_openai_api_version', '2024-10-21')
         try:
             text = _call_azure_openai(system_prompt, user_msg, endpoint, deployment, azure_key, api_version)
-            _ai_cache['text'] = text
-            _ai_cache['model'] = f'azure:{deployment}'
-            _ai_cache['table'] = table_md
-            _ai_cache['optimized'] = opt_md if opt_md != table_md else None
-            _ai_cache['provider'] = 'azure_openai'
-            _ai_cache['ts'] = time.time()
+            with _ai_cache_lock:
+                _ai_cache.update({
+                    'text': text, 'model': f'azure:{deployment}', 'table': table_md,
+                    'optimized': opt_md if opt_md != table_md else None,
+                    'provider': 'azure_openai', 'ts': time.time(),
+                })
             print(f'Gemini failed, Azure OpenAI ({deployment}) succeeded as fallback')
             return jsonify({'ok': True, 'insights': text, 'model': f'azure:{deployment}',
                             'projection_table': table_md,
@@ -629,24 +640,26 @@ def api_rules_ai_insights():
         last_err = f'{gemini_err}; Azure not configured'
 
     # Phase 3: Stale cache fallback
-    if _ai_cache['text']:
-        age_min = int((time.time() - _ai_cache['ts']) / 60)
+    with _ai_cache_lock:
+        cached = dict(_ai_cache) if _ai_cache['text'] else None
+    if cached:
+        age_min = int((time.time() - cached['ts']) / 60)
         return jsonify({
             'ok': True,
-            'insights': _ai_cache['text'],
-            'model': _ai_cache['model'],
-            'projection_table': _ai_cache['table'],
-            'optimized_table': _ai_cache.get('optimized'),
+            'insights': cached['text'],
+            'model': cached['model'],
+            'projection_table': cached['table'],
+            'optimized_table': cached.get('optimized'),
             'cached': True,
             'stale': True,
             'stale_age_min': age_min,
-            'provider': _ai_cache.get('provider', 'gemini'),
+            'provider': cached.get('provider', 'gemini'),
             'stale_reason': f'All providers unavailable. Showing cached response from {age_min} min ago. Last error: {last_err}',
         })
 
     # Phase 4: Hard error
     _log_system_error('ai', 'AI insights failed', last_err or 'All providers unavailable')
-    return jsonify({'ok': False, 'error': f'AI providers unavailable. {last_err}'}), 502
+    return jsonify({'error': f'AI providers unavailable. {last_err}'}), 502
 
 
 @app.route('/api/rules/ai-insights/debug')
@@ -821,7 +834,7 @@ def api_rates_refresh():
         rates = fetch_ev_tou2_rates()
         return jsonify({'ok': True, 'updated': rates.get('updated')})
     except Exception as exc:
-        return jsonify({'ok': False, 'error': str(exc)}), 500
+        return jsonify({'error': str(exc)}), 500
 
 
 # ── Abode debug endpoint ─────────────────────────────────────────────────────
@@ -1842,6 +1855,7 @@ def api_settings_update():
                     (key, str(value))
                 )
         c.commit()
+    invalidate_settings_cache()
     return jsonify({'ok': True})
 
 

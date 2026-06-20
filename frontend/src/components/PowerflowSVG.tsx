@@ -15,6 +15,8 @@ export interface LiveData {
   solar_kwh_today?: number;
   grid_kwh_today?: number;
   mode?: string;
+  ts?: number;
+  stale?: boolean;
 }
 
 interface PowerflowSVGProps {

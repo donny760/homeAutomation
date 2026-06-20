@@ -22,6 +22,22 @@ export default function Dashboard() {
 
   return (
     <div id="page-dashboard" className="page active">
+      {liveData?.stale && (
+        <div
+          role="status"
+          style={{
+            background: 'rgba(224, 82, 82, 0.15)',
+            border: '1px solid #e05252',
+            color: '#e05252',
+            borderRadius: 8,
+            padding: '8px 12px',
+            marginBottom: 12,
+            fontSize: 13,
+          }}
+        >
+          ⚠ Live data is stale — the Powerwall poller may have stalled. Showing last-known values.
+        </div>
+      )}
       <div className="main-row">
         <div className="flow-col">
           <PowerflowSVG data={liveData} />

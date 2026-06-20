@@ -1,6 +1,6 @@
 import json
 import os
-import sqlite3
+import time
 
 import lib.state as state
 from lib.db import connect
@@ -21,7 +21,7 @@ _SETTINGS_DEFAULTS = {
     'rain_skip_max_days':          '7',
     'rain_skip_check_interval':    '3600',
     'abode_enabled':               '1',
-    'cost_rebuild_days':           '1',
+    'cost_rebuild_days':           '7',   # lookback window for the daily catch-up cost rebuild
     'holidays_poll_months':        '1',
     'rates_poll_months':           '1',
     'refresh_start_date':          '',
@@ -98,15 +98,39 @@ def _seed_settings(conn):
 
 
 def load_settings() -> dict:
+    """Fresh, uncached read of all settings (used to render the Settings page)."""
     with connect() as c:
         rows = c.execute('SELECT key, value FROM settings').fetchall()
     return {k: v for k, v in rows}
 
 
+# In-process settings cache. The poller reads ~15 settings every 10s; without a
+# cache that's ~90 open/query/close cycles per minute for config that rarely
+# changes. A short TTL bounds staleness for the *other* process (rules.py);
+# the writing process (server.py) invalidates explicitly on PUT /api/settings.
+_SETTINGS_TTL = 30.0  # seconds
+_settings_cache: dict = {}
+_settings_cache_ts: float = 0.0
+
+
+def _settings_snapshot() -> dict:
+    global _settings_cache, _settings_cache_ts
+    now = time.time()
+    if now - _settings_cache_ts >= _SETTINGS_TTL:
+        # Atomic rebind — concurrent readers see either the old or new dict, never partial.
+        _settings_cache = load_settings()
+        _settings_cache_ts = now
+    return _settings_cache
+
+
+def invalidate_settings_cache() -> None:
+    global _settings_cache_ts
+    _settings_cache_ts = 0.0
+
+
 def get_setting(key: str, default=None):
-    with connect() as c:
-        row = c.execute('SELECT value FROM settings WHERE key = ?', (key,)).fetchone()
-    return row[0] if row else default
+    val = _settings_snapshot().get(key)
+    return val if val is not None else default
 
 
 def get_setting_int(key: str, default: int = 0) -> int:

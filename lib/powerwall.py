@@ -1,9 +1,8 @@
 import json
-import sqlite3
 import threading
 import time
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, date, timedelta, timezone
 
 import pypowerwall
 
@@ -141,11 +140,10 @@ def poller() -> None:
 
         try:
             if pw is None:
-                print('Connecting to Powerwall (Fleet API mode)…')
                 pw = pypowerwall.Powerwall(
                     '', fleetapi=True, email=PW_EMAIL, timeout=30, authpath=BASE_DIR
                 )
-                print('Connected.')
+                _log_success('powerwall', 'connect', 'Connected to Powerwall (Fleet API mode)')
 
             power = pw.power() or {}
             level = pw.level() or 0
@@ -205,9 +203,12 @@ def poller() -> None:
                 purge_old()
                 last_purge = now
 
-            cost_interval = get_setting_int('cost_rebuild_days', 7) * 86400
-            if now - last_cost_rebuild >= cost_interval:
-                _spawn_rebuild_daily_costs()
+            # Daily catch-up rebuild, bounded to the last `cost_rebuild_days` days
+            # so it never rescans the full year. Full-year rebuilds are reserved
+            # for the explicit /api/costs/rebuild trigger.
+            if now - last_cost_rebuild >= 86400:
+                lookback = get_setting_int('cost_rebuild_days', 7)
+                _spawn_rebuild_daily_costs(from_date=date.today() - timedelta(days=lookback))
                 last_cost_rebuild = now
 
             if now - last_today_rebuild >= 3600:
@@ -227,9 +228,7 @@ def poller() -> None:
                     if old_year and new_year and new_year != old_year:
                         _log_success('holidays', 'holidays_updated',
                                      f'Holidays regenerated for {new_year}')
-                    print('Holidays refreshed')
                 except Exception as exc:
-                    print(f'Holidays refresh error: {exc}')
                     _log_system_error('holidays', 'Holiday refresh failed', str(exc))
                 last_holidays_check = now
 
@@ -267,7 +266,6 @@ def poller() -> None:
                                      f'Rates updated (eff. {new_rates.get("effective_date", "?")})',
                                      detail='  '.join(detail_parts))
                 except Exception as exc:
-                    print(f'Rate fetch error: {exc}')
                     _log_system_error('rates', 'Energy rate refresh failed', str(exc))
                 last_rates_check = now
 
@@ -278,7 +276,6 @@ def poller() -> None:
                     try:
                         fetch_rachio_events()
                     except Exception as exc:
-                        print(f'Rachio event poll error: {exc}')
                         _log_system_error('rachio', 'Event poll error', str(exc))
                 last_rachio_event_poll = now
 
@@ -288,7 +285,6 @@ def poller() -> None:
                 try:
                     evaluate_rain_skip()
                 except Exception as exc:
-                    print(f'Rain skip check error: {exc}')
                     _log_system_error('rachio', 'Rain skip check error', str(exc))
                 last_rain_skip_check = now
 
@@ -299,7 +295,6 @@ def poller() -> None:
                     try:
                         fetch_nest_events()
                     except Exception as exc:
-                        print(f'Nest event poll error: {exc}')
                         _log_system_error('nest', 'Event poll error', str(exc))
                     if get_setting_bool('nest_thermostat_enabled', False):
                         try:
@@ -307,7 +302,7 @@ def poller() -> None:
                             if token:
                                 _nest_refresh_devices(token)
                         except Exception as exc:
-                            print(f'Nest thermostat poll error: {exc}')
+                            _log_system_error('nest', 'Thermostat poll error', str(exc))
                 last_nest_event_poll = now
 
             # Pool equipment state polling
@@ -317,7 +312,6 @@ def poller() -> None:
                     try:
                         fetch_pool()
                     except Exception as exc:
-                        print(f'Pool poll error: {exc}')
                         _log_system_error('pool', 'Pool poll error', str(exc))
                 last_pool_poll = now
 
@@ -332,7 +326,6 @@ def poller() -> None:
                         elif get_setting_bool('kasa_state_poll_enabled', True):
                             _kasa_poll_state()
                     except Exception as exc:
-                        print(f'Kasa poll error: {exc}')
                         _log_system_error('kasa', 'State poll error', str(exc))
                 last_kasa_poll = now
 
@@ -346,7 +339,6 @@ def poller() -> None:
                         else:
                             _tuya_poll_state()
                     except Exception as exc:
-                        print(f'Tuya poll error: {exc}')
                         _log_system_error('tuya', 'State poll error', str(exc))
                 last_tuya_poll = now
 
@@ -357,15 +349,12 @@ def poller() -> None:
                     try:
                         _tuya_cloud_poll_sensors()
                     except Exception as exc:
-                        print(f'Tuya cloud poll error: {exc}')
                         _log_system_error('tuya', 'Cloud poll error', str(exc))
                     last_tuya_cloud_poll = now
 
         except Exception as exc:
-            print(f'Poller error: {type(exc).__name__}: {exc}')
-            traceback.print_exc()
             _log_system_error('powerwall', 'Poller error',
-                              f'{type(exc).__name__}: {exc}')
+                              f'{type(exc).__name__}: {exc}\n{traceback.format_exc()}')
             pw = None  # force reconnect on next iteration
 
         time.sleep(poll_interval)
