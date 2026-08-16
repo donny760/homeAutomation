@@ -1,5 +1,15 @@
+// The output goes through dangerouslySetInnerHTML, and the AI's context includes
+// user-controlled rule names and notes. Escaping up front means only the tags
+// emitted below are live HTML — anything from the model renders as literal text.
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 export function mdToHtml(md: string): string {
-  const lines = md.split('\n');
+  const lines = escapeHtml(md).split('\n');
   let html = '';
   let inUl = false,
     inOl = false,

@@ -78,7 +78,100 @@ def _migrate_v2(conn):
     conn.execute("PRAGMA user_version = 2")
 
 
-_MIGRATIONS = [(1, _migrate_v1), (2, _migrate_v2)]
+def _migrate_v3(conn):
+    """Nullable export-rate columns on rate_history.
+
+    NULL means 'credit exports at the retail import TOU rate' — NEM 2.0
+    behaviour, which is what the cost code already does. Populate these only
+    when the account moves to NBT/avoided-cost export pricing.
+
+    Deliberately no DEFAULT: a `REAL DEFAULT 0` would backfill every existing
+    row with zero and silently wipe out every export credit in history.
+    """
+    for col in ("summer_on_peak_export", "summer_off_peak_export",
+                "summer_super_off_peak_export", "winter_on_peak_export",
+                "winter_off_peak_export", "winter_super_off_peak_export"):
+        _add_col(conn, "rate_history", col, "REAL")
+    conn.execute("PRAGMA user_version = 3")
+
+
+def _migrate_v4(conn):
+    """Pool: panel-name sync column, drop the dead feat1 row, re-key the GPM cache.
+
+    1. switches_meta.source_name — the last ScreenLogic panel name we saw.
+         name == source_name  -> tile is panel-synced; keep following the panel
+         name != source_name  -> user renamed it in the drawer; never clobber
+         source_name IS NULL  -> provenance unknown; adopt panel name, keep `name`
+       Backfilled from the FACTORY names _pool_discover_circuits originally
+       inserted, NOT from the current name: backfilling `name` would make an
+       already-renamed tile look un-overridden and the first sync would wipe the
+       rename. switch_update_meta needs no change — writing a different `name` is
+       itself the override signal.
+
+    2. Drop the 'feat1' row. It tracked whichever circuit was literally named
+       'Feature 1'; that was circuit 510, renamed to 'Edge Prime' on the keypad
+       2026-08-15 15:52, after which the tile was permanently stateless and
+       untappable (409 'current state unknown'). Circuits 510/511/512 get proper
+       id-addressed rows from _pool_discover_circuits. The 75 existing
+       'feature1_changed' event_log rows are left alone (event_log is never
+       purged) and are read as circuit 510 by _recalc_pool_target.
+
+    3. Re-key the GPM cache to {pump_idx: {preset_rpm: gpm}}.
+       pool_cached_normal_gpm is DISCARDED, not migrated: it was written on every
+       poll with the cleaner off, so a 'Pool 2150' run (2150 rpm / 38 gpm)
+       overwrote the 1800 rpm filtration baseline — it read 38.0 at migration
+       time. cleaner/edge are trustworthy (the cleaner preset is the pump's top
+       speed, so nothing could override it) and are keyed to the preset RPMs read
+       from the gateway on 2026-08-15: cleaner = 3000 rpm on pump 1, edge
+       baseline = 1380 rpm on pump 0.
+    """
+    _add_col(conn, "switches_meta", "source_name", "TEXT")
+
+    FACTORY_NAMES = {
+        '500': 'Spa',       '501': 'Pool Light', '502': 'Water Light',
+        '503': 'Spa Light', '504': 'Waterfall',  '505': 'Pool',
+        '506': 'Edge Pump', '507': 'Spillway',   '508': 'Cleaner',
+    }
+    for ext_id, factory in FACTORY_NAMES.items():
+        conn.execute(
+            "UPDATE switches_meta SET source_name = ? "
+            "WHERE provider = 'pool' AND external_id = ? AND source_name IS NULL",
+            (factory, ext_id)
+        )
+
+    conn.execute(
+        "DELETE FROM switches_meta WHERE provider = 'pool' AND external_id = 'feat1'"
+    )
+
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return 0.0
+
+    legacy = dict(conn.execute(
+        "SELECT key, value FROM settings WHERE key IN "
+        "('pool_cached_cleaner_gpm', 'pool_cached_edge_gpm')"
+    ).fetchall())
+    samples = {}
+    if _f(legacy.get('pool_cached_cleaner_gpm')) > 0:
+        samples['1'] = {'3000': _f(legacy['pool_cached_cleaner_gpm'])}
+    if _f(legacy.get('pool_cached_edge_gpm')) > 0:
+        samples['0'] = {'1380': _f(legacy['pool_cached_edge_gpm'])}
+    if samples:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+            ('pool_cached_gpm_samples', json.dumps(samples))
+        )
+    conn.execute(
+        "DELETE FROM settings WHERE key IN ('pool_cached_normal_gpm', "
+        "'pool_cached_cleaner_gpm', 'pool_cached_edge_gpm')"
+    )
+
+    conn.execute("PRAGMA user_version = 4")
+
+
+_MIGRATIONS = [(1, _migrate_v1), (2, _migrate_v2), (3, _migrate_v3), (4, _migrate_v4)]
 
 
 def _migrate(conn) -> None:

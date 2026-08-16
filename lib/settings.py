@@ -38,6 +38,10 @@ _SETTINGS_DEFAULTS = {
         },
     }),
     'tou_periods_last_verified':   '',
+    # Internal state (not user config — deliberately absent from the Settings page)
+    'cost_rebuild_pending_from':   '',   # daily_costs stale from this date forward
+    'rates_last_success':          '',   # last successful rate refresh (ISO date)
+    'holidays_last_success':       '',   # last successful holiday refresh (ISO date)
     'fe_poll_interval':            '10000',
     'fe_chart_interval':           '60000',
     'fe_weather_interval':         '600000',
@@ -85,6 +89,9 @@ _SETTINGS_DEFAULTS = {
     'network_router_snmp_port':      '161',
     'network_local_subnet':        '10.0.0.0/24',
     'network_aps':                 '[]',
+    # Gates /api/debug/* — off by default. These routes mutate state, run
+    # expensive scans, and echo router credentials. Turn on only while debugging.
+    'debug_enabled':               '0',
 }
 
 
@@ -126,6 +133,16 @@ def _settings_snapshot() -> dict:
 def invalidate_settings_cache() -> None:
     global _settings_cache_ts
     _settings_cache_ts = 0.0
+
+
+def set_setting(key: str, value) -> None:
+    """Write one setting and drop the read cache, so the next get_setting() in
+    this process sees it immediately (the TTL is 30s; the pending-rebuild marker
+    is written and read back within seconds)."""
+    with connect() as c:
+        c.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                  (key, str(value)))
+    invalidate_settings_cache()
 
 
 def get_setting(key: str, default=None):

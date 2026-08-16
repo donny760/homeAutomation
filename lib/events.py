@@ -1,3 +1,4 @@
+import logging
 import sqlite3
 import threading
 import time
@@ -7,6 +8,7 @@ from lib.db import connect
 
 
 _switches_lock = threading.Lock()
+_log = logging.getLogger(__name__)
 
 _HOME_CONTROL_TITLE_SUFFIX = {
     'plug_turned_on':             'turned on',
@@ -30,8 +32,10 @@ def _log_system_error(system: str, title: str, detail: str = None) -> None:
                 'VALUES (?,?,?,?,?,?,?)',
                 (int(time.time()), system, 'error', title, detail, 'failed', 'live')
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        # Swallowing this silently hides the error reporter's own failures —
+        # 'database is locked' here means errors stop being recorded at all.
+        _log.warning('event_log write failed (%s/%s): %s', system, title, exc)
 
 
 def _log_success(system: str, event_type: str, title: str, detail: str = None) -> None:
@@ -43,8 +47,8 @@ def _log_success(system: str, event_type: str, title: str, detail: str = None) -
                 'VALUES (?,?,?,?,?,?,?)',
                 (int(time.time()), system, event_type, title, detail, 'ok', 'live')
             )
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.warning('event_log write failed (%s/%s): %s', system, title, exc)
 
 
 def _switches_log_event(provider: str, event_type: str, title: str, detail: str = None,

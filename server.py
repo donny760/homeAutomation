@@ -31,12 +31,12 @@ from lib.fetch_rates import (
 from lib.state import BASE_DIR, DB_PATH, _live, _lock
 from lib.db import (
     connect, init_db, write_reading, purge_old,
-    _fetch_rows, _fetch_rows_range, today_rows, day_rows, month_rows,
+    _fetch_rows, _fetch_rows_range, today_rows, day_rows,
 )
 from lib.settings import (
     _SETTINGS_DEFAULTS, _seed_settings, load_settings,
     get_setting, get_setting_int, get_setting_bool, _load_tou_periods,
-    invalidate_settings_cache,
+    invalidate_settings_cache, set_setting,
 )
 from lib.events import (
     _log_system_error, _log_success, _switches_log_event,
@@ -44,17 +44,16 @@ from lib.events import (
 )
 from lib.costs import (
     _cost_rebuild_lock, _spawn_rebuild_daily_costs, _rebuild_today,
-    rebuild_daily_costs, _load_rate_history, _rate_for_date,
+    _load_rate_history, _rate_for_date,
     _is_refresh_due, _read_year_from_json, _backfill_rates_event_url,
-    calc_stats,
+    calc_stats, mark_costs_stale, month_savings_prior_days,
 )
 from lib.solar_forecast import (
     fetch_solar_forecast, fetch_tomorrow_solar_forecast,
 )
 import lib.pool as pool
 from lib.pool import (
-    fetch_pool, pool_set_circuit, _pool_discover_circuits,
-    POOL_CIRCUITS, POOL_EXT_TO_FIELD, _load_pool_gpm_cache, _recalc_pool_target,
+    fetch_pool, _pool_discover_circuits, _load_pool_caches, _recalc_pool_target,
 )
 import lib.kasa as kasa
 from lib.kasa import (
@@ -78,9 +77,12 @@ from lib.nest import (
     fetch_nest_events, nest_set_thermostat, _nest_refresh_devices,
     _nest_ensure_token, _nest_save_tokens, _nest_oauth_exchange,
     NEST_EVENT_TYPE_MAP, NEST_EVENT_TITLE_MAP,
-    _nest_poll_stats, _nest_devices, _nest_devices_raw, _nest_devices_ts,
-    _nest_event_counters,
+    _nest_poll_stats, _nest_event_counters,
 )
+# NOTE: _nest_devices, _nest_devices_raw and _nest_devices_ts are deliberately
+# NOT imported by name — lib/nest.py *rebinds* them under `global`, so a by-value
+# import here would freeze at the empty initial values. Read them as
+# nest_mod.<name>. Same rule for any module-level mutable a `global` rebinds.
 import lib.rachio as rachio_mod
 from lib.rachio import (
     fetch_rachio_schedule, fetch_rachio_events, evaluate_rain_skip,
@@ -94,7 +96,7 @@ from lib.switches import (
     switch_set_state, switch_toggle, switch_set_thermostat,
     switch_set_brightness, switch_update_meta,
 )
-from lib.powerwall import poller, backfill_history
+from lib.powerwall import poller, trigger_backfill
 import lib.ai_insights as ai_insights
 from lib.ai_insights import (
     _ai_cache, _ai_cache_lock, _azure_configured, _build_ai_context, _gemini_system_prompt,
@@ -122,6 +124,29 @@ def handle_exception(e):
         return jsonify(error=e.description), e.code
     app.logger.exception(e)
     return jsonify(error=str(e)), 500
+
+
+# Debug routes that don't live under the /api/debug/ prefix and so aren't caught
+# by the prefix check below. /api/rules/ai-insights/debug burns Gemini quota.
+_DEBUG_EXTRA_PATHS = frozenset({'/api/rules/ai-insights/debug'})
+
+
+@app.before_request
+def _gate_debug_routes():
+    """Hide /api/debug/* unless debug_enabled is set.
+
+    These routes mutate state (bulk DELETE against the never-purged event_log,
+    synthetic event injection), run expensive scans (full LAN sweep), bypass the
+    AP quarantine that keeps the router httpd from wedging, and echo router
+    credentials. Gated as a prefix rather than per-route so a debug route added
+    later is closed by default. 404 rather than 403 — don't advertise them.
+    """
+    path = request.path
+    if not (path.startswith('/api/debug/') or path in _DEBUG_EXTRA_PATHS):
+        return None
+    if get_setting_bool('debug_enabled', False):
+        return None
+    return jsonify(error='Not Found'), 404
 
 
 
@@ -181,7 +206,9 @@ def api_live():
 
     t_rows                          = today_rows()
     solar_kwh, s_today, self_suff, grid_kwh = calc_stats(t_rows)
-    _, s_month, _, _                = calc_stats(month_rows())
+    # Prior days are cached for the day — see month_savings_prior_days(). Only
+    # today's rows are rescanned per poll.
+    s_month                         = month_savings_prior_days() + s_today
 
     # Staleness guard: the poller updates _live every POLL_INTERVAL (10s). If the
     # daemon thread dies, _live keeps serving its last values silently — flag it
@@ -239,6 +266,21 @@ def api_day():
     except ValueError:
         return jsonify({'error': 'invalid date, use YYYY-MM-DD'}), 400
     return jsonify(_filter_chart_rows(day_rows(target)))
+
+
+@app.route('/api/powerwall/backfill', methods=['POST'])
+def api_powerwall_backfill():
+    """Manually trigger a Fleet API backfill (fills outage gaps).
+
+    Optional ?days=N sets the lookback (default 3; capped at 30).
+    """
+    try:
+        days = int(request.args.get('days', 3))
+    except ValueError:
+        return jsonify({'error': 'days must be an integer'}), 400
+    days = max(0, min(days, 30))
+    started = trigger_backfill(days)
+    return jsonify({'started': started, 'lookback_days': days}), 202 if started else 409
 
 
 @app.route('/api/weather')
@@ -783,8 +825,47 @@ def api_costs_daily():
             sql += ' LIMIT ? OFFSET ?'
             params += [limit, offset]
         rows = c.execute(sql, params).fetchall()
-    rates = load_rates()
-    rates_as_of = (rates.get('updated') or '')[:10] if rates else ''
+        # Totals span the whole selected range, independent of limit/offset —
+        # the summary tiles describe the range, not the page scrolled into view.
+        agg = c.execute(
+            'SELECT COUNT(*), SUM(import_cost), SUM(export_credit), '
+            '       SUM(on_peak_cost), SUM(off_peak_cost), SUM(super_off_peak_cost) '
+            'FROM daily_costs WHERE date >= ? AND date <= ?',
+            (start, end)
+        ).fetchone()
+        all_dates = [r[0] for r in c.execute(
+            'SELECT date FROM daily_costs WHERE date >= ? AND date <= ?',
+            (start, end)
+        )]
+
+    rate_periods = _load_rate_history()
+
+    # Base Services Charge is a fixed per-day charge billed in cash every month.
+    # NEM 2.0 export credits cannot offset it, so it is reported alongside
+    # net_cost and deliberately never combined with it: net_cost is a balance
+    # banked to annual true-up, the BSC is money already paid. Adding them would
+    # imply the credit paid the charge, which cannot happen. It is likewise kept
+    # out of the stored daily_costs rows.
+    bsc_by_day = [((_rate_for_date(rate_periods, d) or {}).get('base_services_charge_per_day') or 0)
+                  for d in all_dates]
+    base_charge = sum(bsc_by_day)
+    # Pre-2026 rate rows carry no BSC, so a range covering them would read $0.00
+    # and look like a bug. Flag it so the UI can show "—" instead.
+    base_charge_known = any(v > 0 for v in bsc_by_day)
+    net_cost = (agg[1] or 0) - (agg[2] or 0)
+
+    # Rate periods actually spanning this range (replaces the old rates_as_of,
+    # which reported one current snapshot over a multi-rate table).
+    eff_in_range = [r[0] for r in rate_periods if start < r[0] <= end]
+    at_start = next((r[0] for r in reversed(rate_periods) if r[0] <= start), None)
+    spanning = ([at_start] if at_start else []) + eff_in_range
+    if len(spanning) > 1:
+        rates_note = f'{len(spanning)} rate periods ({spanning[0]} – {spanning[-1]})'
+    elif spanning:
+        rates_note = f'rate effective {spanning[0]}'
+    else:
+        rates_note = ''
+
     days = [
         {
             'date':          r[0],
@@ -802,8 +883,23 @@ def api_costs_daily():
         }
         for r in rows
     ]
-    return jsonify({'start': start, 'end': end, 'total': total,
-                    'rates_as_of': rates_as_of, 'days': days})
+    return jsonify({
+        'start': start, 'end': end, 'total': total,
+        'rates_note': rates_note,
+        'rate_periods': spanning,
+        'totals': {
+            'days':                agg[0] or 0,
+            'import_cost':         round(agg[1] or 0, 2),
+            'export_credit':       round(agg[2] or 0, 2),
+            'on_peak_cost':        round(agg[3] or 0, 2),
+            'off_peak_cost':       round(agg[4] or 0, 2),
+            'super_off_peak_cost': round(agg[5] or 0, 2),
+            'net_cost':            round(net_cost, 2),
+            'base_charge':         round(base_charge, 2),
+            'base_charge_known':   base_charge_known,
+        },
+        'days': days,
+    })
 
 
 @app.route('/api/costs/rebuild', methods=['POST'])
@@ -831,9 +927,28 @@ def api_rates():
 @app.route('/api/rates/refresh', methods=['POST'])
 def api_rates_refresh():
     try:
-        rates = fetch_ev_tou2_rates()
-        return jsonify({'ok': True, 'updated': rates.get('updated')})
+        # Same call shape as the poller (lib/powerwall.py): without db_path this
+        # updated rates.json only, so a manual refresh never reached the cost engine.
+        rates = fetch_ev_tou2_rates(
+            page_url=get_setting('rates_page_url',
+                                 'https://www.sdge.com/total-electric-rates'),
+            schedule_name=get_setting('rate_schedule_name', 'EV-TOU'),
+            db_path=DB_PATH)
+        changes = rates.get('_changes') or []
+        eff = rates.get('effective_date')
+        if changes:
+            detail_parts = [', '.join(changes)]
+            if rates.get('source_url'):
+                detail_parts.append(rates['source_url'])
+            _log_success('rates', 'rates_updated',
+                         f'Rates updated (eff. {eff or "?"})',
+                         detail='  '.join(detail_parts))
+            mark_costs_stale(eff)
+        set_setting('rates_last_success', date.today().isoformat())
+        return jsonify({'ok': True, 'updated': rates.get('updated'),
+                        'effective_date': eff, 'changes': changes})
     except Exception as exc:
+        _log_system_error('rates', 'Energy rate refresh failed', str(exc))
         return jsonify({'error': str(exc)}), 500
 
 
@@ -1032,8 +1147,9 @@ def api_debug_nest_status():
         'token_valid': bool(token and time.time() < expiry),
         'token_expiry': expiry,
         'subscription': get_setting('nest_pubsub_subscription', ''),
-        'cached_devices': _nest_devices,
-        'devices_cache_age': int(time.time() - _nest_devices_ts) if _nest_devices_ts else None,
+        'cached_devices': nest_mod._nest_devices,
+        'devices_cache_age': (int(time.time() - nest_mod._nest_devices_ts)
+                              if nest_mod._nest_devices_ts else None),
     })
 
 
@@ -1046,7 +1162,7 @@ def api_debug_nest_devices():
     # Force refresh
     _nest_refresh_devices(token)
     summary = []
-    for d in _nest_devices_raw:
+    for d in nest_mod._nest_devices_raw:
         traits = d.get('traits', {})
         summary.append({
             'type': d.get('type', ''),
@@ -1568,7 +1684,9 @@ def api_events():
     if err: return err
     offset, err = _arg_int('offset', 0)
     if err: return err
-    limit  = min(limit, 500)
+    # Clamp both ends: a negative limit reaches SQLite as LIMIT -1, which means
+    # unbounded — and event_log is never purged, so it only grows.
+    limit  = max(1, min(limit, 500))
     offset = max(offset, 0)
     system = request.args.get('system', 'all')
     etype  = request.args.get('type')
@@ -1806,19 +1924,22 @@ def api_settings():
     return jsonify({'settings': settings, 'connectors': connectors})
 
 
-def _record_tou_change(conn, new_tou_value):
+def _record_tou_change(conn, new_tou_value) -> bool:
     """When TOU periods change, stamp a rate_history row for today so future
-    rebuilds use the correct periods for each date range."""
+    rebuilds use the correct periods for each date range.
+
+    Returns True if a new row was stamped (i.e. the value actually changed).
+    """
     try:
         new_json = new_tou_value if isinstance(new_tou_value, str) else json.dumps(new_tou_value)
     except Exception:
-        return
+        return False
     # Skip if value hasn't actually changed
     cur = conn.execute("SELECT value FROM settings WHERE key='tou_periods'").fetchone()
     if cur:
         try:
             if json.loads(cur[0]) == json.loads(new_json):
-                return
+                return False
         except Exception:
             pass
     # Copy dollar rates from the most recent rate_history row
@@ -1829,25 +1950,32 @@ def _record_tou_change(conn, new_tou_value):
         "FROM rate_history ORDER BY effective_date DESC LIMIT 1"
     ).fetchone()
     if not latest:
-        return
+        return False
     today = date.today().isoformat()
+    # ON CONFLICT rather than INSERT OR REPLACE so a same-day re-save keeps
+    # end_date and the *_export rates on the existing row.
     conn.execute(
-        "INSERT OR REPLACE INTO rate_history "
+        "INSERT INTO rate_history "
         "(effective_date, summer_on_peak, summer_off_peak, summer_super_off_peak, "
         " winter_on_peak, winter_off_peak, winter_super_off_peak, "
         " base_services_charge_per_day, tou_periods_json, fetched_at) "
-        "VALUES (?,?,?,?,?,?,?,?,?,?)",
+        "VALUES (?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(effective_date) DO UPDATE SET "
+        "  tou_periods_json = excluded.tou_periods_json, "
+        "  fetched_at = excluded.fetched_at",
         (today, *latest, new_json, datetime.now().isoformat())
     )
+    return True
 
 
 @app.route('/api/settings', methods=['PUT'])
 def api_settings_update():
     data = request.get_json() or {}
     valid_keys = set(_SETTINGS_DEFAULTS.keys())
+    tou_changed = False
     with connect() as c:
         if 'tou_periods' in data and 'tou_periods' in valid_keys:
-            _record_tou_change(c, data['tou_periods'])
+            tou_changed = _record_tou_change(c, data['tou_periods'])
         for key, value in data.items():
             if key in valid_keys:
                 c.execute(
@@ -1856,6 +1984,10 @@ def api_settings_update():
                 )
         c.commit()
     invalidate_settings_cache()
+    if tou_changed:
+        # New TOU windows take effect today — re-derive today's tiers now rather
+        # than waiting on the hourly rebuild.
+        mark_costs_stale(date.today().isoformat())
     return jsonify({'ok': True})
 
 
@@ -1892,9 +2024,12 @@ except ImportError:
 def _start():
     os.chdir(BASE_DIR)
     init_db()
-    _load_pool_gpm_cache()
+    _load_pool_caches()
     _backfill_rates_event_url()
-    backfill_history()
+    # Threaded: this makes one Fleet API call per day of lookback and used to run
+    # before Flask bound its socket, so a slow or unreachable Tesla cloud delayed
+    # startup. trigger_backfill reuses the _backfill_running overlap guard.
+    trigger_backfill()
     # Seed switches_meta with known pool circuits on startup so tiles appear
     # without requiring a manual rediscover. Kasa discovery is driven
     # by its enabled flag in the poller loop.
@@ -1914,7 +2049,14 @@ def _start():
             _kasa_start_loop()
         except Exception as exc:
             print(f'Kasa loop start error: {exc}')
-    threading.Thread(target=rebuild_daily_costs, daemon=True).start()
+    # Bounded and lock-guarded, matching the poller's daily catch-up. Rebuilding
+    # unbounded here re-scanned ~1M readings on every restart, and calling
+    # rebuild_daily_costs directly bypassed _cost_rebuild_lock — leaving the
+    # heaviest writer as the one not serialized against _rebuild_today.
+    # Full-year rebuilds stay on POST /api/costs/rebuild.
+    _spawn_rebuild_daily_costs(
+        from_date=date.today() - timedelta(days=get_setting_int('cost_rebuild_days', 7))
+    )
     threading.Thread(target=_recalc_pool_target, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=_network_poll_loop, daemon=True).start()

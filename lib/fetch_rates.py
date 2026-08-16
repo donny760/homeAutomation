@@ -14,14 +14,29 @@ BASE_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RATES_PATH    = os.path.join(BASE_DIR, 'rates.json')
 HOLIDAYS_PATH = os.path.join(BASE_DIR, 'holidays.json')
 
+# Rate fields compared to detect a genuine rate change (order matches the
+# baseline SELECT in fetch_ev_tou2_rates).
+_RATE_KEYS = ('summer_on_peak', 'summer_off_peak', 'summer_super_off_peak',
+              'winter_on_peak', 'winter_off_peak', 'winter_super_off_peak',
+              'base_services_charge_per_day')
+
 
 def _atomic_write_json(path, data):
     """Write JSON via temp + os.replace so a kill mid-write can't truncate
     the destination file. UTF-8 explicit since Windows defaults to cp1252."""
     tmp = path + '.tmp'
-    with open(tmp, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, path)
+    except OSError:
+        # Don't leave an orphaned .tmp behind (a stale one has blocked the
+        # replace with WinError 5 before). Callers still see the exception.
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ── SDG&E holiday calendar ────────────────────────────────────────────────────
@@ -392,13 +407,14 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
     if len(rates) < 6:
         raise ValueError(f'Incomplete rates parsed from PDF: {rates}')
 
-    # Step 3: Write rates.json for backward compat (current rate tile, rate card)
     rates['updated'] = datetime.now().isoformat()
     rates['source_url'] = pdf_url
     rates['effective_date'] = eff_date
-    _atomic_write_json(RATES_PATH, rates)
+    rates['_changes'] = []
 
-    # Step 4: Store in rate_history if db_path provided
+    # Step 3: Store in rate_history FIRST — the DB is the authoritative store for
+    # cost calculations, so a rates.json write failure must not discard a rate we
+    # successfully parsed (that is what happened on 2026-06-14, WinError 5).
     if db_path:
         import sqlite3
         with sqlite3.connect(db_path) as conn:
@@ -407,12 +423,42 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
                 "SELECT value FROM settings WHERE key='tou_periods'"
             ).fetchone()
             tou_json = tou_row[0] if tou_row else None
+
+            # The rate row in effect immediately before this one — the baseline
+            # for change detection. Reading it from the DB rather than rates.json
+            # makes detection immune to a failed/clobbered JSON write.
+            prev = conn.execute(
+                'SELECT summer_on_peak, summer_off_peak, summer_super_off_peak, '
+                '       winter_on_peak, winter_off_peak, winter_super_off_peak, '
+                '       COALESCE(base_services_charge_per_day, 0) '
+                'FROM rate_history WHERE effective_date <= ? '
+                'ORDER BY effective_date DESC LIMIT 1',
+                (eff_date,)
+            ).fetchone()
+
+            # ON CONFLICT rather than INSERT OR REPLACE: REPLACE deletes the row
+            # first, silently wiping columns this statement doesn't name
+            # (end_date, the *_export rates).
             conn.execute(
-                'INSERT OR REPLACE INTO rate_history '
+                'INSERT INTO rate_history '
                 '(effective_date, summer_on_peak, summer_off_peak, summer_super_off_peak, '
                 ' winter_on_peak, winter_off_peak, winter_super_off_peak, '
                 ' base_services_charge_per_day, source_url, fetched_at, tou_periods_json) '
-                'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?) '
+                'ON CONFLICT(effective_date) DO UPDATE SET '
+                '  summer_on_peak = excluded.summer_on_peak, '
+                '  summer_off_peak = excluded.summer_off_peak, '
+                '  summer_super_off_peak = excluded.summer_super_off_peak, '
+                '  winter_on_peak = excluded.winter_on_peak, '
+                '  winter_off_peak = excluded.winter_off_peak, '
+                '  winter_super_off_peak = excluded.winter_super_off_peak, '
+                '  base_services_charge_per_day = excluded.base_services_charge_per_day, '
+                '  source_url = excluded.source_url, '
+                '  fetched_at = excluded.fetched_at, '
+                # Keep an existing historically-correct window rather than
+                # restamping it with today's global setting.
+                '  tou_periods_json = COALESCE(rate_history.tou_periods_json, '
+                '                              excluded.tou_periods_json)',
                 (eff_date,
                  rates.get('summer_on_peak', 0), rates.get('summer_off_peak', 0),
                  rates.get('summer_super_off_peak', 0),
@@ -422,6 +468,12 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
                  pdf_url, rates['updated'], tou_json)
             )
             conn.commit()
+
+            if prev:
+                for i, k in enumerate(_RATE_KEYS):
+                    new_v = rates.get(k)
+                    if new_v is not None and prev[i] is not None and prev[i] != new_v:
+                        rates['_changes'].append(f'{k}: {prev[i]}→{new_v}')
 
             # Step 4b: Check TOU periods against what the website currently shows
             parsed_tou = _parse_ev_tou2_tou_periods(page_html)
@@ -454,6 +506,19 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
                 print('TOU periods: could not parse from website (panel not found)')
 
         print(f'Rates: stored in rate_history (effective {eff_date})')
+
+    # Step 4: rates.json for the current-rate tile / rate card. Best-effort —
+    # rate_history is already committed above, so a failure here is cosmetic
+    # and must not lose the fetched rate.
+    try:
+        _atomic_write_json(RATES_PATH, {k: v for k, v in rates.items()
+                                        if not k.startswith('_')})
+    except OSError as exc:
+        # ASCII only: this runs on a failure path and stdout may be a cp1252
+        # pipe (the Windows service redirects it) — a UnicodeEncodeError here
+        # would mask the original error.
+        print(f'Rates: rates.json write failed ({exc}) - '
+              'rate_history is authoritative, continuing')
 
     print(f'Rates updated from {pdf_url}')
     return rates

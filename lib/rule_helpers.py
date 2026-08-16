@@ -64,7 +64,14 @@ def _rule_fires_at(rule, d):
 
     if d.month not in set(rule['months']):
         return None
-    return datetime(d.year, d.month, d.day, rule['hour'], rule['minute'])
+    try:
+        return datetime(d.year, d.month, d.day, rule['hour'], rule['minute'])
+    except (ValueError, TypeError):
+        # An out-of-range or non-numeric hour/minute already in the DB. Skip the
+        # rule rather than letting it take down every caller of _upcoming_firings
+        # (/api/schedule renders all rules from one pass). _validate_rule_body
+        # blocks new ones; this covers rows written before that existed.
+        return None
 
 
 def _upcoming_firings(rules, hours=48):
@@ -73,9 +80,13 @@ def _upcoming_firings(rules, hours=48):
     events = []
     paused_shown: set = set()
     tou = _load_tou_periods()
-    for delta_days in (0, 1, 2):
+    # Paused rules are scanned further out (up to 8 days) so a recurring rule whose next
+    # occurrence falls outside the 48h window — e.g. a weekday rule paused on a Friday, next
+    # firing Monday — still produces one pinned row the user can resume from.
+    for delta_days in range(0, 8):
         d = now.date() + timedelta(days=delta_days)
-        if is_sdge_holiday(d):
+        within_window = delta_days <= 2
+        if within_window and is_sdge_holiday(d):
             fire_dt = datetime(d.year, d.month, d.day, 0, 0)
             if fire_dt <= cutoff:
                 events.append({
@@ -90,24 +101,32 @@ def _upcoming_firings(rules, hours=48):
                     'conditions':    [],
                 })
         for rule in rules:
-            if not rule['enabled'] and rule['id'] in paused_shown:
+            paused = not rule['enabled']
+            if paused and rule['id'] in paused_shown:
                 continue
+            if not paused and not within_window:
+                continue  # enabled rules keep the original 48h horizon
             fire_dt = _rule_fires_at(rule, d)
-            if fire_dt and now < fire_dt <= cutoff:
-                events.append({
-                    'fire_time':     fire_dt.strftime('%Y-%m-%dT%H:%M:%S'),
-                    'source':        'powerwall',
-                    'rule_id':       rule['id'],
-                    'enabled':       bool(rule['enabled']),
-                    'name':          rule['name'],
-                    'mode':          rule['mode'],
-                    'reserve':       rule['reserve'],
-                    'grid_charging': rule['grid_charging'],
-                    'grid_export':   rule['grid_export'],
-                    'conditions':    rule['conditions'],
-                })
-                if not rule['enabled']:
-                    paused_shown.add(rule['id'])
+            if not fire_dt or fire_dt <= now:
+                continue
+            # Paused rules ignore the cutoff so they always yield one pinned row.
+            if not paused and fire_dt > cutoff:
+                continue
+            events.append({
+                'fire_time':     fire_dt.strftime('%Y-%m-%dT%H:%M:%S'),
+                'source':        'powerwall',
+                'rule_id':       rule['id'],
+                'enabled':       bool(rule['enabled']),
+                'pinned':        paused,
+                'name':          rule['name'],
+                'mode':          rule['mode'],
+                'reserve':       rule['reserve'],
+                'grid_charging': rule['grid_charging'],
+                'grid_export':   rule['grid_export'],
+                'conditions':    rule['conditions'],
+            })
+            if paused:
+                paused_shown.add(rule['id'])
     events.sort(key=lambda e: e['fire_time'])
     return events
 
@@ -118,6 +137,14 @@ def _validate_rule_body(body):
     missing = [k for k in _RULE_REQUIRED_FIELDS if k not in body]
     if missing:
         return f'missing fields: {", ".join(missing)}'
+    # hour/minute go straight into datetime() when the schedule is built, so an
+    # out-of-range value written here surfaces as a 500 on /api/schedule later.
+    for field, hi in (('hour', 23), ('minute', 59)):
+        val = body[field]
+        if isinstance(val, bool) or not isinstance(val, int):
+            return f'{field} must be an integer'
+        if not 0 <= val <= hi:
+            return f'{field} must be between 0 and {hi}'
     return None
 
 

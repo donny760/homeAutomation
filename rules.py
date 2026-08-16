@@ -25,6 +25,12 @@ PW_EMAIL      = 'don@nsdsolutions.com'
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 DB_PATH       = os.environ.get('DB_PATH', os.path.join(BASE_DIR, 'powerwall.db'))
 LOG_PATH      = os.environ.get('LOG_PATH', os.path.join(BASE_DIR, 'rules.log'))
+# Own Fleet API token directory, deliberately NOT shared with server.py.
+# Tesla rotates the refresh token on every use, so two processes pointing at one
+# token file race: whichever refreshes second presents a token the first already
+# invalidated, and pypowerwall swallows that failure — poll() just returns None,
+# which never trips the reconnect path below. Separate token, separate rotation.
+FLEET_AUTH_DIR = os.path.join(BASE_DIR, '.fleet_rules')
 EVAL_INTERVAL = 60    # seconds between evaluations
 LOOP_SLEEP    = 30    # main loop cadence in seconds
 
@@ -326,9 +332,10 @@ def main_loop(stop_fn=None):
         if pw is None:
             try:
                 log.info('Connecting to Powerwall (Fleet API mode)…')
+                os.makedirs(FLEET_AUTH_DIR, exist_ok=True)
                 pw = pypowerwall.Powerwall('', fleetapi=True,
                                            email=PW_EMAIL, timeout=30,
-                                           authpath=BASE_DIR)
+                                           authpath=FLEET_AUTH_DIR)
                 log.info('Connected.')
                 last_state = {}
             except Exception as exc:

@@ -85,6 +85,7 @@ export default function EventLog({ isActive }: EventLogProps) {
   const offsetRef = useRef(0);
   const listRef = useRef<HTMLDivElement>(null);
   const fetchingRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   const buildUrl = useCallback(
     (offset: number, filterKey: string) => {
@@ -114,8 +115,13 @@ export default function EventLog({ isActive }: EventLogProps) {
       if (reset) setLoading(true);
       else setLoadingMore(true);
 
+      abortRef.current?.abort();
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+
       try {
-        const data = await fetch(buildUrl(offset, currentFilter)).then((r) => r.json());
+        const data = await fetch(buildUrl(offset, currentFilter), { signal: ctrl.signal })
+          .then((r) => r.json());
         const newEvents: EventItem[] = data.events;
         setHasMore(data.has_more);
         offsetRef.current = offset + newEvents.length;
@@ -127,6 +133,7 @@ export default function EventLog({ isActive }: EventLogProps) {
         }
         setUpdated('updated ' + new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }));
       } catch (e) {
+        if ((e as Error)?.name === 'AbortError') return;  // superseded, not a failure
         console.warn('Events:', e);
       } finally {
         setLoading(false);
@@ -141,6 +148,7 @@ export default function EventLog({ isActive }: EventLogProps) {
   useEffect(() => {
     if (!isActive) return;
     fetchEvents(true, filter);
+    return () => { abortRef.current?.abort(); };
   }, [isActive, filter, startDate, endDate, fetchEvents]);
 
   // Scroll handler for infinite scroll

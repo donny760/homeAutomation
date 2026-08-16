@@ -12,6 +12,9 @@ interface Switch {
   room: string;
   sort_order: number;
   hidden: boolean;
+  // Last name the ScreenLogic panel reported. Equal to `name` means this tile
+  // still follows keypad renames; different means the name was overridden here.
+  source_name?: string | null;
   state: boolean | null;
   reachable: boolean;
   detail: {
@@ -307,7 +310,10 @@ const POOL_ICON: Record<string, string> = {
   '506':  '\u2699',      // ⚙ Edge Pump
   '507':  '\u{1F4A6}',   // 💦 Spillway
   '508':  '\u{1F9F9}',   // 🧹 Cleaner
-  'feat1':'\u2728',      // ✨ Feature 1
+  '510':  '\u{1F504}',   // arrows  - Edge Prime (edge pump @ 1850 rpm)
+  '511':  '\u{1F4A8}',   // dash    - Pool 2150  (pool pump @ 2150 rpm)
+  '512':  '\u{1F32A}',   // cyclone - Pool 2700  (pool pump @ 2700 rpm)
+  // 'feat1' removed: a name-scanned pseudo-circuit that was really 510.
 };
 
 function iconFor(sw: Switch): string {
@@ -725,6 +731,16 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
                             onChange={(e) => setEditName(e.target.value)}
                           />
                         </label>
+                        {sw.source_name && sw.source_name !== editName && (
+                          <button
+                            className="btn-icon"
+                            style={{ alignSelf: 'flex-start', fontSize: '0.75rem' }}
+                            onClick={() => setEditName(sw.source_name as string)}
+                            title="Follow the name set on the ScreenLogic keypad"
+                          >
+                            Use panel name: {sw.source_name}
+                          </button>
+                        )}
                         <label>
                           Room
                           <input

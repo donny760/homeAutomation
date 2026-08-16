@@ -40,10 +40,10 @@ def _get_all_switches() -> list:
     out = []
     with connect() as c:
         rows = c.execute(
-            'SELECT id, provider, external_id, kind, name, room, sort_order, hidden '
-            'FROM switches_meta ORDER BY room, sort_order, name'
+            'SELECT id, provider, external_id, kind, name, room, sort_order, hidden, '
+            'source_name FROM switches_meta ORDER BY room, sort_order, name'
         ).fetchall()
-    for rid, provider, ext_id, kind, name, room, sort_order, hidden in rows:
+    for rid, provider, ext_id, kind, name, room, sort_order, hidden, source_name in rows:
         sw_state  = None
         detail    = {}
         reachable = True
@@ -64,12 +64,17 @@ def _get_all_switches() -> list:
                 reachable = False
             else:
                 field = POOL_EXT_TO_FIELD.get(ext_id)
-                val = pool._pool.get(field) if field else None
-                if val is None:
-                    reachable = bool(pool._pool)
-                    sw_state = None
+                if field is None:
+                    # Stale row for a circuit we no longer track. Don't invent a
+                    # state for it — the toggle would 409 anyway.
+                    reachable = False
                 else:
-                    sw_state = bool(val)
+                    val = pool._pool.get(field)
+                    if val is None:
+                        # No poll yet, or the circuit is absent from this panel.
+                        reachable = False
+                    else:
+                        sw_state = bool(val)
                 detail = {'circuit_id': ext_id}
         elif provider == 'abode':
             if not get_setting_bool('abode_enabled', True):
@@ -142,6 +147,7 @@ def _get_all_switches() -> list:
             'room':        room or '',
             'sort_order':  sort_order,
             'hidden':      bool(hidden),
+            'source_name': source_name,
             'state':       sw_state,
             'reachable':   reachable,
             'detail':      detail,

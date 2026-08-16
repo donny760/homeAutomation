@@ -5,11 +5,20 @@ network_devices.json
 
 # Runtime artifacts — never commit
 powerwall.db
+# SQLite WAL sidecars — transient, recreated on every open
+powerwall.db-shm
+powerwall.db-wal
 rates.json
 rules.log
 .pypowerwall.auth
+# Fleet API credentials — OAuth tokens and signing key. Never commit.
+.pypowerwall.fleetapi
+.pypowerwall.private.pem
+.fleet_rules/
 abode.pickle
 holidays.json
 __pycache__/
 frontend/tsconfig.tsbuildinfo
 static/frontend/
+# Local agent scratch state — includes security audit notes, not for the repo
+.claude/agent-memory/

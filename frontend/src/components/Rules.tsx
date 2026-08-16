@@ -206,27 +206,36 @@ export default function Rules({ isActive }: RulesProps) {
   const [fEnabled, setFEnabled] = useState(true);
   const [fNotes, setFNotes] = useState('');
 
-  const refreshRules = useCallback(async () => {
+  // Reads are abortable; the mutations below (toggle/delete/reorder/save) are
+  // deliberately not, since cancelling a write mid-flight is worse than letting
+  // it land.
+  const readAbortRef = useRef<AbortController | null>(null);
+
+  const refreshRules = useCallback(async (signal?: AbortSignal) => {
     try {
-      const data = await fetch('/api/rules').then((r) => r.json());
+      const data = await fetch('/api/rules', { signal }).then((r) => r.json());
       setRules(data);
     } catch (e) {
+      if ((e as Error)?.name === 'AbortError') return;
       console.warn('Rules:', e);
     }
   }, []);
 
-  const loadRates = useCallback(async () => {
+  const loadRates = useCallback(async (signal?: AbortSignal) => {
     try {
-      const r = await fetch('/api/rates').then((x) => x.json());
+      const r = await fetch('/api/rates', { signal }).then((x) => x.json());
       setRates(r);
     } catch { /* leave dashes */ }
   }, []);
 
   useEffect(() => {
-    if (isActive) {
-      refreshRules();
-      loadRates();
-    }
+    if (!isActive) return;
+    readAbortRef.current?.abort();
+    const ctrl = new AbortController();
+    readAbortRef.current = ctrl;
+    refreshRules(ctrl.signal);
+    loadRates(ctrl.signal);
+    return () => ctrl.abort();
   }, [isActive, refreshRules, loadRates]);
 
   async function toggleRule(id: number, checked: boolean) {

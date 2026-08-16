@@ -8,6 +8,21 @@ import { usePolling } from '@/lib/usePolling';
 
 Chart.register(...registerables);
 
+// Live readings land every 30 s; a gap > 5 min means a real hole (e.g. a Tesla
+// cloud outage whose all-zero rows the backend drops). Insert a null point so the
+// line breaks across the gap instead of bridging it with a misleading straight ramp.
+const GAP_MS = 5 * 60 * 1000;
+function breakGaps(points: { x: number; y: number | null }[]) {
+  const out: { x: number; y: number | null }[] = [];
+  for (let i = 0; i < points.length; i++) {
+    const p = points[i];
+    const prev = points[i - 1];
+    if (prev && p.x - prev.x > GAP_MS) out.push({ x: prev.x + 1, y: null });
+    out.push(p);
+  }
+  return out;
+}
+
 function isoDate(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -27,10 +42,10 @@ function dayLabel(viewedDate: Date): string {
 export default function DayChart() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const chartRef = useRef<Chart<'line'> | null>(null);
-  const solarDataRef = useRef<{ x: number; y: number }[]>([]);
-  const homeDataRef = useRef<{ x: number; y: number }[]>([]);
+  const solarDataRef = useRef<{ x: number; y: number | null }[]>([]);
+  const homeDataRef = useRef<{ x: number; y: number | null }[]>([]);
   const forecastRef = useRef<{ x: number; y: number }[]>([]);
-  const gridDataRef = useRef<{ x: number; y: number }[]>([]);
+  const gridDataRef = useRef<{ x: number; y: number | null }[]>([]);
   const visibilityRef = useRef([true, true, true, true]);
   const [visible, setVisible] = useState([true, true, true, true]);
   const [viewedDate, setViewedDate] = useState<Date>(() => {
@@ -227,9 +242,9 @@ export default function DayChart() {
       const rows = await fetch(url, { signal: ctrl.signal }).then((r) => r.json());
       const chart = chartRef.current;
       if (!chart) return;
-      solarDataRef.current = rows.filter((r: any) => r.solar_w > 0).map((r: any) => ({ x: r.ts * 1000, y: r.solar_w }));
-      homeDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.home_w) }));
-      gridDataRef.current = rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.grid_w ?? 0) }));
+      solarDataRef.current = breakGaps(rows.filter((r: any) => r.solar_w > 0).map((r: any) => ({ x: r.ts * 1000, y: r.solar_w })));
+      homeDataRef.current = breakGaps(rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.home_w) })));
+      gridDataRef.current = breakGaps(rows.map((r: any) => ({ x: r.ts * 1000, y: Math.max(0, r.grid_w ?? 0) })));
       if (visibilityRef.current[0]) chart.data.datasets[0].data = solarDataRef.current;
       if (visibilityRef.current[1]) chart.data.datasets[1].data = homeDataRef.current;
       if (visibilityRef.current[3]) chart.data.datasets[3].data = gridDataRef.current;

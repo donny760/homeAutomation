@@ -4,22 +4,31 @@ import { useCallback, useEffect, useState } from 'react';
 import { MONTHS_LBL, fmtTime12 } from '@/lib/format';
 import { usePolling } from '@/lib/usePolling';
 
-export type PageName = 'dashboard' | 'events' | 'rules' | 'costs' | 'network' | 'settings';
+// Single source of truth for the page set: PageName and the nav items both derive
+// from PAGES, and page.tsx validates URL hashes against PAGE_KEYS.
+// sparkle is set on every entry so PAGES stays a uniform shape under `as const`.
+const PAGES = [
+  { key: 'dashboard', label: 'Dashboard', sparkle: false },
+  { key: 'events', label: 'Event Log', sparkle: false },
+  { key: 'rules', label: 'Powerwall Rules', sparkle: true },
+  { key: 'costs', label: 'Energy Breakdown', sparkle: false },
+  { key: 'network', label: 'Network', sparkle: false },
+  { key: 'settings', label: 'Settings', sparkle: false },
+] as const satisfies readonly { key: string; label: string; sparkle: boolean }[];
+
+export type PageName = (typeof PAGES)[number]['key'];
+
+export const PAGE_KEYS: readonly string[] = PAGES.map((p) => p.key);
+
+export function isPageName(v: string): v is PageName {
+  return PAGE_KEYS.includes(v);
+}
 
 interface NavProps {
   activePage: PageName;
   onPageChange: (page: PageName) => void;
   onOpenSwitches?: () => void;
 }
-
-const PAGES: { key: PageName; label: string; sparkle?: boolean }[] = [
-  { key: 'dashboard', label: 'Dashboard' },
-  { key: 'events', label: 'Event Log' },
-  { key: 'rules', label: 'Powerwall Rules', sparkle: true },
-  { key: 'costs', label: 'Energy Breakdown' },
-  { key: 'network', label: 'Network' },
-  { key: 'settings', label: 'Settings' },
-];
 
 const WMO_ICON: Record<number, string> = {
   0: '\u2600',     // ☀ Clear

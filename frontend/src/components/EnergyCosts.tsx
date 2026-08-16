@@ -14,6 +14,16 @@ interface DayRow {
   net_cost: number;
 }
 
+interface Totals {
+  days: number;
+  on_peak_cost: number;
+  off_peak_cost: number;
+  super_off_peak_cost: number;
+  net_cost: number;
+  base_charge: number;
+  base_charge_known: boolean;
+}
+
 interface EnergyCostsProps {
   isActive: boolean;
 }
@@ -25,6 +35,7 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
   const yearStart = today.slice(0, 4) + '-01-01';
 
   const [days, setDays] = useState<DayRow[]>([]);
+  const [totals, setTotals] = useState<Totals | null>(null);
   const [ratesNote, setRatesNote] = useState('');
   const [loading, setLoading] = useState(true);
   const [rebuilding, setRebuilding] = useState(false);
@@ -41,14 +52,21 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
   // so an in-flight observer trigger during a date-change reset can't request
   // the wrong offset.
   const offsetRef = useRef(0);
+  const abortRef = useRef<AbortController | null>(null);
+  // costsRebuild schedules a refetch 3s out, which easily outlives a tab switch.
+  const rebuildTimersRef = useRef<ReturnType<typeof setTimeout>[]>([]);
 
   // Fetch a page of data, optionally appending to existing
   const fetchPage = useCallback(async (start: string, end: string, offset: number, append: boolean) => {
     if (!append) setLoading(true);
     else setLoadingMore(true);
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     try {
       const params = new URLSearchParams({ start, end, limit: String(PAGE_SIZE), offset: String(offset) });
-      const data = await fetch(`/api/costs/daily?${params}`).then((r) => r.json());
+      const data = await fetch(`/api/costs/daily?${params}`, { signal: ctrl.signal })
+        .then((r) => r.json());
       const newDays: DayRow[] = data.days || [];
       if (append) {
         setDays((prev) => [...prev, ...newDays]);
@@ -60,8 +78,12 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
       offsetRef.current = newOffset;
       setTotal(data.total || 0);
       setHasMore(newOffset < (data.total || 0));
-      if (data.rates_as_of) setRatesNote('rates as of ' + data.rates_as_of);
+      // Range-scoped, so identical on every page — the summary must describe the
+      // whole selected range, not just the rows scrolled into view.
+      if (data.totals) setTotals(data.totals);
+      setRatesNote(data.rates_note || '');
     } catch (e) {
+      if ((e as Error)?.name === 'AbortError') return;  // superseded, not a failure
       console.warn('CostsPage:', e);
     } finally {
       setLoading(false);
@@ -76,6 +98,11 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
       offsetRef.current = 0;
       fetchPage(startDate, endDate, 0, false);
     }
+    return () => {
+      abortRef.current?.abort();
+      rebuildTimersRef.current.forEach(clearTimeout);
+      rebuildTimersRef.current = [];
+    };
   }, [isActive, startDate, endDate, fetchPage]);
 
   // Infinite scroll via IntersectionObserver. Deps intentionally omit
@@ -101,26 +128,19 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
     setRebuilding(true);
     try {
       await fetch('/api/costs/rebuild', { method: 'POST' });
-      setTimeout(() => fetchPage(startDate, endDate, 0, false), 3000);
+      rebuildTimersRef.current.push(
+        setTimeout(() => fetchPage(startDate, endDate, 0, false), 3000),
+      );
     } catch (e) {
       console.warn('Rebuild:', e);
     } finally {
-      setTimeout(() => setRebuilding(false), 3500);
+      rebuildTimersRef.current.push(setTimeout(() => setRebuilding(false), 3500));
     }
   }
 
   function toggleMonth(mk: string) {
     setExpanded((prev) => ({ ...prev, [mk]: !prev[mk] }));
   }
-
-  // YTD summary from loaded data
-  let ytdOn = 0, ytdOff = 0, ytdSuper = 0;
-  days.forEach((d) => {
-    ytdOn += d.on_peak_cost;
-    ytdOff += d.off_peak_cost;
-    ytdSuper += d.super_off_peak_cost;
-  });
-  const ytdNet = ytdOn + ytdOff + ytdSuper;
 
   // Group by month
   const months: Record<string, DayRow[]> = {};
@@ -165,28 +185,40 @@ export default function EnergyCosts({ isActive }: EnergyCostsProps) {
         <div className="costs-summary-col">
           <div className="costs-summary-label" style={{ color: 'var(--amber)' }}>On-Peak</div>
           <div className="costs-summary-value" style={{ color: 'var(--amber)' }}>
-            {days.length ? fmtNet(ytdOn) : '\u2014'}
+            {totals ? fmtNet(totals.on_peak_cost) : '\u2014'}
           </div>
         </div>
         <div className="costs-summary-col">
           <div className="costs-summary-label" style={{ color: 'var(--green)' }}>Off-Peak</div>
           <div className="costs-summary-value" style={{ color: 'var(--green)' }}>
-            {days.length ? fmtNet(ytdOff) : '\u2014'}
+            {totals ? fmtNet(totals.off_peak_cost) : '\u2014'}
           </div>
         </div>
         <div className="costs-summary-col">
           <div className="costs-summary-label" style={{ color: 'var(--blue)' }}>Super Off-Peak</div>
           <div className="costs-summary-value" style={{ color: 'var(--blue)' }}>
-            {days.length ? fmtNet(ytdSuper) : '\u2014'}
+            {totals ? fmtNet(totals.super_off_peak_cost) : '\u2014'}
+          </div>
+        </div>
+        {/* Energy net and Base Charge are shown side by side and never summed.
+            Energy net is a balance banked to annual true-up; the Base Charge is
+            cash already paid and cannot be offset by export credits, so a
+            combined figure would imply the credit paid the charge. */}
+        <div className="costs-summary-col">
+          <div className="costs-summary-label">Energy (Net)</div>
+          <div
+            className="costs-summary-value"
+            style={{ color: totals ? (totals.net_cost <= 0 ? 'var(--green)' : 'var(--text)') : undefined }}
+            title="Import cost minus export credit. A credit banks to annual true-up rather than paying fixed charges."
+          >
+            {totals ? fmtNet(totals.net_cost) : '\u2014'}
           </div>
         </div>
         <div className="costs-summary-col">
-          <div className="costs-summary-label">Net Cost</div>
-          <div
-            className="costs-summary-value"
-            style={{ color: days.length ? (ytdNet <= 0 ? 'var(--green)' : 'var(--text)') : undefined }}
-          >
-            {days.length ? fmtNet(ytdNet) : '\u2014'}
+          <div className="costs-summary-label" style={{ color: 'var(--dim)' }}>Base Charge</div>
+          <div className="costs-summary-value" style={{ color: 'var(--dim)' }}
+               title="SDG&amp;E Base Services Charge \u2014 a fixed per-day charge billed in cash and not offset by net metering credits">
+            {totals && totals.base_charge_known ? fmtNet(totals.base_charge) : '\u2014'}
           </div>
         </div>
       </div>

@@ -6,7 +6,7 @@
     "dev": "next dev --port 3000",
     "dev:all": "concurrently -n backend,frontend -c yellow,cyan \"set PYTHONIOENCODING=utf-8 && py ../server.py\" \"next dev --port 3000\"",
     "build": "next build",
-    "build:local": "next build && xcopy /E /Y /I out ..\\static\\frontend && rmdir /S /Q out",
+    "build:local": "next build && rmdir /S /Q ..\\static\\frontend 2>nul & xcopy /E /Y /I out ..\\static\\frontend && rmdir /S /Q out",
     "deploy": "npm run build:local",
     "start": "next start"
   },

@@ -17,6 +17,7 @@ interface ScheduleEntry {
   grid_export?: string | null;
   rule_id?: number;
   enabled?: boolean;
+  pinned?: boolean;
 }
 
 export default function AutomationsPanel() {
@@ -26,7 +27,11 @@ export default function AutomationsPanel() {
   const refresh = useCallback(async () => {
     try {
       const data = await fetch('/api/schedule').then((r) => r.json());
-      setItems((data.schedule || []).slice(0, 5));
+      const all: ScheduleEntry[] = data.schedule || [];
+      // Paused rules are pinned: they survive the top-5 cut so they can always be resumed.
+      const pinned = all.filter((e) => e.pinned);
+      const upcoming = all.filter((e) => !e.pinned).slice(0, 5);
+      setItems([...upcoming, ...pinned]);
       setLoading(false);
     } catch (e) {
       console.warn('Automations:', e);

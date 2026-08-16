@@ -84,16 +84,26 @@ export default function NetworkDevices({ isActive }: NetworkDevicesProps) {
   const [confirmRemoveMac, setConfirmRemoveMac] = useState<string | null>(null);
   const editInputRef = useRef<HTMLInputElement>(null);
 
+  // Only the recurring read is abortable — the PUT/DELETE calls below are
+  // deliberately left alone, since cancelling a write mid-flight is worse than
+  // letting it land.
+  const abortRef = useRef<AbortController | null>(null);
   const refresh = useCallback(async () => {
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
     try {
-      const r = await fetch('/api/network/devices');
+      const r = await fetch('/api/network/devices', { signal: ctrl.signal });
       if (r.ok) setData(await r.json());
     } catch (e) {
+      if ((e as Error)?.name === 'AbortError') return;
       console.warn('network fetch:', e);
     }
   }, []);
 
   usePolling(refresh, 15_000, isActive);
+
+  useEffect(() => () => { abortRef.current?.abort(); }, []);
 
   useEffect(() => {
     if (editingMac && editInputRef.current) {

@@ -131,6 +131,9 @@ REM NOTE: .env is intentionally NOT overwritten - server keeps its own credentia
 REM       If you need to update .env, copy it manually after verifying new fields.
 REM NOTE: powerwall.db, abode.pickle, rules.log, and
 REM       network_devices.json are runtime state on the server and are NOT overwritten.
+REM NOTE: Fleet API tokens (.pypowerwall.fleetapi, .pypowerwall.private.pem, .fleet_rules\)
+REM       are server-side state and are NOT copied. rules.py uses .fleet_rules\ and needs
+REM       its own one-time Tesla OAuth on the server - do not point it at the shared token.
 
 echo.
 echo ============================================================

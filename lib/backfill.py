@@ -188,12 +188,27 @@ def backfill_rate_history():
                 print(f'  {eff_date}: incomplete rates, skipping')
                 continue
 
+            # ON CONFLICT, not INSERT OR REPLACE: REPLACE deletes the row first,
+            # which would null out columns this statement doesn't name —
+            # tou_periods_json (historical TOU windows built by migration v2,
+            # which will not re-run), base_services_charge_per_day, and the
+            # *_export rates. Only touch the columns this backfill owns.
             conn.execute(
-                'INSERT OR REPLACE INTO rate_history '
+                'INSERT INTO rate_history '
                 '(effective_date, end_date, summer_on_peak, summer_off_peak, '
                 'summer_super_off_peak, winter_on_peak, winter_off_peak, '
                 'winter_super_off_peak, source_url, fetched_at) '
-                'VALUES (?,?,?,?,?,?,?,?,?,datetime("now"))',
+                'VALUES (?,?,?,?,?,?,?,?,?,datetime("now")) '
+                'ON CONFLICT(effective_date) DO UPDATE SET '
+                '  end_date = excluded.end_date, '
+                '  summer_on_peak = excluded.summer_on_peak, '
+                '  summer_off_peak = excluded.summer_off_peak, '
+                '  summer_super_off_peak = excluded.summer_super_off_peak, '
+                '  winter_on_peak = excluded.winter_on_peak, '
+                '  winter_off_peak = excluded.winter_off_peak, '
+                '  winter_super_off_peak = excluded.winter_super_off_peak, '
+                '  source_url = excluded.source_url, '
+                '  fetched_at = excluded.fetched_at',
                 (eff_date, end_date,
                  rates.get('summer_on_peak'), rates.get('summer_off_peak'),
                  rates.get('summer_super_off_peak'),
