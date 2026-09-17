@@ -28,6 +28,7 @@ interface DevicesResp {
   devices: Device[];
   total: number;
   aps: string[];
+  stale_days: number;
   last_poll_ts: number;
   last_poll: { devices_seen?: number; aps_polled?: number; aps_skipped_quarantined?: number; elapsed_ms?: number; errors?: number };
   enabled: boolean;
@@ -58,15 +59,16 @@ function radioLabel(iface: string | null): string {
 }
 
 // Tier the row's offline-ness so we can fade old entries and gate the
-// remove button. Thresholds match the server-side guard (90d minimum
-// before DELETE will succeed).
+// remove button. `coldDays` is the server's network_device_purge_days
+// setting, the same threshold that drives auto-purge and the DELETE guard —
+// so a 'cold' row is one the poller will remove on its next pass.
 const STALE_WARM_DAYS = 7;
-const STALE_COLD_DAYS = 90;
-function stalenessTier(lastSeen: number | null, online: boolean):
-    'live' | 'warm' | 'cold' {
+const STALE_COLD_FALLBACK_DAYS = 90;
+function stalenessTier(lastSeen: number | null, online: boolean,
+                       coldDays: number): 'live' | 'warm' | 'cold' {
   if (online || !lastSeen) return 'live';
   const ageDays = (Date.now() / 1000 - lastSeen) / 86400;
-  if (ageDays >= STALE_COLD_DAYS) return 'cold';
+  if (coldDays > 0 && ageDays >= coldDays) return 'cold';
   if (ageDays >= STALE_WARM_DAYS) return 'warm';
   return 'live';
 }
@@ -163,6 +165,7 @@ export default function NetworkDevices({ isActive }: NetworkDevicesProps) {
   if (!isActive) return null;
 
   const all = data?.devices || [];
+  const coldDays = data?.stale_days ?? STALE_COLD_FALLBACK_DAYS;
   const filtered = all.filter((d) => {
     const isWireless = !!d.last_ap;
     if (connFilter === 'wireless' && !isWireless) return false;
@@ -290,7 +293,7 @@ export default function NetworkDevices({ isActive }: NetworkDevicesProps) {
             {filtered.map((d) => {
               const wireless = !!d.last_ap;
               const dnsName = d.last_hostname || d.nbns_name || '';
-              const tier = stalenessTier(d.last_seen, d.online);
+              const tier = stalenessTier(d.last_seen, d.online, coldDays);
               const isConfirming = confirmRemoveMac === d.mac;
               return (
                 <tr key={d.mac} data-stale={tier === 'live' ? undefined : tier}>
@@ -377,7 +380,7 @@ export default function NetworkDevices({ isActive }: NetworkDevicesProps) {
                       <button
                         className="net-remove-btn"
                         onClick={() => setConfirmRemoveMac(d.mac)}
-                        title={`Last seen ${shortDate(d.last_seen)} (>90d ago). Remove this entry from the dashboard. (DD-WRT MAC filter bans for this device, if any, are NOT touched.)`}
+                        title={`Last seen ${shortDate(d.last_seen)} (>${coldDays}d ago). Remove this entry from the dashboard now — the poller auto-purges it on its next pass. Threshold is Settings → Network Devices → Purge stale devices. (DD-WRT MAC filter bans for this device, if any, are NOT touched.)`}
                       >
                         ✕
                       </button>

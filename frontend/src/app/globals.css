@@ -403,6 +403,7 @@ body {
 .evf-btn.active[data-system="abode"]     { background: rgba(155,109,255,0.15); color: var(--abode); }
 .evf-btn.active[data-system="pool"]      { background: rgba(0,188,212,0.15); color: var(--pool); }
 .evf-btn.active[data-system="nest"]      { background: rgba(66,133,244,0.15); color: var(--nest); }
+.evf-btn.active[data-system="network"]   { background: rgba(55,138,221,0.15); color: var(--blue); }
 .events-date-range {
   display: flex;
   align-items: center;
@@ -818,6 +819,33 @@ body {
   align-self: flex-end;
 }
 .settings-save-btn:hover { opacity: 0.88; }
+
+/* The Network Devices card carries far more fields than any other connector
+   (router creds, AP JSON, purge threshold, WAN failover), so as a single
+   280px column it renders as a tall narrow strip. Give it two grid columns
+   and flow its fields into two internal columns, which roughly halves its
+   height. Guarded by a media query because below ~600px the settings grid
+   only fits one column, where a span-2 would force a horizontal scroll. */
+@media (min-width: 700px) {
+  .settings-card[data-connector="network"] {
+    grid-column: span 2;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px 22px;
+    align-content: start;
+  }
+  .settings-card[data-connector="network"] > .settings-card-header,
+  .settings-card[data-connector="network"] > .settings-type,
+  .settings-card[data-connector="network"] > .settings-save-btn,
+  .settings-card[data-connector="network"] > .settings-interval:has(textarea) {
+    grid-column: 1 / -1;
+  }
+  /* align-self works on the cross axis in flex but the block axis in grid —
+     the button needs justify-self to stay right-aligned. */
+  .settings-card[data-connector="network"] > .settings-save-btn {
+    justify-self: end;
+  }
+}
 
 /* ── Rate card ───────────────────────────────────────────────────────────────*/
 .rate-card {

@@ -5,11 +5,10 @@ import threading
 import lib.network_devices as _netdev
 from lib.state import BASE_DIR
 from lib.settings import get_setting, get_setting_int, get_setting_bool
-from lib.events import _log_system_error
+from lib.events import _log_system_error, _log_success
 
 NETWORK_STATE_PATH = os.path.join(BASE_DIR, 'network_devices.json')
 _NETWORK_QUARANTINE_SECS = 300
-_NETWORK_REMOVE_MIN_OFFLINE_DAYS = 90
 
 _network_state: dict = _netdev.load_state(NETWORK_STATE_PATH)
 _network_state_lock = threading.Lock()
@@ -32,6 +31,36 @@ def _network_router_cfg() -> dict[str, str]:
 
 def _network_ap_cfgs() -> list[dict[str, str]]:
     return _netdev.load_ap_configs(get_setting('network_aps', '[]'))
+
+
+def _network_purge_days() -> int:
+    """Staleness threshold in days, shared by the auto-purge, the manual
+    DELETE age guard and the frontend's `cold` row tier. 0 disables all
+    three. Clamped at 0 so a cleared Settings field (which posts "0")
+    fails closed rather than purging everything."""
+    return max(get_setting_int('network_device_purge_days', 60), 0)
+
+
+def _purge_stale_locked(state: dict, now: float) -> list[str]:
+    """Drop devices unseen past the threshold. Caller must hold
+    _network_state_lock and is responsible for saving state.
+
+    Age falls back to `first_seen` for records created by PUT on an unknown
+    MAC, which have no `last_seen` yet. A record with neither timestamp has
+    no computable age and is left alone. Mutates in place — server.py holds
+    a by-value reference to this dict, so it must never be rebound."""
+    days = _network_purge_days()
+    if days <= 0:
+        return []
+    cutoff = now - days * 86400
+    stale = []
+    for mac, d in state.items():
+        seen = d.get('last_seen') or d.get('first_seen') or 0
+        if seen and seen < cutoff:
+            stale.append(mac)
+    for mac in stale:
+        state.pop(mac, None)
+    return stale
 
 
 def _network_poll_once() -> dict:
@@ -62,6 +91,7 @@ def _network_poll_once() -> dict:
                 _network_ap_quarantine.pop(name, None)
         _netdev.merge_into_state(_network_state, res.get('merged', []),
                                  now_ts=int(now))
+        purged = _purge_stale_locked(_network_state, now)
         try:
             _netdev.save_state(NETWORK_STATE_PATH, _network_state)
         except Exception as exc:
@@ -74,7 +104,13 @@ def _network_poll_once() -> dict:
         'aps_skipped_quarantined': len(all_aps) - len(live_aps),
         'elapsed_ms': res.get('elapsed_ms', 0),
         'errors': sum(len(a.get('errors', [])) for a in res.get('aps', [])),
+        'purged': len(purged),
     }
+    # One summary row per run, never one per MAC — event_log is never purged.
+    if purged:
+        _log_success('network', 'devices_purged',
+                     f'Purged {len(purged)} stale network device(s)',
+                     f'Unseen >{_network_purge_days()}d: ' + ', '.join(purged))
     return _network_last_poll_result
 
 

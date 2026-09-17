@@ -51,6 +51,26 @@ def _log_success(system: str, event_type: str, title: str, detail: str = None) -
         _log.warning('event_log write failed (%s/%s): %s', system, title, exc)
 
 
+def format_duration(seconds: float) -> str:
+    """Human-readable elapsed time for event_log titles.
+
+    Floors every unit so nothing ever reads '0 min', and clamps negatives —
+    a Windows clock sync can move time.time() backwards mid-outage."""
+    s = int(seconds)
+    if s < 0:
+        s = 0
+    if s < 60:
+        return f'{s} sec'
+    if s < 3600:
+        return f'{s // 60} min'
+    if s < 86400:
+        hrs, mins = s // 3600, (s % 3600) // 60
+        return f'{hrs} hr {mins} min' if mins else f'{hrs} hr'
+    days, hrs = s // 86400, (s % 86400) // 3600
+    unit = 'day' if days == 1 else 'days'
+    return f'{days} {unit} {hrs} hr' if hrs else f'{days} {unit}'
+
+
 def _switches_log_event(provider: str, event_type: str, title: str, detail: str = None,
                         result: str = 'ok') -> None:
     provider_label = (provider or '').strip()

@@ -32,6 +32,8 @@ const SYSTEM_META: Record<string, { icon: string; label: string; color: string }
   home_control: { icon: '\ud83c\udfe0', label: 'Home Control', color: 'var(--purple)' },
   kasa: SMART_SWITCH,
   tuya: SMART_SWITCH,
+  wan: { icon: '🌐', label: 'Internet', color: 'var(--blue)' },
+  network: { icon: '📡', label: 'Network', color: 'var(--blue)' },
   rates: SDGE,
   holidays: SDGE,
 };
@@ -47,6 +49,7 @@ const FILTERS: { key: string; label: string; systems?: string }[] = [
   { key: 'nest', label: '\ud83d\udcf7 Cameras', systems: 'nest' },
   { key: 'sdge', label: '\ud83d\udcb2 SDG&E', systems: 'rates,holidays' },
   { key: 'system', label: '\u2699\ufe0f System', systems: 'system' },
+  { key: 'network', label: '🌐 Network', systems: 'wan,network' },
   { key: 'errors', label: 'Errors' },
 ];
 

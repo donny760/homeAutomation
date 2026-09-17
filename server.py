@@ -1393,12 +1393,13 @@ def api_debug_kasa():
 import lib.network as network_mod
 import lib.network_devices as _netdev
 from lib.network import (
-    NETWORK_STATE_PATH, _NETWORK_REMOVE_MIN_OFFLINE_DAYS,
+    NETWORK_STATE_PATH, _network_purge_days,
     _network_state, _network_state_lock,
     _network_router_cfg, _network_ap_cfgs,
     _network_state_to_list, _network_ap_by_name, _apply_filter_ban_map,
     _network_poll_once, _network_poll_loop,
 )
+from lib.wan import _wan_poll_loop, wan_debug_snapshot
 
 
 
@@ -1553,6 +1554,7 @@ def api_network_devices():
         'devices': items,
         'total': len(items),
         'aps': aps,
+        'stale_days': _network_purge_days(),
         'last_poll_ts': network_mod._network_last_poll_ts,
         'last_poll': network_mod._network_last_poll_result,
         'enabled': get_setting_bool('network_enabled', False),
@@ -1592,14 +1594,15 @@ def api_network_device_remove(mac):
         cur = _network_state.get(mac)
         if cur is None:
             return jsonify({'error': 'unknown mac'}), 404
+        min_days = _network_purge_days()
         last_seen = cur.get('last_seen') or 0
         age_days = (time.time() - last_seen) / 86400 if last_seen else None
-        if last_seen and age_days < _NETWORK_REMOVE_MIN_OFFLINE_DAYS:
+        if min_days and last_seen and age_days < min_days:
             return jsonify({
                 'error': 'device too recent to remove',
                 'last_seen': last_seen,
                 'offline_days': age_days,
-                'min_offline_days': _NETWORK_REMOVE_MIN_OFFLINE_DAYS,
+                'min_offline_days': min_days,
             }), 400
         _network_state.pop(mac, None)
         try:
@@ -1607,6 +1610,12 @@ def api_network_device_remove(mac):
         except Exception as exc:
             return jsonify({'error': f'save failed: {exc}'}), 500
     return jsonify({'ok': True, 'mac': mac})
+
+
+@app.route('/api/debug/wan')
+def api_debug_wan():
+    """WAN failover monitor state. ?probe=1 also runs a live egress lookup."""
+    return jsonify(wan_debug_snapshot(probe=request.args.get('probe') == '1'))
 
 
 @app.route('/api/network/rediscover', methods=['POST'])
@@ -1918,6 +1927,9 @@ def api_settings():
                 {'key': 'network_router_pass',   'label': 'Router pass',   'unit': 'text'},
                 {'key': 'network_local_subnet',  'label': 'LAN subnet (ping-sweep)', 'unit': 'text'},
                 {'key': 'network_aps',           'label': 'APs (JSON)',    'unit': 'text'},
+                {'key': 'network_device_purge_days', 'label': 'Purge stale devices', 'unit': 'days'},
+                {'key': 'wan_poll_interval',     'label': 'WAN failover check (0 = off)', 'unit': 's'},
+                {'key': 'wan_primary_match',     'label': 'Primary WAN match (PTR/org)', 'unit': 'text'},
             ],
         },
     ]
@@ -2060,6 +2072,7 @@ def _start():
     threading.Thread(target=_recalc_pool_target, daemon=True).start()
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=_network_poll_loop, daemon=True).start()
+    threading.Thread(target=_wan_poll_loop, daemon=True).start()
     start_abode_listener()
     print('Dashboard \u2192 http://localhost:5001')
     app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)

@@ -42,6 +42,9 @@ _SETTINGS_DEFAULTS = {
     'cost_rebuild_pending_from':   '',   # daily_costs stale from this date forward
     'rates_last_success':          '',   # last successful rate refresh (ISO date)
     'holidays_last_success':       '',   # last successful holiday refresh (ISO date)
+    'wan_state':                   '',   # committed WAN state: primary/backup/down
+    'wan_state_since':             '',   # epoch seconds that state began
+    'wan_last_poll_ts':            '',   # WAN monitor heartbeat (proves we were watching)
     'fe_poll_interval':            '10000',
     'fe_chart_interval':           '60000',
     'fe_weather_interval':         '600000',
@@ -89,6 +92,9 @@ _SETTINGS_DEFAULTS = {
     'network_router_snmp_port':      '161',
     'network_local_subnet':        '10.0.0.0/24',
     'network_aps':                 '[]',
+    'network_device_purge_days':   '60',   # auto-remove devices unseen this long; 0 = never
+    'wan_poll_interval':           '30',   # dual-WAN failover check; 0 = monitoring off
+    'wan_primary_match':           'cox',  # comma-separated substrings matched against PTR/org
     # Gates /api/debug/* — off by default. These routes mutate state, run
     # expensive scans, and echo router credentials. Turn on only while debugging.
     'debug_enabled':               '0',
