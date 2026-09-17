@@ -25,14 +25,16 @@ PW_EMAIL      = 'don@nsdsolutions.com'
 BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
 DB_PATH       = os.environ.get('DB_PATH', os.path.join(BASE_DIR, 'powerwall.db'))
 LOG_PATH      = os.environ.get('LOG_PATH', os.path.join(BASE_DIR, 'rules.log'))
-# Own Fleet API token directory, deliberately NOT shared with server.py.
-# Tesla rotates the refresh token on every use, so two processes pointing at one
-# token file race: whichever refreshes second presents a token the first already
-# invalidated, and pypowerwall swallows that failure — poll() just returns None,
-# which never trips the reconnect path below. Separate token, separate rotation.
-FLEET_AUTH_DIR = os.path.join(BASE_DIR, '.fleet_rules')
 EVAL_INTERVAL = 60    # seconds between evaluations
 LOOP_SLEEP    = 30    # main loop cadence in seconds
+# Always-enforce reconciliation means a field that never converges would retry
+# forever; these bound both the log noise and the traffic to Tesla.
+ERROR_LOG_INTERVAL  = 300   # min gap between repeat error rows for the same field
+CONVERGE_FAIL_LIMIT = 10    # consecutive failures before a field backs off
+CONVERGE_BACKOFF    = 300   # retry gap for a field that will not converge
+UNREADABLE_ALERT_AFTER = 300  # unreadable this long → red event_log row on the dashboard
+RECONNECT_AFTER_FAILS  = 3    # consecutive unreadable cycles before a full reconnect
+RECONNECT_MIN_GAP      = 300  # min gap between those reconnects
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -47,6 +49,28 @@ logging.basicConfig(
     ]
 )
 log = logging.getLogger('rules')
+
+
+class _LastErrorHandler(logging.Handler):
+    """Remembers pypowerwall's most recent ERROR message.
+
+    pypowerwall reports the real cause of a failure (HTTP status, token refresh
+    401) only through its logger and hands callers a bare None, so this is the
+    only way to put the reason into an event_log row's detail.
+    """
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.last = None
+
+    def emit(self, record):
+        try:
+            self.last = record.getMessage()[:500]
+        except Exception:
+            pass
+
+
+_pw_errors = _LastErrorHandler()
+logging.getLogger('pypowerwall').addHandler(_pw_errors)
 
 
 def log_event(conn, system, event_type, title, detail=None,
@@ -244,64 +268,273 @@ _MODE_LABEL = {
 
 
 # ── Apply Settings ────────────────────────────────────────────────────────────
-def apply_settings(pw, target: dict, last: dict,
+_CONN_ERROR_NAMES = {'ConnectionError', 'Timeout', 'ConnectTimeout', 'ReadTimeout',
+                     'SSLError', 'ProxyError', 'ChunkedEncodingError', 'OSError'}
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    """True only for transport-level faults, where rebuilding the client may help."""
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    return bool(names & _CONN_ERROR_NAMES)
+
+
+def new_apply_state() -> dict:
+    """Per-field retry bookkeeping for apply_settings (not a cache of applied values)."""
+    return {'fails': {}, 'next_try': {}, 'last_err': {}}
+
+
+def new_read_state() -> dict:
+    """Bookkeeping for reading Powerwall state: token-file tracking + outage alerts."""
+    return {'mtime': None, 'fails': 0, 'down_since': 0.0, 'alerted': False,
+            'last_reconnect': 0.0, 'last_warn': 0.0}
+
+
+def _token_mtime(fleet) -> float | None:
+    try:
+        return os.path.getmtime(fleet.configfile)
+    except Exception:
+        return None
+
+
+def _reload_tokens(fleet, state: dict, reason: str) -> None:
+    """Re-read access/refresh tokens from the shared token file.
+
+    rules.py and server.py's poller share one Fleet API token file, and Tesla
+    rotates the refresh token on every use — so whenever the poller refreshes, the
+    refresh token rules.py holds in memory is dead.  Without a reload, rules.py
+    401s on its next refresh forever while the file on disk is perfectly valid
+    (13 hours on 2026-09-16).
+    """
+    mtime = _token_mtime(fleet)   # taken before loading: a write mid-load re-triggers
+    try:
+        fleet.load_config()
+        state['mtime'] = mtime
+        log.info('Reloaded Fleet API tokens (%s)', reason)
+    except Exception as exc:
+        # A read racing the poller's write can hit a half-written file; retry next cycle.
+        log.warning('Token reload failed (%s): %r', reason, exc)
+
+
+def read_actual_state(pw, state: dict | None = None) -> dict | None:
+    """Read the Powerwall's *actual* current settings back from Tesla.
+
+    One forced site_info refresh; the four getters below are then served from that
+    same warm cache, so this costs a single HTTP round trip.  Returns None when
+    Tesla is unreadable — the caller skips the cycle rather than enforcing blind.
+
+    With `state`, first picks up tokens rotated by the other process (token file
+    changed on disk), and reloads again after a failed read.
+    """
+    try:
+        fleet = pw.client.fleet
+    except Exception as exc:
+        log.error('read_actual_state: no fleet client: %r', exc)
+        return None
+
+    if state is not None:
+        mtime = _token_mtime(fleet)
+        if state['mtime'] is None:
+            state['mtime'] = mtime
+        elif mtime is not None and mtime != state['mtime']:
+            _reload_tokens(fleet, state, 'token file changed')
+
+    try:
+        if fleet.get_site_info(force=True):
+            reserve = fleet.get_battery_reserve()
+            return {
+                'reserve':       None if reserve is None else int(reserve),
+                'mode':          fleet.get_operating_mode(),
+                'grid_charging': bool(fleet.get_grid_charging()),
+                'grid_export':   fleet.get_grid_export(),
+            }
+    except Exception as exc:
+        log.error('read_actual_state failed: %r', exc)
+        _pw_errors.last = repr(exc)[:500]
+
+    if state is not None:
+        _reload_tokens(fleet, state, 'read failed')
+    return None
+
+
+def _emit_event(conn, *args, **kwargs) -> None:
+    """log_event on `conn`, or on a short-lived connection when there is none."""
+    try:
+        if conn is not None:
+            log_event(conn, *args, **kwargs)
+            return
+        c = connect()
+        try:
+            log_event(c, *args, **kwargs)
+        finally:
+            c.close()
+    except Exception as exc:
+        log.error('event_log write failed: %r', exc)
+
+
+def note_unreadable(conn, state: dict, now: float) -> bool:
+    """Record a cycle where Powerwall state could not be read.
+
+    Writes one red event_log row once the outage passes UNREADABLE_ALERT_AFTER —
+    previously this was a rules.log-only warning and a 13-hour outage never
+    reached the dashboard.  Returns True when the caller should force a reconnect.
+    """
+    state['fails'] += 1
+    if not state['down_since']:
+        state['down_since'] = now
+    down = now - state['down_since']
+
+    if now - state['last_warn'] >= ERROR_LOG_INTERVAL:
+        state['last_warn'] = now
+        log.warning('Could not read Powerwall state for %ds — skipping apply', int(down))
+
+    if not state['alerted'] and down >= UNREADABLE_ALERT_AFTER:
+        state['alerted'] = True
+        _emit_event(conn, 'powerwall', 'error',
+                    "Rules engine can't read Powerwall — automations paused",
+                    detail=_pw_errors.last or 'no error recorded', result='failed')
+
+    if (state['fails'] >= RECONNECT_AFTER_FAILS
+            and now - state['last_reconnect'] >= RECONNECT_MIN_GAP):
+        state['last_reconnect'] = now
+        return True
+    return False
+
+
+def note_readable(conn, state: dict, now: float) -> None:
+    """Record a successful read; logs recovery if an outage had been alerted."""
+    if state['alerted']:
+        mins = max(1, int((now - state['down_since']) / 60))
+        log.info('Powerwall readable again after %d min', mins)
+        _emit_event(conn, 'powerwall', 'rules_engine_recovered',
+                    f'Rules engine reconnected after {mins} min — automations resumed',
+                    result='ok')
+    state['fails'] = 0
+    state['down_since'] = 0.0
+    state['alerted'] = False
+    _pw_errors.last = None
+
+
+def _set_grid_import_export(fleet, allow_charge: bool, export_rule: str):
+    """Write both grid_import_export fields in a single POST.
+
+    Tesla exposes grid charging and the export rule on one endpoint, but
+    pypowerwall's set_grid_charging/set_grid_export each send only their own key.
+    Writing one key at a time risks the omitted field being reset to default —
+    and under always-enforce reconciliation two setters that clobber each other
+    would ping-pong once a cycle forever.  Always send both.
+    """
+    data = {
+        'disallow_charge_from_grid_with_solar_installed': not allow_charge,
+        'customer_preferred_export_rule': export_rule,
+    }
+    payload = fleet.poll(f'api/1/energy_sites/{fleet.site_id}/grid_import_export',
+                         'POST', data)
+    fleet.pwcachetime.pop(f'api/1/energy_sites/{fleet.site_id}/site_info', None)
+    return payload
+
+
+def apply_settings(pw, target: dict, actual: dict, state: dict,
                    conn=None, battery_pct=None) -> bool:
-    """Apply target state to Powerwall. Logs one combined event row per call."""
+    """Reconcile the Powerwall toward target. Logs one combined event row per call.
+
+    Compares against `actual` — read back from Tesla this cycle — never against a
+    cache of what we believe we wrote.  A write that Tesla accepts but never
+    applies is therefore retried next cycle instead of being remembered as done.
+
+    Calls the fleet setters directly rather than pw.set_reserve/pw.set_mode: the
+    pypowerwall wrapper (set_operation) back-fills a missing reserve via
+    get_reserve(), which returns None while Tesla is erroring, then raises
+    TypeError on `level > 0` — aborting every setting after it.
+    """
+    fleet   = pw.client.fleet
     changes = []
     errors  = []
+    now     = time.time()
 
-    if target['reserve'] is not None and target['reserve'] != last.get('reserve'):
-        result = pw.set_reserve(target['reserve'])
-        if result is not None:
-            log.info('set_reserve(%d%%) → OK', target['reserve'])
-            last['reserve'] = target['reserve']
-            changes.append((f"Reserve → {target['reserve']}%", 'reserve_changed'))
-        else:
-            log.error('set_reserve(%d%%) failed', target['reserve'])
-            errors.append(f"set_reserve({target['reserve']}%) failed")
+    def _settled(key):
+        state['fails'].pop(key, None)
+        state['next_try'].pop(key, None)
 
-    if target['mode'] is not None and target['mode'] != last.get('mode'):
-        result = pw.set_mode(target['mode'])
-        if result is not None:
-            log.info('set_mode(%s) → OK', target['mode'])
-            last['mode'] = target['mode']
-            label = _MODE_LABEL.get(target['mode'], target['mode'])
-            changes.append((f"Mode → {label}", 'mode_changed'))
-        else:
-            log.error('set_mode(%s) failed', target['mode'])
-            errors.append(f"set_mode({target['mode']}) failed")
+    def _attempt(key, call, labels):
+        """One write plus its retry bookkeeping. labels = [(text, event_type), ...]."""
+        if now < state['next_try'].get(key, 0.0):
+            return
+        # Isolated per key: one write failing must not skip the others.
+        try:
+            result = call()
+            reason = f'returned {result!r}'
+        except Exception as exc:
+            result = None
+            reason = repr(exc)
 
-    if target['grid_charging'] is not None and target['grid_charging'] != last.get('grid_charging'):
-        result = pw.set_grid_charging(target['grid_charging'])
-        if result is not None:
-            log.info('set_grid_charging(%s) → OK', target['grid_charging'])
-            last['grid_charging'] = target['grid_charging']
-            changes.append((f"Grid charging → {'ON' if target['grid_charging'] else 'OFF'}",
-                            'grid_charging_changed'))
-        else:
-            log.error('set_grid_charging(%s) failed', target['grid_charging'])
-            errors.append(f"set_grid_charging({target['grid_charging']}) failed")
+        # Falsy, not just None — the fleet setters return False for a value they
+        # reject, which the old `is not None` test logged as success.
+        if result:
+            log.info('set_%s → OK (%s)', key, ', '.join(t for t, _ in labels))
+            changes.extend(labels)
+            _settled(key)
+            return
 
-    if target['grid_export'] is not None and target['grid_export'] != last.get('grid_export'):
-        result = pw.set_grid_export(target['grid_export'])
-        if result is not None:
-            log.info('set_grid_export(%s) → OK', target['grid_export'])
-            last['grid_export'] = target['grid_export']
-            changes.append((f"Grid export → {target['grid_export']}", 'grid_export_changed'))
-        else:
-            log.error('set_grid_export(%s) failed', target['grid_export'])
-            errors.append(f"set_grid_export({target['grid_export']}) failed")
+        fails = state['fails'].get(key, 0) + 1
+        state['fails'][key] = fails
+        log.error('set_%s failed (%s, attempt %d)', key, reason, fails)
+        if fails == CONVERGE_FAIL_LIMIT:
+            log.warning('%s has not converged after %d attempts — backing off to '
+                        'one retry per %ds', key, fails, CONVERGE_BACKOFF)
+        if fails >= CONVERGE_FAIL_LIMIT:
+            state['next_try'][key] = now + CONVERGE_BACKOFF
+        if now - state['last_err'].get(key, 0.0) >= ERROR_LOG_INTERVAL:
+            state['last_err'][key] = now
+            errors.append((f'set_{key} failed', reason))
 
-    if conn:
-        if changes:
-            title  = '  ·  '.join(label for label, _ in changes)
-            etype  = changes[0][1] if len(changes) == 1 else 'automation_fired'
-            log_event(conn, 'powerwall', etype, title,
-                      result='ok', battery_pct=battery_pct)
-        if errors:
-            log_event(conn, 'powerwall', 'error',
-                      '  ·  '.join(errors),
-                      result='failed', battery_pct=battery_pct)
+    try:
+        # reserve and mode each own their endpoint (/backup, /operation).
+        for field, setter, label, etype in (
+            ('reserve', fleet.set_battery_reserve,
+             lambda v: f"Reserve → {v}%",                   'reserve_changed'),
+            ('mode',    fleet.set_operating_mode,
+             lambda v: f"Mode → {_MODE_LABEL.get(v, v)}",   'mode_changed'),
+        ):
+            want = target.get(field)
+            if want is None or want == actual.get(field):
+                _settled(field)
+                continue
+            _attempt(field, lambda s=setter, w=want: s(w), [(label(want), etype)])
+
+        # grid charging + export rule share one endpoint — write them together,
+        # carrying over the current value for whichever field no rule sets.
+        cur_charge, cur_export = actual.get('grid_charging'), actual.get('grid_export')
+        want_charge, want_export = target.get('grid_charging'), target.get('grid_export')
+        eff_charge = cur_charge if want_charge is None else want_charge
+        eff_export = cur_export if want_export is None else want_export
+
+        labels = []
+        if eff_charge != cur_charge:
+            labels.append((f"Grid charging → {'ON' if eff_charge else 'OFF'}",
+                           'grid_charging_changed'))
+        if eff_export != cur_export:
+            labels.append((f"Grid export → {eff_export}", 'grid_export_changed'))
+
+        if labels and eff_charge is not None and eff_export is not None:
+            _attempt('grid_import_export',
+                     lambda: _set_grid_import_export(fleet, eff_charge, eff_export),
+                     labels)
+        elif not labels:
+            _settled('grid_import_export')
+    finally:
+        # In `finally` so a throw above can never discard already-collected errors
+        # — that is how a 24-minute crash loop stayed invisible on the dashboard.
+        if conn:
+            if changes:
+                title = '  ·  '.join(lbl for lbl, _ in changes)
+                ctype = changes[0][1] if len(changes) == 1 else 'automation_fired'
+                log_event(conn, 'powerwall', ctype, title,
+                          result='ok', battery_pct=battery_pct)
+            if errors:
+                log_event(conn, 'powerwall', 'error',
+                          '  ·  '.join(t for t, _ in errors),
+                          detail='\n'.join(f'{t}: {d}' for t, d in errors),
+                          result='failed', battery_pct=battery_pct)
 
     return bool(changes or errors)
 
@@ -315,8 +548,9 @@ def main_loop(stop_fn=None):
 
     pw               = None
     last_eval        = 0.0
-    last_state       = {}
+    apply_state      = new_apply_state()
     pw_retry_after   = 0.0   # epoch — don't call apply_settings until this time
+    read_state       = new_read_state()
     last_holiday_logged = None
     last_nxt         = None
     last_state_sig   = None
@@ -332,14 +566,31 @@ def main_loop(stop_fn=None):
         if pw is None:
             try:
                 log.info('Connecting to Powerwall (Fleet API mode)…')
-                os.makedirs(FLEET_AUTH_DIR, exist_ok=True)
+                # Shares server.py's token file by design. A separate authpath
+                # needs its own OAuth: pypowerwall requires the config file to
+                # already exist in fleetapi mode (os.access on a missing file is
+                # False) and never bootstraps one, and a mere *copy* of this file
+                # is worse than sharing — it dies permanently when Tesla rotates
+                # the refresh token, whereas re-reading the shared file recovers.
                 pw = pypowerwall.Powerwall('', fleetapi=True,
                                            email=PW_EMAIL, timeout=30,
-                                           authpath=FLEET_AUTH_DIR)
+                                           authpath=BASE_DIR)
+                # pypowerwall does not raise when site discovery fails — it logs
+                # "No sites found" and returns a client with no site_id, against
+                # which every later call fails.  Treat that as a bad connect.
+                if not pw.siteid:
+                    pw = None
+                    log.error('Connected but no site_id (site discovery failed) '
+                              '— retry in %ds', LOOP_SLEEP)
+                    note_unreadable(None, read_state, now)
+                    time.sleep(LOOP_SLEEP)
+                    continue
+                read_state['mtime'] = _token_mtime(pw.client.fleet)
                 log.info('Connected.')
-                last_state = {}
             except Exception as exc:
                 log.error('Connection failed: %s — retry in %ds', exc, LOOP_SLEEP)
+                _pw_errors.last = _pw_errors.last or repr(exc)[:500]
+                note_unreadable(None, read_state, now)
                 time.sleep(LOOP_SLEEP)
                 continue
 
@@ -393,17 +644,27 @@ def main_loop(stop_fn=None):
                     log.exception('Evaluation error: %s: %s', type(exc).__name__, exc)
 
                 if target is not None and now >= pw_retry_after:
-                    try:
-                        apply_settings(pw, target, last_state,
-                                       conn=conn, battery_pct=live.get('battery_pct'))
-                    except Exception as exc:
-                        if '429' in str(exc):
-                            pw_retry_after = now + 300
-                            log.warning('Tesla rate limit (429) — pausing apply for 5 min')
-                        else:
-                            log.error('Powerwall apply error: %s — reconnecting', exc)
+                    actual = read_actual_state(pw, read_state)
+                    if actual is None:
+                        # Tesla unreadable — do not enforce against a state we
+                        # cannot see.  The next cycle re-reads and reconciles.
+                        if note_unreadable(conn, read_state, now):
+                            log.warning('Powerwall unreadable for %d cycles — reconnecting',
+                                        read_state['fails'])
                             pw = None
-                            pw_retry_after = now + 60
+                    else:
+                        note_readable(conn, read_state, now)
+                        try:
+                            apply_settings(pw, target, actual, apply_state,
+                                           conn=conn, battery_pct=live.get('battery_pct'))
+                        except Exception as exc:
+                            # Only transport faults justify a reconnect.  Treating
+                            # every error as one previously produced a reconnect
+                            # loop that re-crashed in the same place each cycle.
+                            log.exception('Powerwall apply error: %r', exc)
+                            if _is_connection_error(exc):
+                                pw = None
+                                pw_retry_after = now + 60
             finally:
                 conn.close()
 
