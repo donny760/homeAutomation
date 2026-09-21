@@ -19,6 +19,7 @@ from lib.fetch_rates import (
 from lib.rachio import fetch_rachio_events, evaluate_rain_skip
 from lib.nest import fetch_nest_events, _nest_ensure_token, _nest_refresh_devices
 from lib.pool import fetch_pool, POOL_POLL_INTERVAL
+from lib import rules_watchdog
 import lib.kasa as kasa
 from lib.kasa import _kasa_refresh_devices, _kasa_poll_state
 import lib.tuya as tuya
@@ -228,6 +229,9 @@ def poller() -> None:
                     mode = val
             except Exception:
                 pass
+
+            # Reads the site_info get_mode() just cached — no extra Tesla request.
+            rules_watchdog.check(rules_watchdog.cached_settings(pw))
 
             now = int(time.time())
 
