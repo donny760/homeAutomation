@@ -36,7 +36,7 @@ from lib.db import (
 from lib.settings import (
     _SETTINGS_DEFAULTS, _seed_settings, load_settings,
     get_setting, get_setting_int, get_setting_bool, _load_tou_periods,
-    invalidate_settings_cache, set_setting,
+    invalidate_settings_cache, set_setting, mask_settings, unmask_update,
 )
 from lib.events import (
     _log_system_error, _log_success, _switches_log_event,
@@ -1933,7 +1933,10 @@ def api_settings():
             ],
         },
     ]
-    return jsonify({'settings': settings, 'connectors': connectors})
+    # Secrets (API keys, tokens, passwords, AP passwords in network_aps) are
+    # masked — this response reaches the browser and, via the public hostname,
+    # anyone who requests it.
+    return jsonify({'settings': mask_settings(settings), 'connectors': connectors})
 
 
 def _record_tou_change(conn, new_tou_value) -> bool:
@@ -1985,11 +1988,16 @@ def api_settings_update():
     data = request.get_json() or {}
     valid_keys = set(_SETTINGS_DEFAULTS.keys())
     tou_changed = False
+    current = load_settings()
     with connect() as c:
         if 'tou_periods' in data and 'tou_periods' in valid_keys:
             tou_changed = _record_tou_change(c, data['tou_periods'])
         for key, value in data.items():
             if key in valid_keys:
+                # A masked secret posted back unchanged must not overwrite the real one.
+                value = unmask_update(key, value, current)
+                if value is None:
+                    continue
                 c.execute(
                     'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
                     (key, str(value))

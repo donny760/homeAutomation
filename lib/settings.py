@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 
 import lib.state as state
@@ -108,6 +109,69 @@ def _seed_settings(conn):
             (key, default)
         )
     conn.commit()
+
+
+# Secrets never leave the server. GET /api/settings replaces them with
+# SECRET_MASK; PUT treats an incoming SECRET_MASK as "unchanged" (the Settings
+# page posts back every field in a card, masked ones included).
+SECRET_MASK = '••••••••'
+_SECRET_KEY_RE = re.compile(r'(?:^|_)(password|pass|secret|api_key|token|community)$', re.I)
+_AP_SECRET_FIELDS = ('pass', 'password')
+
+
+def is_secret_key(key: str) -> bool:
+    return bool(_SECRET_KEY_RE.search(key))
+
+
+def mask_settings(settings: dict) -> dict:
+    """Copy of `settings` safe to send to a browser."""
+    out = {}
+    for k, v in settings.items():
+        if is_secret_key(k):
+            out[k] = SECRET_MASK if v else ''
+        elif k == 'network_aps':
+            out[k] = _mask_aps(v)
+        else:
+            out[k] = v
+    return out
+
+
+def _mask_aps(raw: str) -> str:
+    try:
+        aps = json.loads(raw or '[]')
+        if not isinstance(aps, list):
+            return raw
+        for ap in aps:
+            if isinstance(ap, dict):
+                for f in _AP_SECRET_FIELDS:
+                    if ap.get(f):
+                        ap[f] = SECRET_MASK
+        return json.dumps(aps, indent=2, ensure_ascii=False)
+    except (ValueError, TypeError):
+        return '[]'          # unparseable: never echo raw (it may hold passwords)
+
+
+def unmask_update(key: str, value, current: dict):
+    """Resolve an incoming PUT value against stored settings.
+    Returns None when the key should be left unchanged."""
+    if is_secret_key(key):
+        return None if value == SECRET_MASK else value
+    if key == 'network_aps':
+        try:
+            new = json.loads(value)
+            old = {a.get('url'): a for a in json.loads(current.get('network_aps') or '[]')
+                   if isinstance(a, dict)}
+        except (ValueError, TypeError):
+            return value     # let the existing parser tolerate/replace garbage
+        if isinstance(new, list):
+            for ap in new:
+                if isinstance(ap, dict):
+                    for f in _AP_SECRET_FIELDS:
+                        if ap.get(f) == SECRET_MASK:
+                            prev = old.get(ap.get('url'), {})
+                            ap[f] = prev.get(f, '')
+            return json.dumps(new)
+    return value
 
 
 def load_settings() -> dict:
