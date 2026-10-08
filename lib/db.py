@@ -171,7 +171,18 @@ def _migrate_v4(conn):
     conn.execute("PRAGMA user_version = 4")
 
 
-_MIGRATIONS = [(1, _migrate_v1), (2, _migrate_v2), (3, _migrate_v3), (4, _migrate_v4)]
+def _migrate_v5(conn):
+    """Delete rows from the removed public-port check (check_public_port, dropped
+    in 1a54a74 on 2026-04-18). Deliberate one-off exception to never-purge,
+    requested by Don; scoped to this dead event type only."""
+    conn.execute(
+        "DELETE FROM event_log WHERE system = 'system' AND event_type = 'port_check'"
+    )
+    conn.execute("PRAGMA user_version = 5")
+
+
+_MIGRATIONS = [(1, _migrate_v1), (2, _migrate_v2), (3, _migrate_v3), (4, _migrate_v4),
+               (5, _migrate_v5)]
 
 
 def _migrate(conn) -> None:
