@@ -48,6 +48,8 @@ _cached_detail: str     = ''
 _class_retry_at: float  = 0.0
 _class_match_snapshot: str = ''
 
+_last_ip: str           = ''      # last IP seen in a confirmed state; kept through 'down'
+
 _probe_rotor: int       = 0
 _last_obs: str          = ''
 _last_obs_ts: float     = 0.0
@@ -152,17 +154,29 @@ def _class_for(ip: str) -> tuple[str, str]:
     return _cached_class, _cached_detail
 
 
-def _observe() -> tuple[str, str]:
-    """One observation: 'primary' | 'backup' | 'down' | 'unknown'."""
+def _observe() -> tuple[str, str, str | None]:
+    """One observation: ('primary' | 'backup' | 'down' | 'unknown', detail, ip)."""
     ip, _results = probe_external_ip()
     if ip is None:
         if _has_egress():
             # We can reach the internet — the lookups failed provider-side or
             # the resolver is down. No information, so this is not an outage.
-            return 'unknown', 'IP providers unreachable but egress is up'
-        return 'down', 'all IP providers failed and no TCP egress'
+            return 'unknown', 'IP providers unreachable but egress is up', None
+        return 'down', 'all IP providers failed and no TCP egress', None
     cls, detail = _class_for(ip)
-    return cls, f'IP {ip} ({detail})'
+    return cls, f'IP {ip} ({detail})', ip
+
+
+def _with_prev_ip(detail: str, ip: str | None) -> str:
+    """Annotate a transition's detail with the IP it moved from, so a restore
+    shows whether Cox handed back the same lease."""
+    if not _last_ip:
+        return detail
+    if ip is None:
+        return f'{detail}; last IP {_last_ip}'
+    if ip == _last_ip:
+        return detail.replace(f'IP {ip}', f'IP {ip} (unchanged)', 1)
+    return detail.replace(f'IP {ip}', f'IP {_last_ip} → {ip}', 1)
 
 
 def _load_state() -> None:
@@ -229,11 +243,11 @@ def _commit(new_state: str, detail: str, at: float) -> None:
 
 
 def _wan_poll_once() -> dict:
-    global _pending, _pending_since, _last_obs, _last_obs_ts, _last_heartbeat
+    global _pending, _pending_since, _last_obs, _last_obs_ts, _last_heartbeat, _last_ip
     if not _loaded:
         _load_state()
     now = time.time()
-    obs, detail = _observe()
+    obs, detail, ip = _observe()
     _last_obs, _last_obs_ts = obs, now
 
     if now - _last_heartbeat >= _HEARTBEAT_SECS:
@@ -244,6 +258,8 @@ def _wan_poll_once() -> dict:
         pass                                   # no information — freeze
     elif obs == _confirmed_state:
         _pending = None
+        if ip:
+            _last_ip = ip                      # follows DHCP renewals silently
     elif obs != _pending:
         _pending, _pending_since = obs, now
     else:
@@ -251,7 +267,9 @@ def _wan_poll_once() -> dict:
         # Floor the confirm window at one interval so a commit always needs at
         # least two independent sightings.
         if now - _pending_since >= max(_WAN_CONFIRM_SECS, interval):
-            _commit(obs, detail, _pending_since)
+            _commit(obs, _with_prev_ip(detail, ip), _pending_since)
+            if ip:
+                _last_ip = ip
 
     return {'observed': obs, 'detail': detail, 'state': _confirmed_state,
             'pending': _pending}
@@ -300,6 +318,7 @@ def wan_debug_snapshot(probe: bool = False) -> dict:
         'cached_ip': _cached_ip or None,
         'cached_class': _cached_class or None,
         'cached_detail': _cached_detail or None,
+        'last_ip': _last_ip or None,
         'persisted': {
             'wan_state': get_setting('wan_state', ''),
             'wan_state_since': get_setting('wan_state_since', ''),

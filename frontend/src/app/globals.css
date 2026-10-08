@@ -455,6 +455,7 @@ body {
 .event-row.linkable { cursor: pointer; }
 .event-row.linkable:hover { background: var(--bg); }
 .event-link-icon { font-size: 0.7rem; opacity: 0.55; margin-left: 6px; }
+.event-detail { color: var(--very-dim); font-size: 0.78rem; margin-left: 10px; }
 
 .event-date-divider {
   display: flex;

@@ -1,3 +1,6 @@
+import collections
+import logging
+import re
 import threading
 import time
 import traceback
@@ -35,6 +38,41 @@ _backfill_running         = threading.Event()  # prevents overlapping backfill t
 _last_poller_error_log: float = 0.0  # throttles the poller's catch-all error row
 POLLER_ERROR_LOG_INTERVAL = 300      # seconds between logged poller errors
 POLLER_ERROR_DETAIL_MAX   = 500      # chars of traceback kept per row
+
+
+class _PwErrorTap(logging.Handler):
+    """Keeps pypowerwall's own error messages. Its Fleet client turns timeouts,
+    HTTP errors and failed token refreshes into a bare None and says why only
+    through logging, so without this an outage row can't name its cause."""
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.records: collections.deque = collections.deque(maxlen=50)
+
+    def emit(self, record):
+        try:
+            # Drop scheme+host: a URL in event_log detail turns the row into a
+            # link, and an unauthenticated GET on it only shows a misleading 401.
+            msg = re.sub(r'https?://[^/\s]+/', '', record.getMessage())
+            self.records.append((record.created, msg[:200]))
+            # Having any handler suppresses logging.lastResort, which is what
+            # printed these to stderr (server.py configures no root logger).
+            if not logging.getLogger().handlers and logging.lastResort:
+                logging.lastResort.handle(record)
+        except Exception:
+            pass
+
+
+_pw_errors = _PwErrorTap()
+logging.getLogger('pypowerwall').addHandler(_pw_errors)
+
+
+def _pw_error_summary(since: float) -> str:
+    counts = collections.Counter(m for ts, m in list(_pw_errors.records) if ts >= since)
+    if not counts:
+        return 'pypowerwall logged no errors'
+    return 'pypowerwall: ' + '; '.join(
+        f'{m} (x{n})' if n > 1 else m for m, n in counts.most_common(5))
 
 
 BACKFILL_TZ = 'America/Los_Angeles'
@@ -185,7 +223,8 @@ def poller() -> None:
                 if not _cloud_unreachable:
                     _log_success('powerwall', 'connect', 'Connected to Powerwall (Fleet API mode)')
 
-            power = pw.power() or {}
+            raw_power = pw.power()
+            power = raw_power or {}
             level = pw.level() or 0
             now_ts = time.time()
             if not any(power.values()):
@@ -194,8 +233,13 @@ def poller() -> None:
                 elapsed = now_ts - _cloud_zero_since
                 if elapsed >= 120:
                     if not _cloud_unreachable:
+                        # No payload = the request failed; an all-zero payload means
+                        # Tesla answered but its backend had no live data.
+                        kind = 'Tesla returned all-zero power' if power else 'no response'
                         _log_system_error('powerwall', 'Tesla cloud unreachable',
-                                          f'No data for {int(elapsed / 60)}+ min — forcing reconnect')
+                                          f'No data for {int(elapsed / 60)}+ min ({kind}) — '
+                                          f'forcing reconnect. '
+                                          f'{_pw_error_summary(_cloud_zero_since - 30)}')
                         _cloud_unreachable = True
                     # Keep forcing reconnects (throttled) for the whole outage, not just
                     # once — each rebuild re-reads the token file and retries Tesla.
@@ -206,7 +250,8 @@ def poller() -> None:
                 if _cloud_unreachable:
                     down_min = max(1, int((now_ts - _cloud_zero_since) / 60))
                     _log_success('powerwall', 'cloud_recovered',
-                                 f'Tesla cloud connection restored after {down_min} min')
+                                 f'Tesla cloud connection restored after {down_min} min',
+                                 _pw_error_summary(_cloud_zero_since - 30))
                     if not _backfill_running.is_set():
                         _backfill_running.set()
                         threading.Thread(target=backfill_history, daemon=True).start()
@@ -420,9 +465,13 @@ def poller() -> None:
             # >10 MB of tracebacks a day into event_log, which is never purged.
             global _last_poller_error_log
             if time.time() - _last_poller_error_log > POLLER_ERROR_LOG_INTERVAL:
-                detail = f'{type(exc).__name__}: {exc}\n{traceback.format_exc()}'
-                _log_system_error('powerwall', 'Poller error',
-                                  detail[:POLLER_ERROR_DETAIL_MAX])
+                # Keep the traceback's tail: the innermost frames name the
+                # failing call; the head is just poller() boilerplate.
+                head = f'{type(exc).__name__}: {str(exc)[:200]}\n'
+                tb = traceback.format_exc()
+                keep = max(POLLER_ERROR_DETAIL_MAX - len(head), 0)
+                detail = head + (tb if len(tb) <= keep else '…' + tb[-keep:])
+                _log_system_error('powerwall', 'Poller error', detail)
                 _last_poller_error_log = time.time()
             pw = None  # force reconnect on next iteration
 

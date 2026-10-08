@@ -48,7 +48,6 @@ const FILTERS: { key: string; label: string; systems?: string }[] = [
   { key: 'pool', label: '\ud83c\udfca Pool', systems: 'pool' },
   { key: 'nest', label: '\ud83d\udcf7 Cameras', systems: 'nest' },
   { key: 'sdge', label: '\ud83d\udcb2 SDG&E', systems: 'rates,holidays' },
-  { key: 'system', label: '\u2699\ufe0f System', systems: 'system' },
   { key: 'network', label: '🌐 Network', systems: 'wan,network' },
   { key: 'errors', label: 'Errors' },
 ];
@@ -229,6 +228,9 @@ export default function EventLog({ isActive }: EventLogProps) {
               const onRowClick = url
                 ? () => window.open(url, '_blank', 'noopener,noreferrer')
                 : undefined;
+              // Detail is noise on routine rows; errors are where it earns the space.
+              // A bare clip URL is already expressed by the link icon.
+              const showDetail = isErr && !!e.detail && e.detail !== url;
               const rowKey = e.id != null ? `e${e.id}` : `${e.ts}-${e.system}-${e.title}-${i}`;
               return (
                 <span key={rowKey}>
@@ -243,9 +245,10 @@ export default function EventLog({ isActive }: EventLogProps) {
                     <div className="event-system" style={{ color: meta.color }}>
                       {meta.icon} {meta.label}
                     </div>
-                    <div className="event-title">
+                    <div className="event-title" title={e.detail || undefined}>
                       {e.title}
                       {url && <span className="event-link-icon">{'\u{1F517}'}</span>}
+                      {showDetail && <span className="event-detail">{e.detail}</span>}
                     </div>
                   </div>
                 </span>

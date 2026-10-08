@@ -45,6 +45,28 @@ def _extract_api_error(resp, max_len: int = 200) -> str:
         return resp.text[:max_len]
 
 
+def _describe_error(exc: Exception) -> str:
+    """event_log detail for a failed Google call: status + Google's own reason.
+
+    str(HTTPError) is only '500 Server Error: ... for url: <url>', and the URL
+    turns the row into a link whose unauthenticated GET always answers
+    401 CREDENTIALS_MISSING, hiding the real failure."""
+    resp = getattr(exc, 'response', None)
+    if resp is None:
+        return f'{type(exc).__name__}: {str(exc)[:300]}'
+    status = reason = ''
+    try:
+        err = resp.json().get('error', {})
+        if isinstance(err, dict):
+            status = err.get('status', '')
+            reason = next((d.get('reason') for d in err.get('details', []) or []
+                           if isinstance(d, dict) and d.get('reason')), '')
+    except Exception:
+        pass
+    head = ' '.join(p for p in (f'HTTP {resp.status_code}', status, reason) if p)
+    return f'{head}: {_extract_api_error(resp)}'
+
+
 def _nest_oauth_exchange(extra: dict) -> dict:
     client_id     = get_setting('nest_client_id', '')
     client_secret = get_setting('nest_client_secret', '')
@@ -89,7 +111,7 @@ def _nest_ensure_token() -> str | None:
         return tokens.get('access_token')
     except Exception as exc:
         print(f'Nest token refresh error: {exc}')
-        _log_system_error('nest', 'Token refresh failed', str(exc))
+        _log_system_error('nest', 'Token refresh failed', _describe_error(exc))
         return None
 
 
@@ -180,7 +202,7 @@ def _nest_refresh_devices(token):
                         )
     except Exception as exc:
         print(f'Nest device list error: {exc}')
-        _log_system_error('nest', 'Device list error', str(exc))
+        _log_system_error('nest', 'Device list error', _describe_error(exc))
 
 
 def _nest_thermostat_command(device_path: str, command: str, params: dict) -> dict:
@@ -262,7 +284,7 @@ def nest_set_thermostat(device_path: str, *, mode: str = None,
             _nest_refresh_devices(token)
     except Exception as exc:
         print(f'Nest post-command refresh failed: {exc}')
-        _log_system_error('nest', 'Post-command refresh failed', str(exc))
+        _log_system_error('nest', 'Post-command refresh failed', _describe_error(exc))
     return dict(_nest_thermostats.get(device_path, info))
 
 
@@ -384,6 +406,6 @@ def fetch_nest_events() -> int:
     except Exception as exc:
         _nest_poll_stats['last_error'] = str(exc)[:200]
         print(f'Nest event poll error: {exc}')
-        _log_system_error('nest', 'Event poll error', str(exc))
+        _log_system_error('nest', 'Event poll error', _describe_error(exc))
 
     return inserted
