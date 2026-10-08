@@ -452,7 +452,13 @@ def fetch_ev_tou2_rates(page_url: str = None, schedule_name: str = None,
                 '  winter_on_peak = excluded.winter_on_peak, '
                 '  winter_off_peak = excluded.winter_off_peak, '
                 '  winter_super_off_peak = excluded.winter_super_off_peak, '
-                '  base_services_charge_per_day = excluded.base_services_charge_per_day, '
+                # A parse that found no BSC yields 0 (the .get default below), and
+                # the len(rates) < 6 check above passes on the six TOU rates alone.
+                # Treat 0 as "not parsed" so it can't wipe a correct scraped or
+                # hand-entered value.
+                '  base_services_charge_per_day = COALESCE('
+                '      NULLIF(excluded.base_services_charge_per_day, 0), '
+                '      rate_history.base_services_charge_per_day), '
                 '  source_url = excluded.source_url, '
                 '  fetched_at = excluded.fetched_at, '
                 # Keep an existing historically-correct window rather than

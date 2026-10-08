@@ -1863,6 +1863,10 @@ def api_settings():
             'intervals': [
                 {'key': 'rates_page_url', 'label': 'Rates page URL', 'unit': 'url'},
                 {'key': 'rate_schedule_name', 'label': 'Schedule name', 'unit': 'text'},
+                # Not a settings-table key — this edits the current rate_history
+                # row. 'text' (not a number unit) because both numeric render
+                # branches hardcode min=1 with no step, which rejects 0.79343.
+                {'key': 'base_charge_per_day', 'label': 'Base charge ($/day)', 'unit': 'text'},
             ],
         },
         {
@@ -1933,6 +1937,18 @@ def api_settings():
             ],
         },
     ]
+    # base_charge_per_day is not a settings-table key: rate_history stays the
+    # single source of truth for the Base Services Charge, so the field is
+    # populated from the newest rate row and the PUT handler writes it back
+    # there. Blank (not '0') when unknown, so the input doesn't show a
+    # misleading zero for a rate period that was never scraped.
+    with connect() as c:
+        bsc_row = c.execute(
+            'SELECT COALESCE(base_services_charge_per_day, 0) '
+            'FROM rate_history ORDER BY effective_date DESC LIMIT 1'
+        ).fetchone()
+    settings['base_charge_per_day'] = f'{bsc_row[0]:g}' if bsc_row and bsc_row[0] else ''
+
     # Secrets (API keys, tokens, passwords, AP passwords in network_aps) are
     # masked — this response reaches the browser and, via the public hostname,
     # anyone who requests it.
@@ -1983,15 +1999,74 @@ def _record_tou_change(conn, new_tou_value) -> bool:
     return True
 
 
+def _record_base_charge_change(conn, raw):
+    """Write a hand-entered Base Services Charge onto the current rate period.
+
+    Updates the newest rate_history row in place: this is a correction for the
+    period already in effect, not a new dated row. (Contrast _record_tou_change,
+    which stamps a new row because changed TOU windows must not rewrite how
+    past days were classified.) A genuine SDG&E base-charge increase arrives
+    with a new rate PDF and therefore its own effective_date row.
+
+    Historical rows keep their own value; 0 means "unknown" and the Energy
+    Breakdown page renders it as an em dash.
+
+    Returns (change, error_message), where change is None for a no-op or
+    (effective_date, old_value, new_value) for an applied edit. The caller logs
+    it *after* committing: _log_success opens its own connection, and in WAL
+    mode that would block on the write lock this transaction still holds.
+    """
+    # The Settings page posts every field in a card on every save, so a blank
+    # box must be a no-op rather than a request to wipe the stored value.
+    if raw is None or not str(raw).strip():
+        return None, None
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, 'Base charge must be a number (e.g. 0.79343).'
+    if val < 0:
+        return None, 'Base charge cannot be negative.'
+    # Real value is ~$0.79/day; this catches a misplaced decimal or cents.
+    if val > 10:
+        return None, 'Base charge looks wrong (expected a few cents to ~$1/day).'
+
+    latest = conn.execute(
+        'SELECT effective_date, COALESCE(base_services_charge_per_day, 0) '
+        'FROM rate_history ORDER BY effective_date DESC LIMIT 1'
+    ).fetchone()
+    if not latest:
+        return None, 'No rate history yet — refresh SDG&E rates first.'
+    # 5 dp is the precision SDG&E publishes (0.79343).
+    if round(latest[1] or 0, 5) == round(val, 5):
+        return None, None
+
+    # Plain UPDATE naming only the column this owns. fetched_at is deliberately
+    # left alone: it records when the scrape last ran, and a manual edit should
+    # not pretend to be one.
+    conn.execute(
+        'UPDATE rate_history SET base_services_charge_per_day = ? '
+        'WHERE effective_date = ?',
+        (val, latest[0])
+    )
+    return (latest[0], latest[1] or 0, val), None
+
+
 @app.route('/api/settings', methods=['PUT'])
 def api_settings_update():
     data = request.get_json() or {}
     valid_keys = set(_SETTINGS_DEFAULTS.keys())
     tou_changed = False
+    bsc_error = None
+    bsc_change = None
     current = load_settings()
     with connect() as c:
         if 'tou_periods' in data and 'tou_periods' in valid_keys:
             tou_changed = _record_tou_change(c, data['tou_periods'])
+        # Deliberately absent from _SETTINGS_DEFAULTS: this one writes to
+        # rate_history, and the valid_keys guard below keeps it out of the
+        # settings table so there is only ever one stored copy.
+        if 'base_charge_per_day' in data:
+            bsc_change, bsc_error = _record_base_charge_change(c, data['base_charge_per_day'])
         for key, value in data.items():
             if key in valid_keys:
                 # A masked secret posted back unchanged must not overwrite the real one.
@@ -2002,8 +2077,18 @@ def api_settings_update():
                     'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
                     (key, str(value))
                 )
+        if bsc_error:
+            # Nothing in this request is committed if the base charge was
+            # rejected, so a bad value can't half-apply a card save.
+            c.rollback()
+            return jsonify({'ok': False, 'error': bsc_error}), 400
         c.commit()
     invalidate_settings_cache()
+    if bsc_change:
+        eff, old_val, new_val = bsc_change
+        _log_success('rates', 'base_charge_updated',
+                     f'Base charge set to ${new_val:g}/day (eff. {eff})',
+                     detail=f'Changed from ${old_val:g}/day via Settings')
     if tou_changed:
         # New TOU windows take effect today — re-derive today's tiers now rather
         # than waiting on the hourly rebuild.

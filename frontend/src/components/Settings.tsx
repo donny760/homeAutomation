@@ -214,11 +214,19 @@ export default function Settings({ isActive }: SettingsProps) {
       updates[el.dataset.key!] = el.value;
     });
     try {
-      await fetch('/api/settings', {
+      const res = await fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(updates),
       });
+      // A rejected value (e.g. a malformed base charge) returns 400 with a
+      // message; without this check the card would report a save that the
+      // server refused.
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        showStatus(body.error || 'Save failed');
+        return;
+      }
       showStatus('Saved');
     } catch (e) {
       console.warn('Settings save:', e);
