@@ -14,6 +14,7 @@ interface PoolData {
   edge_pump_watts?: number | null;
   edge_pump_rpm?: number | null;
   edge_pump_gpm?: number | null;
+  circuit_510_on?: boolean | null;
   cleaner_on?: boolean;
   pool_light_on?: boolean;
   water_light_on?: boolean;
@@ -210,7 +211,8 @@ function PoolTile() {
             + (d.edge_pump_watts != null ? ` \u00b7 ${d.edge_pump_watts}W`   : '')
             + (d.edge_pump_rpm   != null ? ` \u00b7 ${d.edge_pump_rpm}rpm`   : '')
             + (d.edge_pump_gpm   != null ? ` \u00b7 ${d.edge_pump_gpm}gpm`   : ''),
-          on: !!d.edge_pump_on,
+          // Edge Prime (510) runs pump 0 with circuit 506 off; watts covers any other preset
+          on: !!d.edge_pump_on || !!d.circuit_510_on || (d.edge_pump_watts ?? 0) > 0,
         },
         { label: 'Cleaner', on: !!d.cleaner_on },
         { label: 'Pool Light', on: !!d.pool_light_on },

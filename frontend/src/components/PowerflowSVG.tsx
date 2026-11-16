@@ -1,9 +1,12 @@
 'use client';
 
 import { useRef, useCallback, useEffect } from 'react';
-import { fmtW, fmtWabs, modeLabel } from '@/lib/format';
+import { fmtW, fmtWabs, modeLabel, fmtTime12 } from '@/lib/format';
 
 const THRESHOLD = 50;
+// Storm Watch isn't an energy flow, so it must not reuse solar/battery/home/grid
+// colours. Periwinkle is unused in this diagram and distinct from --blue (#378ADD).
+const STORM_COLOR = '#8C9BD6';
 
 export interface LiveData {
   solar_w: number;
@@ -17,10 +20,25 @@ export interface LiveData {
   mode?: string;
   ts?: number;
   stale?: boolean;
+  // Tesla Storm Watch; absent/null when unknown (cold poller cache).
+  storm?: { active: boolean; type?: string | null; start?: string | null;
+            end?: string | null; event_id?: string | null } | null;
+  storm_label?: string | null;
 }
 
 interface PowerflowSVGProps {
   data: LiveData | null;
+}
+
+/** Badge value: 'UNTIL 4:00 PM', falling back to the storm type when Tesla
+ *  sent no window. Uppercased to match the MODE badge opposite it. */
+function stormValue(data: LiveData): string {
+  const end = data.storm?.end;
+  if (end) {
+    const d = new Date(end);
+    if (!isNaN(d.getTime())) return `UNTIL ${fmtTime12(d.getHours(), d.getMinutes())}`;
+  }
+  return (data.storm?.type ?? 'ACTIVE').toUpperCase();
 }
 
 export default function PowerflowSVG({ data }: PowerflowSVGProps) {
@@ -253,6 +271,32 @@ export default function PowerflowSVG({ data }: PowerflowSVGProps) {
         <circle id="p-mode-dot" cx="22" cy="21" r="4" fill="#888780" opacity="0.9" />
         <text x="30" y="17" fontSize="8" fill="#5a5a5e" letterSpacing="0.8">MODE</text>
         <text id="p-mode" x="30" y="29" fontSize="11" fill="#888780" fontWeight="600" letterSpacing="0.2">&mdash;</text>
+
+        {/* Storm Watch — a normal pill in the diagram's own language (dot /
+            label / value), top-right to balance the MODE badge. Periwinkle:
+            the four flow colours (amber solar, green battery, blue home, grey
+            grid) all carry meaning here, so an alert must not borrow one.
+            Only rendered while a watch is active; full storm type in the title. */}
+        {data?.storm?.active && (() => {
+          const val = stormValue(data);
+          // Same sizing rule as the MODE badge, mirrored: grown from the text and
+          // pinned to the right edge (x=892) the way MODE is pinned to x=8.
+          const w = Math.max(110, val.length * 6.8 + 42);
+          const right = 892;
+          return (
+            <g>
+              <title>{data.storm_label ?? 'Storm Watch'}</title>
+              <rect x={right - w} y="8" width={w} height="26" rx="6"
+                    fill="#18181a" stroke={STORM_COLOR} strokeWidth="1" opacity="0.85" />
+              <rect x={right - 4} y="8" width="4" height="26" rx="3" fill={STORM_COLOR} />
+              <circle cx={right - 18} cy="21" r="4" fill={STORM_COLOR} opacity="0.9" />
+              <text x={right - 28} y="17" textAnchor="end" fontSize="8"
+                    fill="#5a5a5e" letterSpacing="0.8">STORM WATCH</text>
+              <text x={right - 28} y="29" textAnchor="end" fontSize="11"
+                    fill={STORM_COLOR} fontWeight="600" letterSpacing="0.2">{val}</text>
+            </g>
+          );
+        })()}
 
         {/* Grid today text */}
         <rect x="466" y="253" width="110" height="16" rx="4" fill="var(--card-bg)" opacity="0.85" />

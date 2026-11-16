@@ -1,5 +1,6 @@
 import collections
 import logging
+import os
 import re
 import threading
 import time
@@ -7,6 +8,7 @@ import traceback
 from datetime import datetime, date, timedelta, timezone
 
 import pypowerwall
+import requests
 
 from lib.state import BASE_DIR, DB_PATH, _live, _lock
 from lib.settings import get_setting, get_setting_int, get_setting_bool, set_setting
@@ -23,6 +25,8 @@ from lib.rachio import fetch_rachio_events, evaluate_rain_skip
 from lib.nest import fetch_nest_events, _nest_ensure_token, _nest_refresh_devices
 from lib.pool import fetch_pool, POOL_POLL_INTERVAL
 from lib import rules_watchdog
+from lib import storm as storm_mod
+from lib import solar_hold
 import lib.kasa as kasa
 from lib.kasa import _kasa_refresh_devices, _kasa_poll_state
 import lib.tuya as tuya
@@ -49,12 +53,22 @@ class _PwErrorTap(logging.Handler):
         super().__init__(level=logging.ERROR)
         self.records: collections.deque = collections.deque(maxlen=50)
 
+    @staticmethod
+    def _clean(msg: str) -> str:
+        # Drop scheme+host: a URL in event_log detail turns the row into a
+        # link, and an unauthenticated GET on it only shows a misleading 401.
+        msg = re.sub(r'https?://[^/\s]+/', '', msg)
+        # urllib3 reprs embed a memory address, which would stop identical
+        # errors from grouping into one 'xN' entry in _pw_error_summary.
+        return re.sub(r' object at 0x[0-9A-Fa-f]+', '', msg)[:200]
+
+    def note(self, exc: Exception) -> None:
+        """Record an exception pypowerwall raised instead of logging."""
+        self.records.append((time.time(), self._clean(f'{type(exc).__name__}: {exc}')))
+
     def emit(self, record):
         try:
-            # Drop scheme+host: a URL in event_log detail turns the row into a
-            # link, and an unauthenticated GET on it only shows a misleading 401.
-            msg = re.sub(r'https?://[^/\s]+/', '', record.getMessage())
-            self.records.append((record.created, msg[:200]))
+            self.records.append((record.created, self._clean(record.getMessage())))
             # Having any handler suppresses logging.lastResort, which is what
             # printed these to stderr (server.py configures no root logger).
             if not logging.getLogger().handlers and logging.lastResort:
@@ -65,6 +79,36 @@ class _PwErrorTap(logging.Handler):
 
 _pw_errors = _PwErrorTap()
 logging.getLogger('pypowerwall').addHandler(_pw_errors)
+
+
+FLEET_CONFIG = '.pypowerwall.fleetapi'   # pypowerwall.fleetapi.fleetapi.CONFIGFILE
+_token_mtime: float = 0.0
+
+
+def _reload_rotated_token(pw) -> None:
+    """Adopt a Fleet refresh token that rules.py rotated.
+
+    Both processes share one token file and Tesla rotates the refresh token on
+    every use, so whichever refreshes second is left holding a dead one. Re-reading
+    the file as soon as the other process rewrites it costs nothing and picks the
+    new token up within a poll cycle, instead of 401ing for two minutes until the
+    all-zero outage detector forces a reconnect.
+    """
+    global _token_mtime
+    try:
+        mtime = os.path.getmtime(os.path.join(BASE_DIR, FLEET_CONFIG))
+    except OSError:
+        return
+    if mtime == _token_mtime:
+        return
+    if _token_mtime and pw is not None:
+        try:
+            pw.client.fleet.load_config()
+        except Exception:
+            # Likely a half-written file: leave _token_mtime alone so the next
+            # cycle retries once the other process has finished.
+            return
+    _token_mtime = mtime
 
 
 def _pw_error_summary(since: float) -> str:
@@ -187,6 +231,28 @@ def trigger_backfill(lookback_days: int = 3) -> bool:
     return True
 
 
+# Last cached live_status/site_info responses, for /api/debug/powerwall/raw —
+# used to look for a Tesla flag behind states like "Optimized Charging" by
+# diffing captures. Rebound below; callers must read it as a module attribute.
+_last_raw: dict = {}
+
+
+def _stash_raw(pw) -> None:
+    global _last_raw
+    try:
+        fleet = pw.client.fleet
+        out = {}
+        for name in ('live_status', 'site_info'):
+            key = f'api/1/energy_sites/{fleet.site_id}/{name}'
+            out[name] = {
+                'cached_at': fleet.pwcachetime.get(key),
+                'response': (fleet.pwcache.get(key) or {}).get('response'),
+            }
+        _last_raw = out
+    except Exception:
+        pass
+
+
 def poller() -> None:
     pw = None
     last_write = 0
@@ -199,6 +265,7 @@ def poller() -> None:
     last_rachio_event_poll = 0
     last_rain_skip_check = 0
     last_nest_event_poll = 0
+    last_nest_thermostat_poll = 0
     last_pool_poll = 0
     last_kasa_poll = 0
     last_tuya_poll       = 0
@@ -214,18 +281,31 @@ def poller() -> None:
 
         try:
             global _cloud_unreachable, _cloud_zero_since, _last_reconnect_ts
-            if pw is None:
-                pw = pypowerwall.Powerwall(
-                    '', fleetapi=True, email=PW_EMAIL, timeout=30, authpath=BASE_DIR
-                )
-                # Suppress the success log during outage-retry reconnects — recovery is
-                # reported by the cloud_recovered message once data actually returns.
-                if not _cloud_unreachable:
-                    _log_success('powerwall', 'connect', 'Connected to Powerwall (Fleet API mode)')
+            # pypowerwall swallows timeouts into a None return but lets connection
+            # resets, DNS and TLS failures raise. Treat those exactly like a None
+            # response so they feed the outage detector below (one row, a recovery
+            # row and a backfill) instead of the catch-all, which logged a
+            # traceback per blip and never backfilled the gap.
+            try:
+                if pw is None:
+                    pw = pypowerwall.Powerwall(
+                        '', fleetapi=True, email=PW_EMAIL, timeout=30, authpath=BASE_DIR
+                    )
+                    # Suppress the success log during outage-retry reconnects — recovery is
+                    # reported by the cloud_recovered message once data actually returns.
+                    if not _cloud_unreachable:
+                        _log_success('powerwall', 'connect', 'Connected to Powerwall (Fleet API mode)')
 
-            raw_power = pw.power()
+                _reload_rotated_token(pw)
+
+                raw_power = pw.power()
+                level = pw.level() or 0
+                net_error = False
+            except requests.exceptions.RequestException as exc:
+                _pw_errors.note(exc)
+                raw_power, level = None, 0
+                net_error = True
             power = raw_power or {}
-            level = pw.level() or 0
             now_ts = time.time()
             if not any(power.values()):
                 if _cloud_zero_since == 0.0:
@@ -269,7 +349,7 @@ def poller() -> None:
             # (pw.mode is the connection type, not the operating mode)
             mode = 'self_consumption'
             try:
-                val = pw.get_mode()
+                val = None if net_error else pw.get_mode()
                 if val:
                     mode = val
             except Exception:
@@ -278,19 +358,42 @@ def poller() -> None:
             # Reads the site_info get_mode() just cached — no extra Tesla request.
             rules_watchdog.check(rules_watchdog.cached_settings(pw))
 
+            # Same deal for Storm Watch: it rides along in the live_status
+            # response pw.power() just fetched.
+            storm = storm_mod.cached_storm(pw)
+            storm_mod.check(storm)
+
+            # Raw Tesla payloads for /api/debug/powerwall/raw — copied out of the
+            # cache the calls above just filled, never fetched.
+            _stash_raw(pw)
+
             now = int(time.time())
 
-            with _lock:
-                _live.update({
-                    'solar_w': solar_w, 'home_w': home_w,
-                    'battery_w': battery_w, 'grid_w': grid_w,
-                    'battery_pct': battery_pct, 'mode': mode or 'self_consumption',
-                    'ts': now,
-                })
+            # A raised network error has no data at all: keep the last live values
+            # and write no reading (as the catch-all did), rather than recording
+            # zeros that a short blip — too short to trigger a backfill — would
+            # leave in the chart and the cost totals.
+            if not net_error:
+                with _lock:
+                    _live.update({
+                        'solar_w': solar_w, 'home_w': home_w,
+                        'battery_w': battery_w, 'grid_w': grid_w,
+                        'battery_pct': battery_pct, 'mode': mode or 'self_consumption',
+                        'ts': now,
+                        # None when the cache is cold — the dashboard shows nothing
+                        # rather than claiming "no storm" on missing data.
+                        'storm': storm,
+                    })
 
-            if now - last_write >= db_write_interval:
-                write_reading(solar_w, home_w, battery_w, grid_w, battery_pct)
-                last_write = now
+                # Battery idle below full while solar exports (e.g. Tesla's
+                # Optimized Charging). Reads the values above; no Tesla call.
+                solar_hold.check({'solar_w': solar_w, 'home_w': home_w,
+                                  'battery_w': battery_w, 'grid_w': grid_w,
+                                  'battery_pct': battery_pct, 'mode': mode}, now)
+
+                if now - last_write >= db_write_interval:
+                    write_reading(solar_w, home_w, battery_w, grid_w, battery_pct)
+                    last_write = now
 
             if now - last_purge >= 86400:
                 purge_old()
@@ -395,7 +498,7 @@ def poller() -> None:
                     _log_system_error('rachio', 'Rain skip check error', str(exc))
                 last_rain_skip_check = now
 
-            # Nest camera/doorbell events (Pub/Sub pull) + thermostat refresh
+            # Nest camera/doorbell events (Pub/Sub pull)
             nest_event_interval = get_setting_int('nest_poll_interval', 60)
             if now - last_nest_event_poll >= nest_event_interval:
                 if get_setting_bool('nest_enabled', False):
@@ -403,14 +506,21 @@ def poller() -> None:
                         fetch_nest_events()
                     except Exception as exc:
                         _log_system_error('nest', 'Event poll error', str(exc))
-                    if get_setting_bool('nest_thermostat_enabled', False):
-                        try:
-                            token = _nest_ensure_token()
-                            if token:
-                                _nest_refresh_devices(token)
-                        except Exception as exc:
-                            _log_system_error('nest', 'Thermostat poll error', str(exc))
                 last_nest_event_poll = now
+
+            # Thermostat state (SDM ListDevices) — its own, slower timer: this API
+            # is rate-limited per user and setpoints don't change by the minute.
+            nest_thermo_interval = get_setting_int('nest_thermostat_poll_interval', 300)
+            if now - last_nest_thermostat_poll >= nest_thermo_interval:
+                if (get_setting_bool('nest_enabled', False)
+                        and get_setting_bool('nest_thermostat_enabled', False)):
+                    try:
+                        token = _nest_ensure_token()
+                        if token:
+                            _nest_refresh_devices(token)
+                    except Exception as exc:
+                        _log_system_error('nest', 'Thermostat poll error', str(exc))
+                last_nest_thermostat_poll = now
 
             # Pool equipment state polling
             pool_event_interval = get_setting_int('pool_poll_interval', POOL_POLL_INTERVAL)

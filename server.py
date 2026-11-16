@@ -29,6 +29,7 @@ from lib.fetch_rates import (
     holiday_name, is_sdge_holiday,
 )
 from lib.state import BASE_DIR, DB_PATH, _live, _lock
+from lib import storm as storm_mod
 from lib.db import (
     connect, init_db, write_reading, purge_old,
     _fetch_rows, _fetch_rows_range, today_rows, day_rows,
@@ -49,7 +50,7 @@ from lib.costs import (
     calc_stats, mark_costs_stale, month_savings_prior_days,
 )
 from lib.solar_forecast import (
-    fetch_solar_forecast, fetch_tomorrow_solar_forecast,
+    fetch_solar_forecast, fetch_tomorrow_solar_forecast, forecast_loop,
 )
 import lib.pool as pool
 from lib.pool import (
@@ -187,6 +188,7 @@ def api_live():
     grid_w      = d.get('grid_w', 0)
     battery_pct = d.get('battery_pct', 0)
     mode        = d.get('mode', 'self_consumption')
+    storm       = d.get('storm')
 
     # Battery state
     if battery_w > 50:
@@ -234,6 +236,11 @@ def api_live():
         'mode':            mode,
         'ts':              ts,
         'stale':           stale,
+        # Tesla Storm Watch, read from the poller's cached live_status. None
+        # when unknown (cold cache), so the banner stays hidden rather than
+        # asserting there is no storm.
+        'storm':           storm,
+        'storm_label':     storm_mod.describe(storm),
     })
 
 
@@ -1612,6 +1619,13 @@ def api_network_device_remove(mac):
     return jsonify({'ok': True, 'mac': mac})
 
 
+@app.route('/api/debug/powerwall/raw')
+def api_debug_powerwall_raw():
+    """Last cached Tesla live_status + site_info, as the poller saw them (no fetch)."""
+    import lib.powerwall as powerwall_mod
+    return jsonify(powerwall_mod._last_raw)
+
+
 @app.route('/api/debug/wan')
 def api_debug_wan():
     """WAN failover monitor state. ?probe=1 also runs a live egress lookup."""
@@ -1913,6 +1927,7 @@ def api_settings():
             'enabled_key': 'nest_enabled',
             'intervals': [
                 {'key': 'nest_poll_interval',       'label': 'Poll interval',        'unit': 's'},
+                {'key': 'nest_thermostat_poll_interval', 'label': 'Thermostat poll interval', 'unit': 's'},
                 {'key': 'nest_pubsub_subscription', 'label': 'Pub/Sub subscription', 'unit': 'text'},
                 {'key': 'nest_client_id',           'label': 'OAuth Client ID',      'unit': 'text'},
                 {'key': 'nest_client_secret',       'label': 'OAuth Client Secret',  'unit': 'text'},
@@ -2166,6 +2181,7 @@ def _start():
     threading.Thread(target=poller, daemon=True).start()
     threading.Thread(target=_network_poll_loop, daemon=True).start()
     threading.Thread(target=_wan_poll_loop, daemon=True).start()
+    threading.Thread(target=forecast_loop, daemon=True).start()
     start_abode_listener()
     print('Dashboard \u2192 http://localhost:5001')
     app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
