@@ -4,12 +4,13 @@ import urllib.request
 
 from lib.settings import get_setting_int
 from lib.rachio import get_device_coords
-from lib.events import _log_system_error
+from lib.events import FetchIncident
 
 
 _wx_cache: dict = {}
 _wx_ts: float   = 0.0
 WX_TTL = 600
+_wx_incident = FetchIncident('weather', 'Weather')
 
 WMO = {
     0: 'Clear', 1: 'Mainly Clear', 2: 'Partly Cloudy', 3: 'Overcast',
@@ -25,6 +26,8 @@ WMO = {
 def fetch_weather() -> dict:
     global _wx_cache, _wx_ts
     if time.time() - _wx_ts < WX_TTL:
+        return _wx_cache
+    if _wx_incident.should_skip():
         return _wx_cache
 
     lookback = get_setting_int('rain_lookback_days', 5)
@@ -88,9 +91,9 @@ def fetch_weather() -> dict:
             _wx_cache['aqi'] = None
 
         _wx_ts = time.time()
+        _wx_incident.ok()
     except Exception as exc:
-        print(f'Weather error: {exc}')
-        _log_system_error('weather', 'Weather fetch failed', str(exc))
+        _wx_incident.failed(exc)
         if not _wx_cache:
             _wx_cache = {}
 

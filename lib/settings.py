@@ -65,6 +65,7 @@ _SETTINGS_DEFAULTS = {
     'azure_openai_api_version':    '2024-10-21',
     'nest_enabled':                '0',
     'nest_poll_interval':          '60',
+    'nest_thermostat_poll_interval': '300',
     'nest_client_id':              os.environ.get('NEST_CLIENT_ID', ''),
     'nest_client_secret':          os.environ.get('NEST_CLIENT_SECRET', ''),
     'nest_project_id':             os.environ.get('NEST_PROJECT_ID', ''),

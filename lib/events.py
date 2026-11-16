@@ -71,6 +71,52 @@ def format_duration(seconds: float) -> str:
     return f'{days} {unit} {hrs} hr' if hrs else f'{days} {unit}'
 
 
+class FetchIncident:
+    """Failure backoff + one event_log row per outage for a polled HTTP fetch.
+
+    Without this, a fetch that only advances its TTL on success retries on
+    every caller (several frontend polls per minute) and logs every attempt."""
+
+    def __init__(self, system: str, label: str, retry_secs: int = 120):
+        self.system = system
+        self.label = label
+        self.retry_secs = retry_secs
+        self._lock = threading.Lock()
+        self._since = None      # first failure of the current incident
+        self._last_fail = 0.0
+        self._attempts = 0
+        self._last_error = ''
+
+    def should_skip(self) -> bool:
+        with self._lock:
+            return self._since is not None and time.time() - self._last_fail < self.retry_secs
+
+    def failed(self, exc: Exception, detail: str = None) -> None:
+        detail = detail or str(exc)
+        now = time.time()
+        with self._lock:
+            first = self._since is None
+            if first:
+                self._since = now
+            self._last_fail = now
+            self._attempts += 1
+            self._last_error = detail
+        if first:
+            _log_system_error(self.system, f'{self.label} fetch failed', detail)
+
+    def ok(self) -> None:
+        with self._lock:
+            if self._since is None:
+                return
+            elapsed = time.time() - self._since
+            attempts, last_error = self._attempts, self._last_error
+            self._since, self._last_fail, self._attempts, self._last_error = None, 0.0, 0, ''
+        event_type = self.label.lower().replace(' ', '_') + '_recovered'
+        _log_success(self.system, event_type, f'{self.label} fetch recovered',
+                     f'after {format_duration(elapsed)}, {attempts} failed attempts; '
+                     f'last error: {last_error}')
+
+
 def _switches_log_event(provider: str, event_type: str, title: str, detail: str = None,
                         result: str = 'ok') -> None:
     provider_label = (provider or '').strip()

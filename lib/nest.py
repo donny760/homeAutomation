@@ -6,7 +6,7 @@ from datetime import datetime
 import requests as _requests
 
 import lib.state as state
-from lib.events import _log_system_error
+from lib.events import _log_system_error, _log_success, FetchIncident
 from lib.settings import get_setting, get_setting_bool, get_setting_int
 from lib.db import connect
 
@@ -16,7 +16,15 @@ _nest_devices: dict     = {}
 _nest_devices_raw: list = []
 _nest_devices_ts: float = 0.0
 _NEST_DEVICE_CACHE_TTL  = 3600
+# ListDevices failure gate: Google 503s/timeouts are routine blips, and a 429
+# means back off, not retry. One row per incident instead of one per failure.
+_NEST_DEV_FAIL_LOG_AFTER = 3
+_NEST_429_BACKOFF_SECS   = 900
+_nest_dev_fail: int        = 0
+_nest_dev_logged: bool     = False
+_nest_backoff_until: float = 0.0
 _nest_event_counters: dict = {}
+_nest_event_incident = FetchIncident('nest', 'Nest event')
 _nest_poll_stats: dict = {
     'calls': 0, 'last_call_ts': None, 'last_pull_count': None,
     'last_error': None, 'pull_count_total': 0,
@@ -133,8 +141,34 @@ def _f_to_c(f):
         return None
 
 
+def _nest_dev_failed(exc: Exception) -> None:
+    global _nest_dev_fail, _nest_dev_logged, _nest_backoff_until
+    _nest_dev_fail += 1
+    resp = getattr(exc, 'response', None)
+    if resp is not None and resp.status_code == 429:
+        try:
+            wait = int(resp.headers.get('Retry-After', ''))
+        except ValueError:
+            wait = _NEST_429_BACKOFF_SECS
+        _nest_backoff_until = time.time() + wait
+    if _nest_dev_fail >= _NEST_DEV_FAIL_LOG_AFTER and not _nest_dev_logged:
+        _log_system_error('nest', 'Device list error',
+                          f'{_describe_error(exc)} ({_nest_dev_fail} consecutive failures)')
+        _nest_dev_logged = True
+
+
+def _nest_dev_ok() -> None:
+    global _nest_dev_fail, _nest_dev_logged, _nest_backoff_until
+    if _nest_dev_logged:
+        _log_success('nest', 'device_list_recovered',
+                     f'Nest device list recovered after {_nest_dev_fail} failures')
+    _nest_dev_fail, _nest_dev_logged, _nest_backoff_until = 0, False, 0.0
+
+
 def _nest_refresh_devices(token):
     global _nest_devices, _nest_devices_ts, _nest_devices_raw, _nest_thermostats
+    if time.time() < _nest_backoff_until:
+        return  # rate-limited: the cached device list stays in use
     project_id = get_setting('nest_project_id', '')
     try:
         resp = _requests.get(
@@ -181,6 +215,7 @@ def _nest_refresh_devices(token):
                 }
         _nest_thermostats = thermostats
         _nest_devices_ts = time.time()
+        _nest_dev_ok()
         if thermostats:
             with connect() as c:
                 for dev_path, info in thermostats.items():
@@ -202,7 +237,7 @@ def _nest_refresh_devices(token):
                         )
     except Exception as exc:
         print(f'Nest device list error: {exc}')
-        _log_system_error('nest', 'Device list error', _describe_error(exc))
+        _nest_dev_failed(exc)
 
 
 def _nest_thermostat_command(device_path: str, command: str, params: dict) -> dict:
@@ -311,6 +346,11 @@ def fetch_nest_events() -> int:
         _nest_poll_stats['last_error'] = 'no subscription'
         return 0
 
+    # Pub/Sub keeps unacked messages, so backing off after a failure only
+    # delays events — it never drops them.
+    if _nest_event_incident.should_skip():
+        return 0
+
     token = _nest_ensure_token()
     if not token:
         _nest_poll_stats['last_error'] = 'no token'
@@ -325,6 +365,7 @@ def fetch_nest_events() -> int:
             timeout=30,
         )
         resp.raise_for_status()
+        _nest_event_incident.ok()
         messages = resp.json().get('receivedMessages', [])
         _nest_poll_stats['last_pull_count'] = len(messages)
         _nest_poll_stats['pull_count_total'] += len(messages)
@@ -406,6 +447,6 @@ def fetch_nest_events() -> int:
     except Exception as exc:
         _nest_poll_stats['last_error'] = str(exc)[:200]
         print(f'Nest event poll error: {exc}')
-        _log_system_error('nest', 'Event poll error', _describe_error(exc))
+        _nest_event_incident.failed(exc, _describe_error(exc))
 
     return inserted

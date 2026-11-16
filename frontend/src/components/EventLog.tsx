@@ -34,6 +34,8 @@ const SYSTEM_META: Record<string, { icon: string; label: string; color: string }
   tuya: SMART_SWITCH,
   wan: { icon: '🌐', label: 'Internet', color: 'var(--blue)' },
   network: { icon: '📡', label: 'Network', color: 'var(--blue)' },
+  weather: { icon: '🌤️', label: 'Weather', color: 'var(--dim)' },
+  solar: { icon: '☀️', label: 'Solar Forecast', color: 'var(--amber)' },
   rates: SDGE,
   holidays: SDGE,
 };

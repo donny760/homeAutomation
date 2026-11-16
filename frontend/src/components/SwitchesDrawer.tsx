@@ -527,7 +527,9 @@ export default function SwitchesDrawer({ open, onClose }: DrawerProps) {
         });
         load();
       }
-    }, 500);
+      // Each flush is one SDM command, and Google rate-limits those per user;
+      // 1.5s coalesces a run of stepper taps. The optimistic value keeps the UI instant.
+    }, 1500);
   }
 
   async function rediscover() {
