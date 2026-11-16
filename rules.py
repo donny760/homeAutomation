@@ -106,7 +106,7 @@ def load_rules_from_db(conn) -> list:
 # ── Condition evaluation ──────────────────────────────────────────────────────
 def _eval_single(cond: dict, live: dict) -> bool:
     ctype = cond['type']
-    if ctype in ('battery_pct', 'net_cost', 'net_cost_ytd', 'tomorrow_solar_kwh'):
+    if ctype in ('battery_pct', 'net_cost', 'net_cost_ytd', 'tomorrow_solar_kwh', 'today_solar_kwh'):
         actual = live.get(ctype)
         if actual is None:
             return False  # data unavailable — condition fails safe
@@ -117,6 +117,42 @@ def _eval_single(cond: dict, live: dict) -> bool:
         if op == '>=': return actual >= v
         if op == '<=': return actual <= v
     return False
+
+
+_COND_LABELS = {
+    'battery_pct':        ('Battery', '{:.0f}%'),
+    'net_cost':           ('Net cost today', '${:.2f}'),
+    'net_cost_ytd':       ('YTD net cost', '${:.2f}'),
+    'tomorrow_solar_kwh': ('Tomorrow solar forecast', '{:.1f} kWh'),
+    'today_solar_kwh':    ('Today solar forecast', '{:.1f} kWh'),
+}
+
+
+def _clock(ts: int) -> str:
+    return datetime.fromtimestamp(ts).strftime('%I:%M %p').lstrip('0')
+
+
+def _describe_one(cond: dict, live: dict) -> str:
+    label, fmt = _COND_LABELS.get(cond['type'], (cond['type'], '{}'))
+    need = f"needs {cond['operator']} {cond['value']:g}"
+    actual = live.get(cond['type'])
+    solar_ts = live.get('today_solar_ts') if cond['type'] == 'today_solar_kwh' else None
+    if actual is None:
+        if solar_ts:
+            when = datetime.fromtimestamp(solar_ts).strftime('%b %d ') + _clock(solar_ts)
+            return f'{label} unavailable (last fetched {when} — fetches failing?; {need})'
+        return f'{label} unavailable ({need})'
+    as_of = f' as of {_clock(solar_ts)}' if solar_ts else ''
+    return f'{label} {fmt.format(actual)}{as_of} ({need})'
+
+
+def _describe_failed(conditions: list, live: dict) -> str:
+    """Human-readable reason evaluate_conditions() returned False."""
+    and_fail = [c for c in conditions if c['logic'] == 'AND' and not _eval_single(c, live)]
+    if and_fail:
+        return '; '.join(_describe_one(c, live) for c in and_fail)
+    or_conds = [c for c in conditions if c['logic'] == 'OR']
+    return 'none of: ' + '; '.join(_describe_one(c, live) for c in or_conds)
 
 
 def evaluate_conditions(conditions: list, live: dict) -> bool:
@@ -164,6 +200,7 @@ def current_target_state(dt: datetime, rules: list, live: dict, cond_cache: dict
         'grid_export':   'pv_only',
     }
     fired_events = []
+    skipped = []
     for delta_days in (2, 1, 0):
         d = dt.date() - timedelta(days=delta_days)
         for rule in rules:
@@ -176,6 +213,12 @@ def current_target_state(dt: datetime, rules: list, live: dict, cond_cache: dict
             cache_key = (rule['id'], fire_dt.isoformat())
             if cond_cache is not None and cache_key not in cond_cache:
                 cond_cache[cache_key] = evaluate_conditions(rule['conditions'], live)
+                # Report a skip only for a firing that just happened — after a
+                # restart the empty cache re-judges up to 2 days of past firings
+                # against *current* values, which would be misleading.
+                if not cond_cache[cache_key] and dt - fire_dt < timedelta(minutes=10):
+                    skipped.append((rule['name'], fire_dt,
+                                    _describe_failed(rule['conditions'], live)))
             passed = cond_cache.get(cache_key, True) if cond_cache is not None else evaluate_conditions(rule['conditions'], live)
             if not passed:
                 continue
@@ -185,6 +228,8 @@ def current_target_state(dt: datetime, rules: list, live: dict, cond_cache: dict
 
     if is_sdge_holiday(dt.date()):
         state['_holiday'] = holiday_name(dt.date())
+    if skipped:
+        state['_skipped'] = skipped
 
     return state
 
@@ -228,6 +273,23 @@ def get_live_state(conn) -> dict:
         state['tomorrow_solar_kwh'] = float(row[0]) if row and row[0] is not None else None
     except Exception:
         state['tomorrow_solar_kwh'] = None
+    # today_solar_kwh is only trusted if stamped with today's date — a stale
+    # value from yesterday becomes None, which fails the condition safe.
+    try:
+        rows = dict(conn.execute(
+            "SELECT key, value FROM settings WHERE key IN "
+            "('today_solar_kwh', 'today_solar_date', 'today_solar_ts')"
+        ).fetchall())
+        fresh = rows.get('today_solar_date') == date.today().isoformat()
+        val = rows.get('today_solar_kwh')
+        state['today_solar_kwh'] = float(val) if fresh and val is not None else None
+        # Fetch time, for skip messages only — tells a real low forecast apart
+        # from stale data left by failing fetches.
+        ts = rows.get('today_solar_ts')
+        state['today_solar_ts'] = int(ts) if ts else None
+    except Exception:
+        state['today_solar_kwh'] = None
+        state['today_solar_ts'] = None
     try:
         year_start = f"{date.today().year}-01-01"
         row = conn.execute(
@@ -381,6 +443,13 @@ def main_loop(stop_fn=None):
                                   f'Holiday: {hol} — weekend rules apply',
                                   result='ok', battery_pct=live.get('battery_pct'))
                         last_holiday_logged = dt.date()
+
+                    # Conditional rules that just fired but didn't apply — say why.
+                    for name, fire_dt, reason in target.pop('_skipped', []):
+                        log.info('SKIP   %s (%s) — %s', name, fire_dt.strftime('%H:%M'), reason)
+                        log_event(conn, 'powerwall', 'rule_skipped',
+                                  f'{name} skipped — {reason}',
+                                  result='ok', battery_pct=live.get('battery_pct'))
 
                     state_sig = (target['mode'], target['reserve'], target['grid_charging'], target['grid_export'])
                     if state_sig != last_state_sig:

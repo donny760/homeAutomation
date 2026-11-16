@@ -819,6 +819,7 @@ export default function Rules({ isActive }: RulesProps) {
                         <option value="battery_pct">Battery %</option>
                         <option value="net_cost">Net Cost Today ($)</option>
                         <option value="net_cost_ytd">Net Cost YTD ($)</option>
+                        <option value="today_solar_kwh">Today Solar Forecast (kWh)</option>
                         <option value="tomorrow_solar_kwh">Tomorrow Solar Forecast (kWh)</option>
                       </select>
                       <select className="form-select" value={c.operator} onChange={(e) => updateCondition(idx, 'operator', e.target.value)}>

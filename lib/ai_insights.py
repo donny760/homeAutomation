@@ -945,6 +945,7 @@ def _build_ai_context():
         'net_cost':           'net cost today $',
         'net_cost_ytd':       'YTD net cost $',
         'tomorrow_solar_kwh': 'tomorrow solar forecast kWh',
+        'today_solar_kwh':    'today solar forecast kWh',
     }
 
     def _fmt_days(days):

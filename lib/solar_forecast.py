@@ -6,7 +6,7 @@ from datetime import datetime, date, timedelta
 
 import lib.state as state
 from lib.db import connect
-from lib.events import _log_system_error
+from lib.events import FetchIncident
 
 
 _sf_cache: dict  = {}
@@ -15,6 +15,8 @@ _stf_cache: dict = {}
 _stf_ts: float   = 0.0
 SF_TTL = 3600
 PEAK_RAD_WM2 = 950.0
+_sf_incident = FetchIncident('solar', 'Solar forecast')
+_stf_incident = FetchIncident('solar', 'Tomorrow solar forecast')
 
 
 def _peak_solar_w() -> float:
@@ -33,6 +35,8 @@ def fetch_solar_forecast() -> dict:
     current_hour = now.hour
 
     if _sf_cache.get('date') == today_str and time.time() - _sf_ts < SF_TTL:
+        return _sf_cache
+    if _sf_incident.should_skip():
         return _sf_cache
 
     url = (
@@ -67,14 +71,43 @@ def fetch_solar_forecast() -> dict:
 
         _sf_cache = {'date': today_str, 'hours': merged}
         _sf_ts = time.time()
+        _sf_incident.ok()
+
+        # Persisted for rules.py's today_solar_kwh condition. Stamped with its
+        # date so the rules engine can reject yesterday's value. Only written on
+        # a successful fetch — the failure path's empty hours would store a 0.
+        if merged:
+            try:
+                with connect() as c:
+                    c.executemany(
+                        'INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                        [('today_solar_kwh', str(round(sum(merged.values()) / 1000, 2))),
+                         ('today_solar_date', today_str),
+                         ('today_solar_ts', str(int(time.time())))]
+                    )
+            except Exception:
+                pass
 
     except Exception as exc:
-        print(f'Solar forecast error: {exc}')
-        _log_system_error('solar', 'Solar forecast fetch failed', str(exc))
+        _sf_incident.failed(exc)
         if not _sf_cache or _sf_cache.get('date') != today_str:
             _sf_cache = {'date': today_str, 'hours': {}}
 
     return _sf_cache
+
+
+FORECAST_LOOP_INTERVAL = 600   # seconds; fetch_solar_forecast's own TTL limits real fetches to ~hourly
+
+
+def forecast_loop() -> None:
+    """Keep today_solar_kwh fresh without a browser open (rules read it at 3-5 AM).
+    Runs in its own daemon thread so an Open-Meteo timeout never stalls the poller."""
+    while True:
+        try:
+            fetch_solar_forecast()
+        except Exception:
+            pass
+        time.sleep(FORECAST_LOOP_INTERVAL)
 
 
 def fetch_tomorrow_solar_forecast() -> dict:
@@ -82,6 +115,8 @@ def fetch_tomorrow_solar_forecast() -> dict:
     tomorrow_str = (date.today() + timedelta(days=1)).isoformat()
 
     if _stf_cache.get('date') == tomorrow_str and time.time() - _stf_ts < SF_TTL:
+        return _stf_cache
+    if _stf_incident.should_skip():
         return _stf_cache
 
     url = (
@@ -119,6 +154,7 @@ def fetch_tomorrow_solar_forecast() -> dict:
             'total_kwh':   total_kwh,
         }
         _stf_ts = time.time()
+        _stf_incident.ok()
 
         try:
             with connect() as c:
@@ -130,8 +166,7 @@ def fetch_tomorrow_solar_forecast() -> dict:
             pass
 
     except Exception as exc:
-        print(f'Tomorrow solar forecast error: {exc}')
-        _log_system_error('solar', 'Tomorrow solar forecast fetch failed', str(exc))
+        _stf_incident.failed(exc)
         if _stf_cache.get('date') != tomorrow_str:
             _stf_cache = {'date': tomorrow_str, 'hours': {}, 'kwh_by_hour': {}, 'total_kwh': 0.0}
 
